@@ -1,0 +1,25 @@
+{
+    "project_name": "Corelocation",
+    "description": "locationd daemon and its associated algorithms and frameworks",
+    
+    "api_end_point": "https://floodgate.g.apple.com/api/openai/v1/chat/completions",
+    "model": "aws:anthropic.claude-opus-4-5-20251101-v1:0",
+    "llm_provider_type": "dummy",
+    "credentials": "",
+    
+    
+
+    "exclude_directories": [
+        ".git", "Tools", "Tests", "Test", "ProtobufDefs", "Protobuf",
+        "External", "Plugins", "proto", "ci_scripts",  "TestPlans",
+        "test-files", "TestPlans", "hws-log", "Oscar", "LogFormatters", "Plugins", "xcconfig",
+        "Resources", "en.lproj", "CardioHealthTests", "CoreLocation.xcodeproj", "vagrant", 
+        "regressiontests", "Resources", ".workflow"
+    ],
+    "include_directories": [],
+    "exclude_files": [],
+    
+    "min_function_body_length": 7,
+    
+    "user_prompts": [ ""]
+}

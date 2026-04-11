@@ -1,0 +1,14 @@
+[
+    {
+        "file_path": "path/to/file.ext",
+        "file_name": "file.ext",
+        "function_name": "functionName",
+        "line_number": "123",
+        "severity": "high",
+        "issue": "Brief description of the issue",
+        "description": "Detailed explanation of the problem",
+        "suggestion": "How to fix this issue",
+        "category": "logicBug",
+        "issueType": "logicBug"
+    }
+]

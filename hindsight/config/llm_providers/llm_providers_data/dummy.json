@@ -1,0 +1,8 @@
+{
+  "api_end_point": "http://localhost:8000/dummy",
+  "model": "dummy-model",
+  "credentials": {
+    "api_key": "dummy-key"
+  },
+  "llm_provider_type": "dummy"
+}

@@ -1,0 +1,8 @@
+{
+  "project_name": "GitHubRepoAnalysis",
+  "github_repo_url": "https://github.com/abhayanigam/Learn_C",
+  "exclude_directories": ["tests", "dist", "node_modules", "venv"],
+  "exclude_files": ["README.md", "setup.py", "config.example.json"],
+  "llm_provider": "dummy"
+}
+

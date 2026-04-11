@@ -1,0 +1,9 @@
+{
+  "project_name": "SampleCodeInsightProject",
+  "directory_path": "/Users/johndoe/workspace/sample-repo",
+  "exclude_directories": ["tests", "dist", "node_modules", "venv"],
+  "include_directories": ["src", "lib", "core"],
+  "exclude_files": ["README.md", "setup.py", "config.example.json"],
+  "llm_provider": "claude"
+}
+

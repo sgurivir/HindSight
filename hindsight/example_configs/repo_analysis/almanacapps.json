@@ -1,0 +1,21 @@
+{
+    "project_name": "Almanac Apps",
+    "description": "Almanac Apps",
+    
+    "api_end_point": "https://floodgate.g.apple.com/api/openai/v1/chat/completions",
+    "model_": "aws:anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "model": "aws:anthropic.claude-opus-4-5-20251101-v1:0",
+    "llm_provider_type": "aws_bedrock",
+    "credentials": "",
+    
+    
+
+    "exclude_directories": ["AlmanacProxy"
+    ],
+    "include_directories": ["Orange", "StudyApp"],
+    "exclude_files": [],
+    
+    "min_function_body_length": 7,
+    
+    "user_prompts": [ ""]
+}

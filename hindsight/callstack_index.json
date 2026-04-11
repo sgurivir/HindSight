@@ -1,0 +1,20 @@
+{
+  "a0fac0f5809b": {
+    "file": "callstacks/a0fac0f5809b.json",
+    "context": {
+      "file": "CLIntersiloProxy.mm",
+      "function": "forwardInvocation:",
+      "line": "125-230",
+      "severity": "high"
+    }
+  },
+  "772daf1fa987": {
+    "file": "callstacks/772daf1fa987.json",
+    "context": {
+      "file": "CLLocationManager.mm",
+      "function": "requestLocation",
+      "line": "45-67",
+      "severity": "medium"
+    }
+  }
+}

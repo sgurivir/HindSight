@@ -1,0 +1,9 @@
+# Existing issue_deduper dependencies
+radarclient
+tqdm
+
+# issue_deduper dependencies
+chromadb>=0.4.0           # Vector database
+sentence-transformers>=2.2.0  # Embeddings
+beautifulsoup4>=4.12.0    # HTML parsing
+lxml>=4.9.0               # HTML parser backend

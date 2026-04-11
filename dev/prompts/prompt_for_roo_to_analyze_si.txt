@@ -1,0 +1,95 @@
+I got a static code analysis report for this repository. The issues are in a TEXT file.
+Analyze the report and create a simple HTML file, telling which issues are valid and which are false positive.
+Some issues may be dupes. Just de-dupe them.
+
+
+You will produce TWO output files at the end:
+1. ONE HTML file with the full analysis
+2. ONE CSV file listing ONLY the false positives (for automated processing)
+
+Inputs:
+- Static analysis report (TEXT file) at: <path>
+  The text file format has issues separated by "======================" with fields:
+    file name: <path>
+    line number: <line range>
+    issue: <title>
+    impact: <description>
+    potential evidence: <optional evidence>
+    Potential Solution: <suggested fix>
+- Repository source code is available in this workspace.
+- Check progress.txt (if exists) to see previous analysis so we don't have to repeat same analysis
+
+Goal:
+- Create progress.txt, if it does not exist. List issues prepended by [<status>], with one issue per line.
+- For EACH issue in the report, decide: Valid vs False Positive.
+- De-duplicate identical issues (same title + same file/function/line + same core claim).
+
+Critical workflow (must follow exactly):
+1) Load the text file of reported issues and build an index of issues.
+   Parse each section separated by "======================" to extract:
+   - File name (from "file name:" field)
+   - Line number (from "line number:" field)
+   - Issue title (from "issue:" field)
+   - Impact (from "impact:" field)
+   - Potential Solution (from "Potential Solution:" field)
+   
+   NOTE: To get the checksum, you need to find the corresponding analysis JSON file in the results directory.
+   The checksum is the 8-character hex string in the filename (e.g., "880f92c1" from "function_file_880f92c1_analysis.json")
+   Match by file name and issue title to find the correct checksum.
+
+2) Then process issues sequentially.
+3) For each issue:
+   a) Re-open ONLY the section of the report for that issue (do not keep the whole report in memory).
+   b) Open the referenced source file(s) and verify by reading code around the line AND the full control-flow after the flagged line.
+   c) Decide Valid/False Positive and Worth Fixing (Yes/Low Priority/No) with brief reasoning.
+   d) Append ONE row to an internal "rows" list.
+   e) Output progress to progress.txt file
+4) After all issues are processed, output the final HTML using the collected rows.
+5) Also output a CSV file containing ONLY the false positives.
+
+HTML output:
+- Single table with columns:
+  Checksum (8-char hex from analysis filename, or "N/A" if not found)
+  Issue title (from "issue:" field, verbatim)
+  File and Line (from "file name:" and "line number:" fields)
+  Impact (from "impact:" field, verbatim)
+  Potential solution (from "Potential Solution:" field, verbatim)
+  Is it valid? (Valid / False Positive)
+  Is it worth fixing? (Yes / Low Priority / No)
+  Reasoning (brief)
+
+CSV output (false_positives.csv):
+- Header row: checksum,issue_title,issue_description
+- Include ONLY issues marked as "False Positive"
+- Format:
+  checksum: The 8-character checksum from the analysis filename (or "unknown" if not found)
+  issue_title: Brief title of the issue (from "issue:" field)
+  issue_description: The issue description/impact (from "impact:" field)
+- Example:
+  checksum,issue_title,issue_description
+  880f92c1,"Integer overflow check uses incorrect cast comparison","The overflow check at lines 1490-1491 casts size_t values..."
+  abc12345,"Potential undefined behavior with __builtin_ctzl on zero","Line 1892 uses __builtin_ctzl which has undefined behavior..."
+
+NOTE: This CSV file is consumed by code_analyzer.py via --false-positives-csv.
+It drives two removal passes: (1) exact checksum+title match, (2) semantic
+near-duplicate search using ChromaDB embeddings (catches phantom issues with
+subtly different titles that were deduplicated away in the original report).
+
+Usage after analysis:
+  python -m hindsight.analyzers.code_analyzer \
+      --generate-report-from-existing-issues \
+      --false-positives-csv /path/to/false_positives.csv \
+      --config <config.json> \
+      --repo /path/to/<repo> \
+      --out-dir ~/llm_artifacts/<repo>
+
+Rules:
+- Copy issue title / file+line / impact / potential solution EXACTLY from report (no paraphrase).
+- Do not invent issues.
+- Do not skip issues.
+- Sort rows so (False Positive OR Worth Fixing = No/Low Priority) appear at the bottom.
+- If you cannot locate the referenced code, mark:
+  Is it valid? = Unknown
+- For CSV output, use proper CSV escaping (quote fields containing commas)
+
+CRITICAL REMINDER: Update progress.txt as frequently as possible, as you make progress

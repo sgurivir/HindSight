@@ -1,0 +1,4 @@
+"""
+Database module for Hindsight
+"""
+

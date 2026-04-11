@@ -1,0 +1,20 @@
+{
+    "project_name": "Example Project with Preprocessor Macros",
+    "description": "Example configuration demonstrating the enable_preprocessor_macros feature for conditional compilation",
+    
+    "api_end_point": "https://floodgate.g.apple.com/api/openai/v1/chat/completions",
+    "model": "aws:anthropic.claude-opus-4-5-20251101-v1:0",
+    "llm_provider_type": "aws_bedrock",
+    "credentials": "",
+    
+    "exclude_directories": [
+        ".git", "build", "DerivedData", "Tests", "test"
+    ],
+    
+    "enable_preprocessor_macros": [
+        "DEBUG",
+        "FEATURE_FLAG_ENABLED=1",
+        "TARGET_OS_IOS=1",
+        "ENABLE_LOGGING"
+    ]
+}

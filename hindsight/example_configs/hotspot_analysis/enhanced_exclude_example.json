@@ -1,0 +1,31 @@
+{
+    "project_name": "Enhanced Exclude Directories - Trace Analysis",
+    "description": "Example configuration for trace analysis demonstrating both directory names and relative paths in exclude_directories",
+    
+    "api_end_point": "https://floodgate.g.apple.com/api/openai/v1/chat/completions",
+    "model": "aws:anthropic.claude-opus-4-5-20251101-v1:0",
+    "llm_provider_type": "aws_bedrock",
+    "credentials": "",
+    
+    "exclude_directories": [
+        ".git",
+        "Tools", 
+        "Tests",
+        "Test",
+        "ProtobufDefs",
+        "External",
+        "Plugins",
+        "proto",
+        "ci_scripts",
+        "TestPlans",
+        "test-files",
+        "hws-log",
+        "LogFormatters",
+        "xcconfig",
+        "Daemon/Shared",
+        "src/test/resources",
+        "build/generated",
+        "vendor/third_party",
+        "tests/integration/data"
+    ]
+}

@@ -1,0 +1,18 @@
+{
+    "project_name": "Coretime",
+    "description": "coretime",
+    
+    "api_end_point": "https://floodgate.g.apple.com/api/openai/v1/chat/completions",
+    "model": "aws:anthropic.claude-opus-4-5-20251101-v1:0",
+    "llm_provider_type": "aws_bedrock",
+    "credentials": "",
+    
+    "exclude_directories": [
+    ],
+    "include_directories": [],
+    "exclude_files": [],
+    
+    "min_function_body_length": 7,
+    
+    "user_prompts": [ ""]
+}

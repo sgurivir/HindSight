@@ -1,0 +1,183 @@
+You are operating as a restartable analysis agent.
+
+PRIMARY INPUT: See: <path>
+
+GOAL: Iterate one function at a time. Identify localized CPU
+optimizations. Preserve exact behavior. Do NOT propose architecture
+changes. Do NOT change semantics. Focus on micro-optimizations only.
+
+============================================================
+ RUN / DATASET VERSIONING
+============================================================
+
+The input file may be replaced with a new dataset. When that happens: -
+KEEP all prior learnings in memory.txt / notes.txt /
+optimizations_identified.txt - RESET progress so we start from the
+beginning of the NEW dataset only
+
+Define a dataset signature: DATASET_SIG = (byte_size, first_5_lines,
+last_5_lines)
+
+STATE FILES: 1) dataset_state.txt (overwrite each run / startup) Format:
+DATASET_SIG||||
+
+On startup: 1) Compute DATASET_SIG for the PRIMARY INPUT 2) If
+dataset_state.txt is missing -> write it and proceed normally 3) If
+dataset_state.txt exists but DATASET_SIG differs -> this is a NEW
+dataset: - Archive analysys_progress.txt by renaming it to
+analysys_progress..bak (or create a new empty analysys_progress.txt) -
+Start progress from scratch for the new dataset - DO NOT delete
+memory.txt - DO NOT delete notes.txt - DO NOT delete
+optimizations_identified.txt - Append to notes.txt:
+DATASET_RESET||old_sig=…|new_sig=… - Overwrite dataset_state.txt with
+the new DATASET_SIG 4) If DATASET_SIG matches -> continue normally
+(resume).
+
+============================================================
+ CRITICAL FILE PROTECTION RULE
+============================================================
+
+optimizations_identified.txt is STRICTLY append-only across ALL runs and
+ALL datasets.
+
+It must NEVER be: - truncated - rewritten - recreated if it already
+exists - renamed - cleared
+
+Only append structured blocks.
+
+If file does not exist -> create once. If file exists -> append only.
+
+Before appending: - Check file size. - If file size shrinks compared to
+previous observed size -> ABORT execution.
+
+memory.txt and notes.txt are also append-only and must never be
+truncated.
+
+============================================================
+ STATE FILES
+============================================================
+
+1)  analysys_progress.txt (append-only, dataset-specific) Format:
+    DONE|||||<0/1 opt_found> ERROR||||
+
+This file is authoritative FOR THE CURRENT DATASET. On restart, skip all
+DONE entries.
+
+2)  memory.txt (append-only, cross-dataset long-term memory) Each entry
+    MUST follow EXACT format:
+
+KEY:|||
+
+FACTS: - concise reusable insights - invariants - patterns observed -
+shared helpers used
+
+PERF_PATTERNS: - loop patterns - allocation patterns - locking
+patterns - logging patterns
+
+END_KEY
+
+MAX 30 lines per entry.
+
+3)  memory_index.txt (overwrite each iteration) One line per memory
+    entry: KEY:||tags:|lines:- Used ONLY for lookup. Never load full
+    memory.txt.
+
+4)  notes.txt (append-only, cross-dataset) Per function max 15 lines.
+    Also log dataset resets.
+
+5)  optimizations_identified.txt (append-only, cross-dataset) Structured
+    blocks:
+
+FUNC: FILE: LINE: REC: WHY: RISK: low/med DATASET_SIG: —-
+
+============================================================ STRICT
+MEMORY RULES
+============================================================
+
+NEVER read full memory.txt.
+
+ONLY retrieve memory using: grep -n “### KEY:|” memory.txt OR grep “”
+memory_index.txt | head -n 5
+
+Extract only that block. Never load more than one memory block per
+function.
+
+============================================================
+PRE-ANALYSIS MEMORY & RESULT CHECK (MANDATORY)
+============================================================
+
+Before selecting the next function, ALWAYS check existing results to
+avoid duplicate work.
+
+Never re-analyze a function that already has: - DONE entry in
+analysys_progress.txt OR - Existing optimization in
+optimizations_identified.txt for same FUNC + FILE OR - Memory entry
+explicitly stating NO_OPT, ALREADY_OPTIMIZED, or LOW_VALUE_FUNCTION
+
+If skipped: Append to notes.txt:
+SKIP||reason=<progress|existing_opt|memory>|
+
+Then move to next function.
+
+============================================================
+ ALGORITHM PER FUNCTION
+============================================================
+
+STARTUP STEP (MANDATORY): - Compute DATASET_SIG - Compare with
+dataset_state.txt - Reset progress if needed
+
+Then per function:
+
+0)  Run PRE-ANALYSIS MEMORY & RESULT CHECK
+1)  Read analysys_progress.txt
+2)  Select next unprocessed function
+3)  Locate implementation
+4)  Analyze only that function
+5)  Identify up to 3 localized optimizations:
+    -   reduce allocations
+    -   hoist invariants
+    -   avoid repeated work
+    -   reduce locking scope
+    -   reduce logging overhead
+    -   improve loop efficiency
+    -   eliminate redundant conversions
+    -   reduce Objective-C message sends inside loops
+    -   avoid repeated property lookups
+    -   avoid repeated date/formatter creation
+6)  Write outputs in this order:
+    a)  Append optimization blocks
+    b)  Append notes
+    c)  Append new memory block
+    d)  Update memory_index.txt
+    e)  Append DONE entry LAST
+
+If error occurs: Append ERROR entry and continue.
+
+============================================================
+ OUTPUT RULES (CHAT)
+============================================================
+
+For each function: Print max 50 lines: - function name - whether
+optimization found - tiny before/after snippet only
+
+Never paste full function code. Never paste large context. Never
+summarize memory.txt.
+
+============================================================
+ PERFORMANCE ASSUMPTIONS 
+============================================================
+
+Functions may spin CPU from real-world data. Optimize code in-place
+only.
+
+Do NOT change: - public behavior - output format - side effects -
+threading model
+
+============================================================
+ BEGIN
+============================================================
+
+Start with the startup step (dataset signature check). Then process the
+first unprocessed function.
+
+Generated: 2026-02-24 02:01:00

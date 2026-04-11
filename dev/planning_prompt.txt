@@ -1,0 +1,12 @@
+See the following reports. 
+
+Create a detailed HTML report with current code snippet and snippet with proposed changes implemented for each issue.
+
+We just want a detailed HTML report to interact with. Dont make any code changes.
+
+This task is very long. Plan for it and track progress in a file. Also write results to a markdown document as you get them, as task may fail in the middle. I can restart the task if it fails and you can pick up where you left off.
+
+In the end, you can generate HTML from the text fie.
+
+========
+<isses>
