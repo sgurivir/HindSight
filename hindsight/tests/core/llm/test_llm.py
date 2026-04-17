@@ -36,25 +36,12 @@ class TestConversationState:
     """Tests for ConversationState class."""
 
     def test_initialization_default_provider(self):
-        """Test ConversationState initializes with default provider type."""
+        """Test ConversationState initializes with default values."""
         state = ConversationState()
-        
+
         assert state.messages == []
         assert state.system_prompt is None
         assert state.original_request is None
-        assert state.provider_type == "claude"
-
-    def test_initialization_custom_provider(self):
-        """Test ConversationState initializes with custom provider type."""
-        state = ConversationState(provider_type="aws_bedrock")
-        
-        assert state.provider_type == "aws_bedrock"
-
-    def test_initialization_provider_type_case_insensitive(self):
-        """Test provider type is normalized to lowercase."""
-        state = ConversationState(provider_type="AWS_BEDROCK")
-        
-        assert state.provider_type == "aws_bedrock"
 
     def test_set_system_prompt(self):
         """Test setting system prompt."""
@@ -110,44 +97,12 @@ class TestConversationState:
         assert "File content here" in state.messages[0]["content"]
 
     def test_add_tool_result_unified_format(self):
-        """Test that tool results use unified plain text format for all providers."""
-        # Test Claude provider
-        state_claude = ConversationState(provider_type="claude")
-        state_claude.add_tool_result("tool_1", "result_1")
-        
-        # Test AWS Bedrock provider
-        state_bedrock = ConversationState(provider_type="aws_bedrock")
-        state_bedrock.add_tool_result("tool_1", "result_1")
-        
-        # Both should use the same format
-        assert state_claude.messages[0]["content"] == state_bedrock.messages[0]["content"]
-        assert "[TOOL_RESULT: tool_1]" in state_claude.messages[0]["content"]
-
-    def test_add_multiple_tool_results(self):
-        """Test adding multiple tool results as single message."""
+        """Test that tool results use unified plain text format."""
         state = ConversationState()
-        tool_results = [
-            {"tool_use_id": "tool_1", "result": "Result 1"},
-            {"tool_use_id": "tool_2", "result": "Result 2"},
-            {"tool_use_id": "tool_3", "result": "Result 3"}
-        ]
-        state.add_multiple_tool_results(tool_results)
-        
-        assert len(state.messages) == 1
-        assert state.messages[0]["role"] == "user"
+        state.add_tool_result("tool_1", "result_1")
+
         assert "[TOOL_RESULT: tool_1]" in state.messages[0]["content"]
-        assert "[TOOL_RESULT: tool_2]" in state.messages[0]["content"]
-        assert "[TOOL_RESULT: tool_3]" in state.messages[0]["content"]
-        assert "Result 1" in state.messages[0]["content"]
-        assert "Result 2" in state.messages[0]["content"]
-        assert "Result 3" in state.messages[0]["content"]
-
-    def test_add_multiple_tool_results_empty_list(self):
-        """Test adding empty tool results list does nothing."""
-        state = ConversationState()
-        state.add_multiple_tool_results([])
-        
-        assert len(state.messages) == 0
+        assert "result_1" in state.messages[0]["content"]
 
     def test_get_full_conversation(self):
         """Test getting full conversation history."""
@@ -231,7 +186,7 @@ class TestClaudeConfig:
         assert config.max_tokens == 64000
         assert config.temperature == 0.05
         assert config.timeout == 300
-        assert config.provider_type == "claude"
+        assert config.provider_type == "aws_bedrock"
 
     def test_custom_values(self):
         """Test ClaudeConfig with custom values."""
@@ -258,20 +213,6 @@ class TestClaudeConfig:
 class TestCreateLLMProvider:
     """Tests for create_llm_provider factory function."""
 
-    @patch('hindsight.core.llm.llm.ClaudeProvider')
-    def test_create_claude_provider(self, mock_claude_provider):
-        """Test creating Claude provider."""
-        config = ClaudeConfig(
-            api_key="test-key",
-            api_url="https://api.anthropic.com/v1/messages",
-            model="claude-3-5-sonnet-20241022",
-            provider_type="claude"
-        )
-        
-        provider = create_llm_provider(config)
-        
-        mock_claude_provider.assert_called_once()
-
     @patch('hindsight.core.llm.llm.AWSBedrockProvider')
     def test_create_aws_bedrock_provider(self, mock_bedrock_provider):
         """Test creating AWS Bedrock provider."""
@@ -281,36 +222,27 @@ class TestCreateLLMProvider:
             model="anthropic.claude-3-sonnet-20240229-v1:0",
             provider_type="aws_bedrock"
         )
-        
+
         provider = create_llm_provider(config)
-        
+
         mock_bedrock_provider.assert_called_once()
 
-    @patch('hindsight.core.llm.llm.DummyProvider')
-    def test_create_dummy_provider(self, mock_dummy_provider):
-        """Test creating dummy provider."""
-        config = ClaudeConfig(
-            api_key="test-key",
-            api_url="https://dummy.api.com",
-            model="dummy-model",
-            provider_type="dummy"
-        )
-        
-        provider = create_llm_provider(config)
-        
-        mock_dummy_provider.assert_called_once()
-
     def test_invalid_provider_type(self):
-        """Test that invalid provider type raises ValueError."""
+        """Test that invalid provider type is ignored (only AWS Bedrock is supported).
+        
+        Note: The create_llm_provider function was simplified to only support AWS Bedrock,
+        so it ignores the provider_type parameter and always creates an AWSBedrockProvider.
+        """
         config = ClaudeConfig(
             api_key="test-key",
             api_url="https://api.example.com",
             model="test-model",
             provider_type="invalid_provider"
         )
-        
-        with pytest.raises(ValueError):
-            create_llm_provider(config)
+
+        # Should not raise - provider_type is ignored, always creates AWSBedrockProvider
+        provider = create_llm_provider(config)
+        assert provider is not None
 
 
 # ============================================================================
@@ -326,8 +258,8 @@ class TestClaude:
         provider = MagicMock()
         provider.create_payload.return_value = {"messages": []}
         provider.make_request.return_value = {
-            "content": [{"type": "text", "text": "Response"}],
-            "usage": {"input_tokens": 100, "output_tokens": 50}
+            "choices": [{"message": {"content": "Response"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50}
         }
         provider.validate_connection.return_value = True
         return provider
@@ -337,9 +269,9 @@ class TestClaude:
         """Create a test ClaudeConfig."""
         return ClaudeConfig(
             api_key="test-key",
-            api_url="https://api.anthropic.com/v1/messages",
-            model="claude-3-5-sonnet-20241022",
-            provider_type="dummy"
+            api_url="https://bedrock.amazonaws.com",
+            model="anthropic.claude-3-sonnet-20240229-v1:0",
+            provider_type="aws_bedrock"
         )
 
     @pytest.fixture
@@ -355,14 +287,15 @@ class TestClaude:
         assert claude_instance.conversation_responses == []
         assert claude_instance.conversation_metadata == {}
 
-    def test_start_conversation(self, claude_instance):
+    def test_start_conversation(self, claude_instance, claude_config):
         """Test starting a new conversation."""
         claude_instance.start_conversation("code_analysis", "test_file.py")
         
         assert claude_instance.conversation_metadata['analysis_type'] == "code_analysis"
         assert claude_instance.conversation_metadata['context_info'] == "test_file.py"
         assert 'start_time' in claude_instance.conversation_metadata
-        assert claude_instance.conversation_metadata['model'] == "claude-3-5-sonnet-20241022"
+        # Model should match the config used to create the instance
+        assert claude_instance.conversation_metadata['model'] == claude_config.model
 
     def test_estimate_tokens(self, claude_instance):
         """Test token estimation."""
@@ -628,7 +561,7 @@ class TestClaudeToolExecution:
             api_key="test-key",
             api_url="https://api.anthropic.com/v1/messages",
             model="claude-3-5-sonnet-20241022",
-            provider_type="dummy"
+            provider_type="aws_bedrock"
         )
 
     @pytest.fixture
@@ -661,42 +594,6 @@ class TestClaudeToolExecution:
         
         result = claude_instance._execute_json_tool_request(
             tool_request, mock_tools_executor, supported_tools
-        )
-        
-        assert "Error" in result
-        assert "unsupportedTool" in result
-
-    def test_execute_tool_use(self, claude_instance):
-        """Test executing structured tool_use."""
-        mock_tools_executor = MagicMock()
-        mock_tools_executor.tools.execute_tool_use.return_value = "Tool result"
-        
-        tool_use = {
-            "id": "tool_123",
-            "name": "readFile",
-            "input": {"path": "test.py"}
-        }
-        supported_tools = ["readFile"]
-        
-        result = claude_instance._execute_tool_use(
-            tool_use, mock_tools_executor, supported_tools
-        )
-        
-        assert result == "Tool result"
-
-    def test_execute_tool_use_unsupported(self, claude_instance):
-        """Test executing unsupported tool_use."""
-        mock_tools_executor = MagicMock()
-        
-        tool_use = {
-            "id": "tool_123",
-            "name": "unsupportedTool",
-            "input": {}
-        }
-        supported_tools = ["readFile"]
-        
-        result = claude_instance._execute_tool_use(
-            tool_use, mock_tools_executor, supported_tools
         )
         
         assert "Error" in result

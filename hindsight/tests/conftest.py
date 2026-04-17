@@ -116,7 +116,7 @@ def sample_config(temp_dir) -> Dict[str, Any]:
         'project_name': 'test-project',
         'api_end_point': 'https://api.anthropic.com/v1/messages',
         'model': 'claude-3-5-sonnet-20241022',
-        'llm_provider_type': 'claude',
+        'llm_provider_type': 'aws_bedrock',
         'path_to_repo': temp_dir,  # Use actual temp directory that exists
         'exclude_directories': ['node_modules', '.git', 'build'],
         'exclude_files': ['*.min.js', '*.map'],
@@ -261,7 +261,7 @@ def valid_config_dict():
         'project_name': 'test-project',
         'api_end_point': 'https://api.anthropic.com/v1/messages',
         'model': 'claude-3-5-sonnet-20241022',
-        'llm_provider_type': 'claude'
+        'llm_provider_type': 'aws_bedrock'
     }
 
 

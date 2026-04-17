@@ -62,7 +62,7 @@ class TraceCodeAnalysis:
             model=config.model,
             max_tokens=config.max_tokens,
             temperature=config.temperature,
-            provider_type=config.config.get('llm_provider_type', 'claude') if config.config else 'claude'
+            provider_type=config.config.get('llm_provider_type', 'aws_bedrock') if config.config else 'aws_bedrock'
         )
         self.claude = Claude(claude_config)
 
@@ -354,7 +354,7 @@ class TraceCodeAnalysis:
                 user_prompt=user_prompt,
                 tools_executor=self,  # Pass self so tools can be accessed via self.tools
                 supported_tools=[
-                    "readFile", "runTerminalCmd", "getImplementation", "getSummaryOfFile",
+                    "readFile", "runTerminalCmd", "getSummaryOfFile",
                     "inspectDirectoryHierarchy", "list_files",
                     "getFileContentByLines", "getFileContent", "checkFileSize"
                 ],

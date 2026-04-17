@@ -1,8 +1,0 @@
-{
-  "api_end_point": "https://api.anthropic.com/v1/messages",
-  "model": "claude-sonnet-4-5",
-  "credentials": {
-    "api_key": "your claude api key"
-  },
-  "llm_provider_type": "claude"
-}

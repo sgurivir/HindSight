@@ -61,7 +61,7 @@ class FileOrDirectorySummaryGenerator:
         Initialize the summary generator with specified LLM provider.
         
         Args:
-            llm_provider: LLM provider type ('claude' or 'aws_bedrock')
+            llm_provider: LLM provider type ('aws_bedrock')
             config: Configuration dictionary containing LLM settings
         """
         self.llm_provider = llm_provider
@@ -74,12 +74,12 @@ class FileOrDirectorySummaryGenerator:
         self._current_repo_path = None
         
         # Validate provider
-        if llm_provider not in ['claude', 'aws_bedrock', 'dummy']:
+        if llm_provider not in ['aws_bedrock']:
             raise ValueError(f"Unsupported LLM provider: {llm_provider}")
-        
+
         # Get API key
         self.api_key = get_api_key_from_config(config)
-        if not self.api_key and llm_provider != 'dummy':
+        if not self.api_key:
             raise ValueError(f"No API key available for provider: {llm_provider}")
         
         logger.info(f"Initialized FileOrDirectorySummaryGenerator with provider: {llm_provider}")
@@ -226,7 +226,7 @@ File to analyze: {relative_path}"""
                 user_prompt=user_prompt,
                 tools_executor=self,  # Pass self so tools can be accessed via self.tools
                 supported_tools=[
-                    "readFile", "runTerminalCmd", "getImplementation", "getSummaryOfFile",
+                    "readFile", "runTerminalCmd", "getSummaryOfFile",
                     "inspectDirectoryHierarchy", "list_files",
                     "getFileContentByLines", "getFileContent", "checkFileSize"
                 ],
@@ -385,16 +385,13 @@ Available tools:"""
 2. runTerminalCmd - Execute terminal commands
    Usage: {"tool": "runTerminalCmd", "command": "command to run", "reason": "why you need this"}
 
-3. getImplementation - Get class or function implementation
-   Usage: {"tool": "getImplementation", "name": "class_or_function_name", "reason": "why you need this"}
-
-4. getSummaryOfFile - Get file summary
+3. getSummaryOfFile - Get file summary
    Usage: {"tool": "getSummaryOfFile", "path": "file.ext", "reason": "why you need this"}
 
-5. list_files - Get directory structure
+4. list_files - Get directory structure
    Usage: {"tool": "list_files", "path": "directory/path", "reason": "why you need this"}
 
-6. runTerminalCmd with grep - Search for text patterns across files
+5. runTerminalCmd with grep - Search for text patterns across files
    Usage: {"tool": "runTerminalCmd", "command": "grep -r -l 'text to find' --include='*.ext' .", "reason": "why you need this"}
 
 Use these tools to gather information about the file before providing your summary.

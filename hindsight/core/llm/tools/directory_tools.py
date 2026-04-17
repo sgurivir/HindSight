@@ -51,8 +51,7 @@ class DirectoryToolsMixin:
         
         path = path.strip() if path else self.repo_path
 
-        logger.info(f"[TOOL] list_files called #{self.tool_usage_stats['list_files']['count']} - Path: {path}, Recursive: {recursive}")
-        logger.info(f"[AI REASONING] {reason if reason else 'No reason provided'}")
+        logger.info(f"[TOOL] list_files called #{self.tool_usage_stats['list_files']['count']} - Path: {path}, Recursive: {recursive} | [AI REASONING] {reason if reason else 'No reason provided'}")
 
         try:
             # Check if DirectoryTreeUtil is available
@@ -123,8 +122,7 @@ class DirectoryToolsMixin:
                 return error_msg
             directory_path = directory_path.strip() if directory_path else None
 
-        logger.info(f"[TOOL] inspectDirectoryHierarchy called #{self.tool_usage_stats['inspectDirectoryHierarchy']['count']} - Path: {directory_path or 'root'}")
-        logger.info(f"[AI REASONING] {reason if reason else 'No reason provided'}")
+        logger.info(f"[TOOL] inspectDirectoryHierarchy called #{self.tool_usage_stats['inspectDirectoryHierarchy']['count']} - Path: {directory_path or 'root'} | [AI REASONING] {reason if reason else 'No reason provided'}")
 
         try:
             if directory_path:

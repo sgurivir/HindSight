@@ -2,47 +2,27 @@
 # Created by Sridhar Gurivireddy
 """
 LLM Client Module
-Handles communication with LLM providers for code analysis
+Handles communication with AWS Bedrock for code analysis
 
 TOOL INVOCATION ARCHITECTURE:
 ==============================
-This module uses JSON-embedded tool requests for universal provider-agnostic tool invocation.
-Structured tool calls are DISABLED for all providers to ensure consistency.
+This module uses JSON-embedded tool requests for tool invocation.
+Structured/native tool calls are never used.
 
-1. Tool Request Format (JSON-Embedded - PRIMARY AND ONLY):
+1. Tool Request Format (JSON-Embedded):
    - System prompts describe tools as JSON objects
    - LLM returns: ```json {"tool": "readFile", "path": "file.py", "reason": "..."} ```
    - _extract_json_tool_requests() extracts these JSON requests using regex
-   - Works identically across Claude, AWS Bedrock, and all other providers
-   - Structured tool_use blocks are NOT used (enable_tools=False always)
 
-2. Tool Result Format (Unified Plain Text):
-   - All providers use plain text format for tool results
+2. Tool Result Format (Plain Text):
    - Format: {"role": "user", "content": "[TOOL_RESULT: tool_id]\nresult"}
-   - This ensures consistent behavior across all providers
-   - No provider-specific tool_result content blocks
 
 3. Tool Execution Flow:
    - run_iterative_analysis() manages the conversation loop
    - Detects JSON tool requests in LLM response text via _extract_json_tool_requests()
    - Executes tools via _execute_json_tool_request()
-   - Converts JSON to tool_use format internally for execution
    - Returns results to LLM in next iteration using plain text format
    - Continues until analysis is complete
-
-4. Provider Compatibility:
-   - All providers (Claude, AWS Bedrock, etc.) work identically with JSON-embedded tools
-   - All use the same plain text format for tool results (body requests)
-   - No provider-specific tool handling needed
-   - Response format detection uses duck-typing (hasattr checks)
-   - Structured tools are disabled for ALL providers (enable_tools=False)
-
-5. Why JSON-Embedded Tools Only:
-   - Universal compatibility across all LLM providers
-   - Avoids provider-specific tool_use format mismatches
-   - Simpler architecture with single code path
-   - Prevents bugs like multiple tool_result formatting issues
-   - System prompts provide clear tool usage instructions
 """
 
 import json
@@ -56,13 +36,10 @@ from typing import Optional, Dict, Any, List, Callable
 
 from .providers.base_provider import BaseLLMProvider, LLMConfig
 from .providers.aws_bedrock_provider import AWSBedrockProvider
-from .providers.claude_provider import ClaudeProvider
-from .providers.dummy_provider import DummyProvider
 from ...utils.file_util import write_file, ensure_directory_exists
 from ...utils.json_util import clean_json_response
 from ...utils.log_util import get_logger
 from ...utils.output_directory_provider import get_output_directory_provider
-from ...utils.config_util import validate_llm_provider_type
 
 logger = get_logger(__name__)
 
@@ -75,99 +52,51 @@ class ConversationState:
     """
     Manages conversation state and history for proper MCP implementation.
     Ensures that full conversation history is maintained across tool interactions.
-    
-    UNIFIED TOOL RESULT FORMATTING:
-    ================================
-    All providers now use the same plain text format for tool results (body requests):
-    
+
+    Tool results are added as plain text user messages:
     Format: {"role": "user", "content": "[TOOL_RESULT: tool_id]\nresult"}
-    
-    This unified approach ensures consistent behavior across all providers:
-    - provider_type='claude': Uses plain text format
-    - provider_type='aws_bedrock': Uses plain text format
-    
-    The provider_type parameter is maintained for potential future differentiation
-    but currently both providers use identical formatting.
     """
-    
-    def __init__(self, provider_type: str = "claude"):
+
+    def __init__(self):
         self.messages = []
         self.system_prompt = None
         self.original_request = None
-        self.provider_type = provider_type.lower()
-    
+
     def set_system_prompt(self, system_prompt: str):
         """Set the system prompt for this conversation."""
         self.system_prompt = system_prompt
-    
+
     def set_original_request(self, request: str):
         """Set the original user request for context preservation."""
         self.original_request = request
-    
+
     def add_user_message(self, content: str):
         """Add a user message to the conversation history."""
         self.messages.append({"role": "user", "content": content})
-    
+
     def add_assistant_message(self, content: Any):
         """Add an assistant message to the conversation history."""
         self.messages.append({"role": "assistant", "content": content})
-    
+
     def add_tool_result(self, tool_use_id: str, result: str):
-        """
-        Add a tool result to the conversation history.
-        
-        UNIFIED FORMATTING FOR ALL PROVIDERS:
-        - Both 'claude' and 'aws_bedrock' use plain text user message format
-        - This ensures consistent behavior across all providers
-        - Format: [TOOL_RESULT: tool_id]\nresult
-        
-        This is the body request format that works reliably for both providers.
-        """
-        # Use plain text format for all providers (body requests)
+        """Add a tool result to the conversation history as a plain text user message."""
         tool_result_message = f"[TOOL_RESULT: {tool_use_id}]\n{result}"
         self.messages.append({
             "role": "user",
             "content": tool_result_message
         })
-    
-    def add_multiple_tool_results(self, tool_results: List[Dict[str, str]]):
-        """
-        Add multiple tool results as a single user message.
-        
-        This is critical for Claude API compatibility when multiple tool_use blocks
-        are present in a single assistant message. Claude expects all corresponding
-        tool results in a single user message, not separate messages.
-        
-        Args:
-            tool_results: List of dicts with 'tool_use_id' and 'result' keys
-        """
-        if not tool_results:
-            return
-        
-        # Combine all tool results into a single message
-        combined_results = []
-        for tool_result in tool_results:
-            tool_use_id = tool_result['tool_use_id']
-            result = tool_result['result']
-            combined_results.append(f"[TOOL_RESULT: {tool_use_id}]\n{result}")
-        
-        # Add as a single user message
-        self.messages.append({
-            "role": "user",
-            "content": "\n\n".join(combined_results)
-        })
-    
+
     def get_full_conversation(self) -> List[Dict]:
         """Get the complete conversation history."""
         return self.messages.copy()
-    
+
     def get_conversation_with_context(self, additional_context: str = None) -> List[Dict]:
         """
         Get conversation history with additional context for tool results.
         This helps Claude understand what to do with tool results.
         """
         messages = self.messages.copy()
-        
+
         # If we have tool results and additional context, add contextual guidance
         if additional_context and self.original_request:
             contextual_message = f"""
@@ -178,9 +107,9 @@ Original analysis request: {self.original_request}
 Please continue your analysis based on the tool results above.
 """
             messages.append({"role": "user", "content": contextual_message})
-        
+
         return messages
-    
+
     def clear(self):
         """Clear the conversation state."""
         self.messages = []
@@ -197,42 +126,19 @@ class ClaudeConfig:
     max_tokens: int = 64000
     temperature: float = 0.05
     timeout: int = 300
-    provider_type: str = "claude"  # New field for provider selection
+    provider_type: str = "aws_bedrock"
 
 
 def create_llm_provider(config: ClaudeConfig) -> BaseLLMProvider:
     """
-    Factory function to create the appropriate LLM provider based on configuration.
-    
-    PROVIDER SELECTION STRATEGY:
-    ============================
-    Uses config.provider_type (from llm_provider_type in config) to determine which provider to create:
-    
-    - 'claude': Creates ClaudeProvider
-      * Converts OpenAI tool format to Claude's input_schema format
-      * Returns Claude native response format
-    
-    - 'aws_bedrock': Creates AWSBedrockProvider
-      * Uses OpenAI tool format directly
-      * Returns OpenAI-compatible response format
-    
-    - 'dummy': Creates DummyProvider
-      * Mock provider for testing
-      * Returns mock responses
-    
-    No isinstance() checks are used - provider type is determined by configuration string.
-    Each provider handles its own format conversions internally.
+    Create an AWSBedrockProvider from the given configuration.
 
     Args:
-        config: LLM configuration including provider type
+        config: LLM configuration
 
     Returns:
-        BaseLLMProvider: Configured provider instance
-
-    Raises:
-        ValueError: If provider type is not supported
+        AWSBedrockProvider: Configured provider instance
     """
-    # Convert ClaudeConfig to LLMConfig
     llm_config = LLMConfig(
         api_key=config.api_key,
         api_url=config.api_url,
@@ -241,25 +147,8 @@ def create_llm_provider(config: ClaudeConfig) -> BaseLLMProvider:
         temperature=config.temperature,
         timeout=config.timeout
     )
-
-    provider_type = config.provider_type.lower()
-
-    # Use centralized validation
-    validate_llm_provider_type(provider_type)
-
-    if provider_type == "aws_bedrock":
-        logger.info(f"Creating AWS Bedrock provider for model: {config.model}")
-        return AWSBedrockProvider(llm_config)
-    elif provider_type == "claude":
-        logger.info(f"Creating Claude API provider for model: {config.model}")
-        return ClaudeProvider(llm_config)
-    elif provider_type == "dummy":
-        logger.info(f"Creating dummy provider for model: {config.model}")
-        logger.info("Dummy provider will return mock responses without making API calls")
-        return DummyProvider(llm_config)
-    else:
-        # This should never be reached due to validate_llm_provider_type above
-        raise ValueError(f"Unsupported provider type: {config.provider_type}")
+    logger.info(f"Creating AWS Bedrock provider for model: {config.model}")
+    return AWSBedrockProvider(llm_config)
 
 
 class Claude:
@@ -272,6 +161,10 @@ class Claude:
     _conversation_counter = 0
     _prompts_dir = None
     _errors_dir = None
+    
+    # NEW: Track current issue directory for numbered subdirectory logging
+    _current_issue_number = None
+    _current_issue_dir = None
 
     def __init__(self, config: ClaudeConfig):
         """
@@ -337,8 +230,10 @@ class Claude:
             logger.warning("Prompts directory not set up, cannot clear")
             return
 
-        # Reset conversation counter
+        # Reset conversation counter and issue tracking
         cls._conversation_counter = 0
+        cls._current_issue_number = None
+        cls._current_issue_dir = None
         
         # Clear existing prompts directory if it exists
         if os.path.exists(cls._prompts_dir):
@@ -350,6 +245,46 @@ class Claude:
             logger.info(f"Recreated prompts directory: {cls._prompts_dir}")
         else:
             logger.debug(f"Prompts directory does not exist, nothing to clear: {cls._prompts_dir}")
+
+    @classmethod
+    def start_issue_logging(cls, issue_number: int) -> None:
+        """
+        Start logging prompts for a specific issue in a numbered subdirectory.
+        
+        This creates a numbered subdirectory (e.g., prompts_sent/1/, prompts_sent/2/)
+        for each analyzed function/issue, preventing prompts from being overwritten
+        when analyzing multiple functions.
+        
+        Args:
+            issue_number: The issue/function number (1-based)
+        """
+        if not cls._prompts_dir:
+            logger.warning("Prompts directory not set up, cannot start issue logging")
+            return
+            
+        cls._current_issue_number = issue_number
+        cls._current_issue_dir = os.path.join(cls._prompts_dir, str(issue_number))
+        
+        # Create the numbered subdirectory
+        ensure_directory_exists(cls._current_issue_dir)
+        
+        # Reset conversation counter for this issue
+        cls._conversation_counter = 0
+        
+        logger.info(f"Started issue logging in: {cls._current_issue_dir}")
+    
+    @classmethod
+    def end_issue_logging(cls) -> None:
+        """
+        End logging for the current issue and reset to root prompts directory.
+        
+        This should be called after completing analysis of a function/issue
+        to ensure subsequent prompts go to the correct location.
+        """
+        if cls._current_issue_number is not None:
+            logger.info(f"Ended issue logging for issue {cls._current_issue_number}")
+        cls._current_issue_number = None
+        cls._current_issue_dir = None
 
     def start_conversation(self, analysis_type: str = "unknown", context_info: str = ""):
         """
@@ -388,8 +323,13 @@ class Claude:
             return None
 
         self.__class__._conversation_counter += 1
-        conversation_filename = f"conversation_{self._conversation_counter}.md"
-        conversation_path = os.path.join(self._prompts_dir, conversation_filename)
+        analysis_type = self.conversation_metadata.get('analysis_type', 'unknown')
+        safe_type = analysis_type.replace(' ', '_').replace('/', '_').replace('\\', '_')
+        conversation_filename = f"step{self._conversation_counter}_{safe_type}.md"
+        
+        # Use issue-specific directory if set, otherwise use root prompts directory
+        target_dir = self._current_issue_dir if self._current_issue_dir else self._prompts_dir
+        conversation_path = os.path.join(target_dir, conversation_filename)
 
         # Build conversation content
         conversation_content = f"# CONVERSATION {self._conversation_counter}\n\n"
@@ -572,11 +512,10 @@ class Claude:
         messages: List[Dict[str, str]],
         stream: bool = False,
         enable_system_cache: bool = True,
-        cache_ttl: str = "1h",
-        enable_tools: bool = True
+        cache_ttl: str = "1h"
     ) -> Optional[Dict[str, Any]]:
         """
-        Send a message to Claude API with custom message history.
+        Send a message to the AWS Bedrock API with custom message history.
 
         Args:
             messages: List of message dictionaries with 'role' and 'content'
@@ -592,8 +531,7 @@ class Claude:
                 messages,
                 stream=stream,
                 enable_system_cache=enable_system_cache,
-                cache_ttl=cache_ttl,
-                enable_tools=enable_tools
+                cache_ttl=cache_ttl
             )
         except ValueError as e:
             logger.error(f"Failed to create payload due to token limits: {e}")
@@ -623,15 +561,11 @@ class Claude:
         messages: List[Dict[str, str]],
         stream: bool = False,
         enable_system_cache: bool = True,
-        cache_ttl: str = "1h",
-        enable_tools: bool = True
+        cache_ttl: str = "1h"
     ) -> Optional[Dict[str, Any]]:
         """
-        Send a message to Claude API with separate system prompt following MCP pattern.
+        Send a message to the AWS Bedrock API with separate system prompt.
         This method maintains complete conversation history while keeping system prompt separate.
-        
-        CRITICAL FIX: This method now properly maintains conversation history by including
-        ALL previous messages in each turn, not just the current turn messages.
 
         Args:
             system_prompt: System prompt content
@@ -644,10 +578,6 @@ class Claude:
             Dict: API response or None on error
         """
         try:
-            # Create messages array with system prompt as separate message
-            # This follows MCP pattern: system prompt in system field, conversation in messages
-            # IMPORTANT: 'messages' parameter should contain the FULL conversation history,
-            # not just the current turn. This is the caller's responsibility.
             full_messages = [
                 {"role": "system", "content": system_prompt}
             ] + messages
@@ -656,8 +586,7 @@ class Claude:
                 full_messages,
                 stream=stream,
                 enable_system_cache=enable_system_cache,
-                cache_ttl=cache_ttl,
-                enable_tools=enable_tools
+                cache_ttl=cache_ttl
             )
         except ValueError as e:
             logger.error(f"Failed to create payload due to token limits: {e}")
@@ -792,9 +721,32 @@ class Claude:
         context_guidance_template: str = None,
         response_processor: Callable[[str], str] = None,
         max_iterations: int = None,
-        token_usage_callback: Callable[[Dict[str, Any], int], None] = None
+        token_usage_callback: Callable[[Dict[str, Any], int], None] = None,
+        fallback_json_guidance: str = None,
+        json_validator: Callable[[Any], bool] = None
     ) -> Optional[str]:
         """
+        DEPRECATED: Use stage-specific analyzers from hindsight.core.llm.iterative instead.
+        
+        This method uses clean_json_response() which returns the LAST valid JSON candidate,
+        causing incorrect results when LLM responses contain multiple JSON structures
+        (e.g., context bundle dict AND collection_notes array).
+        
+        Recommended replacements:
+        - ContextCollectionAnalyzer: For Stage 4a (dict with 'primary_function')
+        - CodeAnalysisAnalyzer: For Stage 4b (array of issue dicts)
+        - DiffContextAnalyzer: For Stage Da (dict with 'changed_functions')
+        - DiffAnalysisAnalyzer: For Stage Db (array of issue dicts)
+        
+        Example migration:
+            # Old (deprecated):
+            result = self.claude.run_iterative_analysis(system_prompt, user_prompt, ...)
+            
+            # New (recommended):
+            from hindsight.core.llm.iterative import ContextCollectionAnalyzer
+            analyzer = ContextCollectionAnalyzer(claude=self.claude, tools_executor=self, ...)
+            result = analyzer.run_iterative_analysis(system_prompt, user_prompt)
+        
         Unified iterative analysis method following Claude's MCP pattern with configurable tool support.
         Maintains complete conversation history and uses structured tool calls.
         
@@ -813,10 +765,26 @@ class Claude:
             response_processor: Optional function to process final response
             max_iterations: Maximum iterations (defaults to MAX_TOOL_ITERATIONS)
             token_usage_callback: Optional callback for token usage logging
+            fallback_json_guidance: Custom re-prompt injected when the LLM returns no valid JSON.
+                Overrides the default jsonOutputGuidance.md (which requests a JSON array).
+                Use this when the expected output is a JSON object rather than an array.
+            json_validator: Optional callable that takes the parsed JSON value and returns
+                True if it is acceptable. When provided, JSON that fails this check is
+                treated as "not yet valid" and the loop continues with fallback_json_guidance,
+                exactly as if no JSON had been found.  Example:
+                    json_validator=lambda p: isinstance(p, dict)
+                ensures the LLM must return a JSON object, not an array.
             
         Returns:
             str: Final analysis result or None on error
         """
+        # DEPRECATION WARNING: Log error to alert developers to migrate to stage-specific analyzers
+        logger.error(
+            "DEPRECATED: Claude.run_iterative_analysis() is deprecated and may return incorrect JSON. "
+            "Use stage-specific analyzers from hindsight.core.llm.iterative instead: "
+            "ContextCollectionAnalyzer, CodeAnalysisAnalyzer, DiffContextAnalyzer, DiffAnalysisAnalyzer. "
+            "See docstring for migration example."
+        )
         # Import constants here to avoid circular imports
         from ..constants import MAX_TOOL_ITERATIONS
         
@@ -833,7 +801,7 @@ class Claude:
             logger.info(f"Supported tools: {supported_tools}")
 
         # Initialize conversation state to track full history
-        conversation_state = ConversationState(self.config.provider_type)
+        conversation_state = ConversationState()
         conversation_state.set_system_prompt(system_prompt)
         conversation_state.set_original_request(user_prompt)
         conversation_state.add_user_message(user_prompt)
@@ -878,30 +846,23 @@ class Claude:
             
             if should_send_system or not system_prompt_sent:
                 # Send with system prompt (first time or TTL expired)
-                # CRITICAL: Disable structured tools for ALL providers to use JSON-embedded tools
-                # All providers should follow system prompt instructions for JSON tool requests
-                # instead of using native tool_use blocks which cause format mismatches
-                # JSON-embedded tools work universally across Claude, AWS Bedrock, and other providers
                 response = self.send_message_with_system(
                     system_prompt=system_prompt,
                     messages=full_conversation,
                     enable_system_cache=True,
-                    cache_ttl="1h",
-                    enable_tools=False  # Always disable structured tools, use JSON-embedded instead
+                    cache_ttl="1h"
                 )
-                
+
                 # Record that system prompt was sent
                 ttl_manager.record_system_prompt_sent(system_prompt)
                 system_prompt_sent = True
                 logger.info(f"System prompt sent in iteration {iteration} with {len(full_conversation)} messages")
             else:
                 # Send without system prompt (use cached version)
-                # CRITICAL: Disable structured tools for ALL providers to use JSON-embedded tools
                 response = self.send_message(
                     messages=full_conversation,
                     enable_system_cache=True,
-                    cache_ttl="1h",
-                    enable_tools=False  # Always disable structured tools, use JSON-embedded instead
+                    cache_ttl="1h"
                 )
                 logger.info(f"Using cached system prompt in iteration {iteration} with {len(full_conversation)} messages")
 
@@ -913,182 +874,83 @@ class Claude:
             if token_usage_callback:
                 token_usage_callback(response, iteration)
 
-            # Handle both Claude direct API and AWS Bedrock response formats
-            # PROVIDER FORMAT DETECTION:
-            # - Uses duck-typing (hasattr) instead of isinstance() or provider_type checks
-            # - Claude format: has "content" key with list value (content blocks)
-            # - AWS Bedrock format: has "choices" key with array value
-            # - This approach works regardless of which provider was used
-            assistant_content = ""
-            tool_uses = []
-            content_blocks = []
-
-            # Detect response format based on structure (not isinstance)
-            has_content_blocks = "content" in response and response.get("content") and hasattr(response.get("content"), '__iter__') and not hasattr(response.get("content"), 'strip')
-            has_choices = "choices" in response
-            
-            # Check if this is Claude's native format (content blocks)
-            if has_content_blocks:
-                # Claude direct API format
-                content_blocks = response.get("content", [])
-                if not content_blocks:
-                    logger.error(f"No content blocks in Claude API response for iteration {iteration}")
-                    return None
-
-                # Extract text content and tool uses from Claude's native format
-                for block in content_blocks:
-                    block_type = block.get("type") if hasattr(block, 'get') else None
-                    if block_type == "text":
-                        assistant_content += block.get("text", "")
-                    elif block_type == "tool_use":
-                        tool_uses.append(block)
-
-            # Check if this is AWS Bedrock format (choices array)
-            elif has_choices:
-                # AWS Bedrock format (similar to OpenAI)
-                choices = response.get("choices", [])
-                if not choices:
-                    logger.error(f"No choices in AWS Bedrock API response for iteration {iteration}")
-                    return None
-
-                assistant_message = choices[0].get("message", {})
-                
-                # AWS Bedrock with Claude models returns content in Claude's native format
-                message_content = assistant_message.get("content", "")
-                
-                # Handle both string content and Claude's native content blocks format
-                # Check if content is string-like (has strip method)
-                is_string_content = hasattr(message_content, 'strip')
-                is_list_content = hasattr(message_content, '__iter__') and not is_string_content
-                
-                if is_string_content:
-                    # Simple string content - no tool uses
-                    assistant_content = message_content
-                    content_blocks = [{"type": "text", "text": assistant_content}] if assistant_content else []
-                elif is_list_content:
-                    # Claude's native content blocks format - extract text and tool uses
-                    for block in message_content:
-                        block_type = block.get("type") if hasattr(block, 'get') else None
-                        if block_type == "text":
-                            assistant_content += block.get("text", "")
-                        elif block_type == "tool_use":
-                            tool_uses.append(block)
-                    content_blocks = message_content
-                else:
-                    # Fallback: try OpenAI-style tool_calls format
-                    assistant_content = str(message_content)
-                    tool_calls = assistant_message.get("tool_calls", [])
-                    
-                    # Convert OpenAI-style tool_calls to Claude-style tool_uses for consistency
-                    for tool_call in tool_calls:
-                        tool_call_type = tool_call.get("type") if hasattr(tool_call, 'get') else None
-                        if tool_call_type == "function":
-                            function_info = tool_call.get("function", {})
-                            arguments_str = function_info.get("arguments", "{}")
-                            try:
-                                arguments = json.loads(arguments_str)
-                            except json.JSONDecodeError:
-                                arguments = {}
-                            
-                            tool_uses.append({
-                                "id": tool_call.get("id", ""),
-                                "name": function_info.get("name", ""),
-                                "input": arguments
-                            })
-
-                    # Create content_blocks for consistent message format
-                    content_blocks = []
-                    if assistant_content:
-                        content_blocks.append({"type": "text", "text": assistant_content})
-                    for tool_use in tool_uses:
-                        content_blocks.append({
-                            "type": "tool_use",
-                            "id": tool_use.get("id"),
-                            "name": tool_use.get("name"),
-                            "input": tool_use.get("input", {})
-                        })
-
-            else:
-                logger.error(f"Unknown API response format for iteration {iteration}: {list(response.keys())}")
+            # Extract content from AWS Bedrock response format
+            # Response format: {"choices": [{"message": {"content": "..."}}], "usage": {...}}
+            choices = response.get("choices", [])
+            if not choices:
+                logger.error(f"No choices in AWS Bedrock API response for iteration {iteration}")
                 return None
 
-            logger.info(f"Received response: {len(assistant_content)} characters, {len(tool_uses)} tool uses")
+            assistant_content = choices[0].get("message", {}).get("content", "")
+            if not isinstance(assistant_content, str):
+                assistant_content = str(assistant_content) if assistant_content else ""
 
-            # Check for JSON-embedded tool requests as fallback
+            logger.info(f"Received response: {len(assistant_content)} characters")
+
+            # Extract JSON-embedded tool requests from response text
             json_tool_requests = []
-            if not tool_uses and tools_enabled:
+            if tools_enabled:
                 json_tool_requests = self._extract_json_tool_requests(assistant_content)
                 if json_tool_requests:
                     logger.info(f"Found {len(json_tool_requests)} JSON-embedded tool requests")
 
-            # Use conversation state to properly maintain history across tool interactions
-            if (tool_uses or json_tool_requests) and tools_enabled:
-                # Assistant made tool uses - add to conversation state
-                conversation_state.add_assistant_message(content_blocks)
-
-                # Execute structured tool uses if present
-                if tool_uses:
-                    logger.info(f"Processing {len(tool_uses)} structured tool uses in iteration {iteration}")
-                    
-                    # Collect all tool results first
-                    tool_results = []
-                    for tool_use in tool_uses:
-                        tool_result = self._execute_tool_use(tool_use, tools_executor, supported_tools)
-                        tool_id = tool_use.get("id", "unknown")
-                        tool_results.append({
-                            'tool_use_id': tool_id,
-                            'result': tool_result
-                        })
-                        logger.info(f"Executed tool {tool_use.get('name', 'unknown')} (id: {tool_id})")
-                    
-                    # Add all tool results as a single message (critical for Claude API)
-                    conversation_state.add_multiple_tool_results(tool_results)
-                    logger.info(f"Added {len(tool_results)} tool results as single message to conversation history")
-
-                # Execute JSON-embedded tool requests if present
-                elif json_tool_requests:
-                    logger.info(f"Processing {len(json_tool_requests)} JSON-embedded tool requests in iteration {iteration}")
-                    for i, tool_request in enumerate(json_tool_requests):
-                        tool_result = self._execute_json_tool_request(tool_request, tools_executor, supported_tools)
-                        tool_id = f"json_tool_{iteration}_{i}"
-                        # Add tool result to conversation state for next iteration context
-                        conversation_state.add_tool_result(tool_id, tool_result)
-                        logger.info(f"Added JSON tool result for {tool_request.get('tool', 'unknown')} (id: {tool_id})")
+            # Dispatch: tool requests → continue loop; no tools → final answer
+            if json_tool_requests and tools_enabled:
+                # Assistant made tool requests — add message and execute tools
+                conversation_state.add_assistant_message(assistant_content)
+                logger.info(f"Processing {len(json_tool_requests)} JSON-embedded tool requests in iteration {iteration}")
+                for i, tool_request in enumerate(json_tool_requests):
+                    tool_result = self._execute_json_tool_request(tool_request, tools_executor, supported_tools)
+                    tool_id = f"json_tool_{iteration}_{i}"
+                    conversation_state.add_tool_result(tool_id, tool_result)
+                    logger.info(f"Added JSON tool result for {tool_request.get('tool', 'unknown')} (id: {tool_id})")
 
                 logger.info(f"Tool results added to conversation history")
                 # Continue to next iteration to let LLM analyze tool results
                 continue
-            elif (tool_uses or json_tool_requests) and not tools_enabled:
-                # Tools were requested but not enabled - inform the LLM
-                tool_count = len(tool_uses) + len(json_tool_requests)
-                logger.warning(f"LLM requested {tool_count} tools but tools are disabled")
-                conversation_state.add_assistant_message(content_blocks)
-                
-                # Add a message explaining tools are not available
-                no_tools_message = "Tools are not available in this analysis context. Please provide your analysis based on the information already provided."
-                conversation_state.add_user_message(no_tools_message)
-                continue
             else:
-                # No tool uses - add regular assistant message to conversation state
-                conversation_state.add_assistant_message(content_blocks)
+                # No tool requests - add regular assistant message to conversation state
+                conversation_state.add_assistant_message(assistant_content)
 
                 # Apply clean_json_response to check if we have valid structured output
-                # This handles mixed responses (explanatory text + JSON) properly
                 cleaned_response = clean_json_response(assistant_content)
-                
+
                 # Check if we have valid JSON content after cleaning
                 has_valid_json = False
                 if cleaned_response and cleaned_response.strip():
                     try:
-                        # Try to parse as JSON to validate structure
                         import json
-                        json.loads(cleaned_response)
-                        has_valid_json = True
-                        logger.info(f"Found valid JSON in response after cleaning in iteration {iteration}")
+                        parsed_json = json.loads(cleaned_response)
+                        
+                        # Skip validation if this looks like a tool call JSON (not final output)
+                        # Tool calls have a "tool" key at the top level
+                        is_tool_call_json = isinstance(parsed_json, dict) and 'tool' in parsed_json
+                        
+                        if is_tool_call_json:
+                            # This is a tool call JSON that wasn't caught by _extract_json_tool_requests
+                            # (possibly malformed or edge case) - don't treat as final output
+                            logger.info(f"Found tool-call JSON in iteration {iteration} (has 'tool' key) — not treating as final output")
+                        elif json_validator is None or json_validator(parsed_json):
+                            has_valid_json = True
+                            logger.info(f"Found valid JSON in response after cleaning in iteration {iteration}")
+                        else:
+                            # Debug logging: show what structure was received vs what was expected
+                            json_type = type(parsed_json).__name__
+                            if isinstance(parsed_json, dict):
+                                top_keys = list(parsed_json.keys())[:5]  # Show first 5 keys
+                                logger.info(f"Found JSON but failed shape validator in iteration {iteration} — "
+                                           f"got dict with keys: {top_keys} — continuing")
+                            elif isinstance(parsed_json, list):
+                                list_len = len(parsed_json)
+                                first_item_type = type(parsed_json[0]).__name__ if parsed_json else 'empty'
+                                logger.info(f"Found JSON but failed shape validator in iteration {iteration} — "
+                                           f"got list with {list_len} items, first item type: {first_item_type} — continuing")
+                            else:
+                                logger.info(f"Found JSON but failed shape validator in iteration {iteration} — "
+                                           f"got {json_type} — continuing")
                     except json.JSONDecodeError:
-                        # Not valid JSON, continue iteration
                         logger.info(f"No valid JSON found after cleaning in iteration {iteration}")
-                
+
                 # If we have valid JSON or this is the last possible iteration, complete analysis
                 if has_valid_json or iteration >= max_iterations:
                     if has_valid_json:
@@ -1097,7 +959,7 @@ class Claude:
                     else:
                         logger.info(f"Analysis complete (max iterations reached) in iteration {iteration}")
                         final_response = assistant_content
-                    
+
                     # Apply response processor if provided
                     if response_processor:
                         try:
@@ -1110,13 +972,16 @@ class Claude:
                         return final_response
                 else:
                     # No valid JSON found and not at max iterations - continue iteration
-                    # Add a strict guidance message from markdown file to enforce JSON output
-                    try:
-                        from ..prompts.prompt_builder import PromptBuilder
-                        guidance_message = PromptBuilder.build_json_output_guidance()
-                    except Exception as e:
-                        logger.warning(f"Could not load JSON output guidance from file: {e}")
-                        guidance_message = "Please provide your analysis results as a valid JSON array starting with [ and ending with ]."
+                    # Add a strict guidance message to enforce JSON output
+                    if fallback_json_guidance:
+                        guidance_message = fallback_json_guidance
+                    else:
+                        try:
+                            from ..prompts.prompt_builder import PromptBuilder
+                            guidance_message = PromptBuilder.build_json_output_guidance()
+                        except Exception as e:
+                            logger.warning(f"Could not load JSON output guidance from file: {e}")
+                            guidance_message = "Please provide your analysis results as a valid JSON array starting with [ and ending with ]."
                     conversation_state.add_user_message(guidance_message)
                     logger.info(f"No structured output found, continuing iteration {iteration + 1}")
                     continue
@@ -1201,71 +1066,36 @@ class Claude:
     def _execute_json_tool_request(self, tool_request: Dict[str, Any], tools_executor: Any, supported_tools: List[str]) -> str:
         """
         Execute a JSON-embedded tool request using the centralized orchestrator.
-        This is the PRIMARY tool execution mechanism used across all providers.
-        
-        Converts JSON format to Claude tool_use format for execution:
+
+        Converts JSON format to tool_use format for execution:
         - Input: {"tool": "readFile", "path": "file.py", "reason": "..."}
         - Converts to: {"id": "...", "name": "readFile", "input": {"path": "file.py", "reason": "..."}}
         - Executes via tools_executor.tools.execute_tool_use()
-        
-        Works identically for Claude, AWS Bedrock, and other providers.
-        
+
         Args:
             tool_request: JSON tool request dictionary like {"tool": "readFile", "path": "file.py"}
             tools_executor: Object with tools attribute for tool execution
             supported_tools: List of supported tool names
-            
+
         Returns:
             str: Tool execution result
         """
         try:
             tool_name = tool_request.get("tool", "unknown")
-            
+
             # Check if this tool is supported
             if tool_name not in supported_tools:
                 return f"Error: Tool '{tool_name}' is not supported. Available tools: {supported_tools}"
-            
-            # Convert JSON format to Claude tool_use format for execution
-            claude_tool_use = {
+
+            # Convert JSON format to tool_use format for execution
+            tool_use = {
                 "id": f"json_{tool_name}_{int(time.time())}",
                 "name": tool_name,
                 "input": {k: v for k, v in tool_request.items() if k != "tool"}
             }
-            
-            # Use the centralized tool orchestrator from Tools class
-            return tools_executor.tools.execute_tool_use(claude_tool_use)
-            
+
+            return tools_executor.tools.execute_tool_use(tool_use)
+
         except Exception as e:
             logger.error(f"Error executing JSON tool request: {e}")
             return f"Error executing JSON tool request: {str(e)}"
-
-    def _execute_tool_use(self, tool_use: Dict[str, Any], tools_executor: Any, supported_tools: List[str]) -> str:
-        """
-        Execute a structured tool_use using the centralized orchestrator.
-        This is FALLBACK support for Claude's native tool_use blocks.
-        
-        The primary tool mechanism is JSON-embedded tool requests (_execute_json_tool_request).
-        This method handles structured tool calls when the LLM uses Claude's native format.
-
-        Args:
-            tool_use: Tool_use block from API response
-                     Format: {"id": "...", "name": "readFile", "input": {"path": "..."}}
-            tools_executor: Object with tools attribute for tool execution
-            supported_tools: List of supported tool names
-
-        Returns:
-            str: Tool execution result
-        """
-        try:
-            tool_name = tool_use.get("name", "unknown")
-            
-            # Check if this tool is supported
-            if tool_name not in supported_tools:
-                return f"Error: Tool '{tool_name}' is not supported. Available tools: {supported_tools}"
-
-            # Use the centralized tool orchestrator from Tools class
-            return tools_executor.tools.execute_tool_use(tool_use)
-            
-        except Exception as e:
-            logger.error(f"Error executing Claude tool use: {e}")
-            return f"Error executing tool use: {str(e)}"

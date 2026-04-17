@@ -70,14 +70,14 @@ class LLMProviderConfig(BaseModel):
         if provider_type == 'aws_bedrock':
             # Load from environment if not provided in config
             # Priority: project-credentials > credentials > environment variables
-            
+
             # Load project-credentials from environment if not provided
             if not self.project_credentials:
                 env_project_token = os.getenv("FLOODGATE_PROJECT_TOKEN", "").strip()
                 if env_project_token:
                     object.__setattr__(self, 'project_credentials', env_project_token)
                     logger.debug("Loaded project-credentials from FLOODGATE_PROJECT_TOKEN environment variable")
-            
+
             # Load credentials from environment if not provided
             if not self.credentials:
                 env_credentials = (
@@ -88,31 +88,16 @@ class LLMProviderConfig(BaseModel):
                 if env_credentials:
                     object.__setattr__(self, 'credentials', env_credentials)
                     logger.debug("Loaded credentials from environment variable")
-            
+
             # Also load AWS credentials if needed for direct AWS access
             if not self.access_key_id or self.access_key_id in ["YOUR_AWS_ACCESS_KEY", "your_access_key_here"]:
                 object.__setattr__(self, 'access_key_id', os.getenv("AWS_ACCESS_KEY_ID"))
-            
+
             if not self.secret_access_key or self.secret_access_key in ["YOUR_AWS_SECRET_KEY", "your_secret_key_here"]:
                 object.__setattr__(self, 'secret_access_key', os.getenv("AWS_SECRET_ACCESS_KEY"))
-            
+
             if not self.region_name:
                 object.__setattr__(self, 'region_name', os.getenv("AWS_REGION", "us-east-1"))
-                
-        elif provider_type == 'claude':
-            # Claude provider - use credentials field
-            if not self.credentials or self.credentials in ["your claude api key", "your_api_key_here"]:
-                env_credentials = (
-                    os.getenv("ANTHROPIC_API_KEY", "").strip() or
-                    os.getenv("CREDENTIALS", "").strip() or
-                    os.getenv("CLAUDE_API_KEY", "").strip()
-                )
-                if env_credentials:
-                    object.__setattr__(self, 'credentials', env_credentials)
-                    
-        elif provider_type == 'dummy':
-            # Dummy provider doesn't need real credentials
-            object.__setattr__(self, 'credentials', "dummy-key")
     
     def get_api_key(self) -> Optional[str]:
         """

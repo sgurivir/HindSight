@@ -315,24 +315,8 @@ class TestEnhancedExcludeDirectories:
             (src_dir / "main.py").write_text("# main")
             yield tmpdir
 
-    def test_get_enhanced_exclude_directories_dummy_provider(self, temp_repo):
-        """Test enhanced exclusions with dummy LLM provider."""
-        analyzer = ConcreteAnalyzer()
-        
-        config = {'llm_provider_type': 'dummy'}
-        
-        result = analyzer.get_enhanced_exclude_directories(
-            temp_repo,
-            config
-        )
-        
-        assert isinstance(result, list)
-
-    @patch('hindsight.utils.config_util.get_llm_provider_type')
-    def test_get_enhanced_exclude_directories_no_api_key(self, mock_get_provider, temp_repo):
+    def test_get_enhanced_exclude_directories_no_api_key(self, temp_repo):
         """Test enhanced exclusions without API key."""
-        mock_get_provider.return_value = 'claude'
-        
         analyzer = ConcreteAnalyzer()
         config = {}  # No API key
         

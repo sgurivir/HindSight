@@ -327,8 +327,7 @@ class ImplementationToolsMixin:
         start_time = time.time()
         self.tool_usage_stats['getImplementation']['count'] += 1
 
-        logger.info(f"[TOOL] getImplementation called #{self.tool_usage_stats['getImplementation']['count']} - Name: {name}")
-        logger.info(f"[AI REASONING] {reason if reason else 'No reason provided'}")
+        logger.info(f"[TOOL] getImplementation called #{self.tool_usage_stats['getImplementation']['count']} - Name: {name} | [AI REASONING] {reason if reason else 'No reason provided'}")
 
         try:
             # First try to find as a class
@@ -605,8 +604,7 @@ class ImplementationToolsMixin:
             logger.error(f"[TOOL] getSummaryOfFile - Empty path provided")
             return error_msg
 
-        logger.info(f"[TOOL] getSummaryOfFile called #{self.tool_usage_stats['getSummaryOfFile']['count']} - Path: {file_path}")
-        logger.info(f"[AI REASONING] {reason if reason else 'No reason provided'}")
+        logger.info(f"[TOOL] getSummaryOfFile called #{self.tool_usage_stats['getSummaryOfFile']['count']} - Path: {file_path} | [AI REASONING] {reason if reason else 'No reason provided'}")
 
         try:
             summary_content = self._find_summary_by_path(file_path)

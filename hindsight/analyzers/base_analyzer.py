@@ -108,46 +108,43 @@ class BaseAnalyzer(ABC):
         except Exception as e:
             logger.warning(f"Static directory analysis failed: {e}")
         
-        # Try LLM-based enhancement if provider is not dummy
+        # Try LLM-based enhancement
         llm_provider_type = get_llm_provider_type(config)
-        if llm_provider_type != "dummy":
-            try:
-                logger.info("Attempting LLM-based directory analysis for enhanced exclusions...")
-                
-                # Lazy import to avoid circular dependency
-                from .directory_classifier import LLMBasedDirectoryClassifier
-                from ..utils.config_util import get_api_key_from_config
-                
-                # Get API key
-                api_key = get_api_key_from_config(config)
-                if not api_key:
-                    logger.warning("No API key available for LLM-based directory analysis, using static analysis only")
-                    return list(base_exclusions)
-                
-                # Create LLM classifier
-                llm_classifier = LLMBasedDirectoryClassifier.from_config(config)
-                
-                # Use base exclusions as already excluded directories
-                already_excluded = list(base_exclusions)
-                
-                # Get LLM recommendations
-                llm_exclusions = llm_classifier.analyze_directories(
-                    repo_path=repo_path,
-                    subdirectories=None,  # Let it discover all directories
-                    already_excluded_directories=already_excluded
-                )
-                
-                if llm_exclusions:
-                    logger.info(f"LLM analysis recommended {len(llm_exclusions)} additional directories for exclusion")
-                    base_exclusions.update(llm_exclusions)
-                else:
-                    logger.info("LLM analysis completed but found no additional directories to exclude")
-                    
-            except Exception as e:
-                logger.warning(f"LLM-based directory analysis failed (using static analysis only): {e}")
-                # Continue with static analysis results
-        else:
-            logger.info("Using dummy LLM provider - skipping LLM-based directory analysis")
+        try:
+            logger.info("Attempting LLM-based directory analysis for enhanced exclusions...")
+
+            # Lazy import to avoid circular dependency
+            from .directory_classifier import LLMBasedDirectoryClassifier
+            from ..utils.config_util import get_api_key_from_config
+
+            # Get API key
+            api_key = get_api_key_from_config(config)
+            if not api_key:
+                logger.warning("No API key available for LLM-based directory analysis, using static analysis only")
+                return list(base_exclusions)
+
+            # Create LLM classifier
+            llm_classifier = LLMBasedDirectoryClassifier.from_config(config)
+
+            # Use base exclusions as already excluded directories
+            already_excluded = list(base_exclusions)
+
+            # Get LLM recommendations
+            llm_exclusions = llm_classifier.analyze_directories(
+                repo_path=repo_path,
+                subdirectories=None,  # Let it discover all directories
+                already_excluded_directories=already_excluded
+            )
+
+            if llm_exclusions:
+                logger.info(f"LLM analysis recommended {len(llm_exclusions)} additional directories for exclusion")
+                base_exclusions.update(llm_exclusions)
+            else:
+                logger.info("LLM analysis completed but found no additional directories to exclude")
+
+        except Exception as e:
+            logger.warning(f"LLM-based directory analysis failed (using static analysis only): {e}")
+            # Continue with static analysis results
         
         final_exclusions = list(base_exclusions)
         logger.info(f"Enhanced directory analysis complete: {len(final_exclusions)} total directories to exclude")

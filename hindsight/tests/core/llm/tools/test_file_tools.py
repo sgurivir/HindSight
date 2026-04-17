@@ -231,15 +231,21 @@ class TestGetFileContentByLinesTool:
         
         # Should adjust to file end and return content
         assert "def hello" in result
+        # Should include total line count in header (Solution 1)
+        assert "total" in result.lower()
 
     def test_get_file_content_by_lines_start_exceeds_file_length(self, tools_instance, temp_repo):
-        """Test with start line exceeding file length."""
+        """Test with start line exceeding file length - should return enhanced error message."""
         result = tools_instance.execute_tool_use({
             "name": "getFileContentByLines",
             "input": {"path": "test.py", "startLine": 1000, "endLine": 1005}
         })
         
+        # Solution 2: Enhanced error message should include helpful guidance
         assert "error" in result.lower()
+        assert "total lines" in result.lower() or "valid" in result.lower()
+        # Should suggest using checkFileSize or provide valid range
+        assert "suggestion" in result.lower() or "valid line range" in result.lower()
 
     def test_get_file_content_by_lines_file_not_found(self, tools_instance):
         """Test with non-existent file."""
@@ -302,6 +308,18 @@ class TestGetFileContentByLinesTool:
         })
         
         assert tools_instance.tool_usage_stats['getFileContentByLines']['count'] >= 1
+
+    def test_get_file_content_by_lines_header_includes_total_lines(self, tools_instance, temp_repo):
+        """Test that response header includes total line count (Solution 1)."""
+        result = tools_instance.execute_tool_use({
+            "name": "getFileContentByLines",
+            "input": {"path": "test.py", "startLine": 1, "endLine": 5}
+        })
+        
+        # Header should include "of X total" format
+        assert "total" in result.lower()
+        # Should show the line range requested
+        assert "lines 1-5" in result.lower() or "lines 1-5" in result
 
     def test_get_file_content_alias(self, tools_instance, temp_repo):
         """Test that getFileContent alias works."""

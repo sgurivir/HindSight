@@ -299,8 +299,9 @@ class LLMResponseChallenger:
         """
         Real LLM-based challenging using structured tools like the main code analyzer.
         
-        Uses the shared Tools class from hindsight.core.llm.tools.tools for OpenAI-compatible
-        tool execution, ensuring consistency with the main code analyzer pipeline.
+        Uses the ResponseChallengerAnalyzer from hindsight.core.llm.iterative for proper
+        stage-specific JSON extraction and validation, ensuring consistency with the
+        main code analyzer pipeline.
         
         Args:
             issues: List of issue dictionaries
@@ -309,6 +310,7 @@ class LLMResponseChallenger:
         """
         from ..core.llm.llm import Claude, ClaudeConfig
         from ..core.llm.tools.tools import Tools
+        from ..core.llm.iterative import ResponseChallengerAnalyzer
         from ..utils.config_util import get_llm_provider_type
         
         original_count = len(issues)
@@ -447,8 +449,7 @@ class LLMResponseChallenger:
                     "code_snippet": issue.get('code_snippet', issue.get('codeSnippet', ''))
                 }
                 
-                # Build context message - only include tools information
-                # Let the LLM use tools to fetch the actual code
+                # Build context message
                 context_parts = []
                 
                 # Add trace context if available (for trace analysis)
@@ -457,16 +458,116 @@ class LLMResponseChallenger:
                     callstack = trace_context.get('callstack', [])
                     context_parts.append(f"TRACE CONTEXT:\nTrace ID: {trace_id}\nCallstack:\n" + "\n".join(callstack[:10]))  # First 10 frames
                 
-                # Add tools information - LLM should use these to fetch code
+                # Pre-fetch file content to avoid redundant file reads by each challenger voter
+                # This optimization passes the file content directly in the prompt instead of
+                # requiring the LLM to use tools to read it (which would triple the file-read cost
+                # when using 3 parallel voters)
+                file_content_provided = False
+                file_content_section = ""
+                
+                # First, try to use function_context if provided (already contains the relevant code)
+                if function_context:
+                    file_content_section = f"SOURCE CODE CONTEXT (from analysis stage):\n```\n{function_context}\n```"
+                    file_content_provided = True
+                    self.logger.debug(f"Using function_context ({len(function_context)} chars) for issue {i}")
+                
+                # If no function_context, try to read the file content directly
+                if not file_content_provided and self.file_content_provider:
+                    file_path = issue_data.get('file_path', '')
+                    line_number = issue_data.get('line_number', '')
+                    
+                    if file_path and file_path != 'Unknown':
+                        try:
+                            # Read the file content using file_content_provider
+                            full_content = self.file_content_provider.get_file_content(file_path)
+                            
+                            if full_content:
+                                # If we have a line number, extract a context window around it
+                                if line_number and str(line_number).isdigit():
+                                    line_num = int(line_number)
+                                    lines = full_content.split('\n')
+                                    
+                                    # Extract context window: 50 lines before and after the issue line
+                                    context_window = 50
+                                    start_line = max(0, line_num - context_window - 1)
+                                    end_line = min(len(lines), line_num + context_window)
+                                    
+                                    # Add line numbers for reference
+                                    numbered_lines = []
+                                    for idx, line in enumerate(lines[start_line:end_line], start=start_line + 1):
+                                        marker = ">>>" if idx == line_num else "   "
+                                        numbered_lines.append(f"{marker} {idx:4d} | {line}")
+                                    
+                                    context_content = '\n'.join(numbered_lines)
+                                    file_content_section = f"SOURCE FILE CONTENT ({file_path}, lines {start_line + 1}-{end_line}):\n```\n{context_content}\n```"
+                                    file_content_provided = True
+                                    self.logger.debug(f"Pre-fetched file content for issue {i}: {file_path} (lines {start_line + 1}-{end_line})")
+                                else:
+                                    # No line number, include full file if not too large
+                                    if len(full_content) <= 50000:  # 50KB limit
+                                        file_content_section = f"SOURCE FILE CONTENT ({file_path}):\n```\n{full_content}\n```"
+                                        file_content_provided = True
+                                        self.logger.debug(f"Pre-fetched full file content for issue {i}: {file_path} ({len(full_content)} chars)")
+                                    else:
+                                        self.logger.debug(f"File too large to include directly for issue {i}: {file_path} ({len(full_content)} chars)")
+                        except Exception as e:
+                            self.logger.debug(f"Failed to pre-fetch file content for issue {i}: {e}")
+                
+                # Add file content to context if we have it
+                if file_content_section:
+                    context_parts.append(file_content_section)
+                
+                # Add tools information - only needed if file content wasn't provided
+                # Tools are still available for additional context gathering if needed
                 if tools_executor and supported_tools:
-                    context_parts.append(f"AVAILABLE TOOLS:\nYou have access to these tools to gather code context:\n" + "\n".join(f"- {tool}" for tool in supported_tools))
-                    context_parts.append("\nIMPORTANT: Use these tools to read the actual file contents and verify the issue. Start by reading the file at the specified location.")
+                    if file_content_provided:
+                        context_parts.append(f"ADDITIONAL TOOLS (if needed for further investigation):\nYou have access to these tools if you need additional context:\n" + "\n".join(f"- {tool}" for tool in supported_tools))
+                    else:
+                        context_parts.append(f"AVAILABLE TOOLS:\nYou have access to these tools to gather code context:\n" + "\n".join(f"- {tool}" for tool in supported_tools))
+                        context_parts.append("\nIMPORTANT: Use these tools to read the actual file contents and verify the issue. Start by reading the file at the specified location.")
                 
                 context_section = "\n\n".join(context_parts) if context_parts else ""
                 
-                # Create user message with issue data only - no code context provided
-                # LLM must use tools to fetch the code
-                user_message = f"""Please analyze this code issue and determine if it's worth pursuing.
+                # Create user message with issue data and pre-fetched code context
+                if file_content_provided:
+                    user_message = f"""Please analyze this code issue and determine if it's worth pursuing.
+
+The source code has been provided below for your analysis. You do NOT need to use tools to read the file - the relevant code is already included.
+
+{context_section}
+
+ISSUE DETAILS:
+{json.dumps(issue_data, indent=2)}
+
+FILE LOCATION:
+- File: {issue_data.get('file_path', 'Unknown')}
+- Line: {issue_data.get('line_number', 'Unknown')}
+
+INSTRUCTIONS:
+1. Analyze the provided code to verify if the issue is legitimate
+2. Consider the validation checklist below
+
+VALIDATION CHECKLIST:
+Before making your decision, please consider these critical questions:
+
+1. Is there concrete evidence in the actual code?
+   - Can you point to specific lines or code patterns that support this issue?
+   - Is the issue based on actual observable code behavior rather than assumptions?
+
+2. Would fixing this provide meaningful value?
+   - Would addressing this issue provide tangible benefits to code quality, performance, or maintainability?
+   - Is this worth a developer's time to investigate and fix?
+
+Based on your analysis as a senior software engineer and the validation checklist above, should this issue be kept (legitimate bug/optimization) or filtered out (false positive/not worth pursuing)?
+
+IMPORTANT: You MUST provide a detailed "reason" field in your response explaining your decision, regardless of whether you keep or filter the issue.
+
+Respond with JSON format:
+- To filter out the issue: {{"result": true, "reason": "detailed explanation of why this is a false positive or not worth pursuing"}}
+- To keep the issue: {{"result": false, "reason": "detailed explanation of why this is a legitimate issue worth fixing, including specific evidence from the code"}}"""
+                else:
+                    # Fallback: no file content available, LLM must use tools
+                    user_message = f"""Please analyze this code issue and determine if it's worth pursuing.
 
 IMPORTANT: You must use the available tools to read the actual source code before making your decision. The file path and line number are provided below.
 
@@ -503,13 +604,15 @@ Respond with JSON format:
 - To keep the issue: {{"result": false, "reason": "detailed explanation of why this is a legitimate issue worth fixing, including specific evidence from the code"}}"""
                 
                 # Use structured analysis like main code analyzer
-                self.logger.info(f"Challenging issue {i}/{original_count} with LLM using structured approach")
+                self.logger.info(f"Challenging issue {i}/{original_count} with LLM using ResponseChallengerAnalyzer")
                 
                 # Start conversation tracking
                 claude.start_conversation("issue_challenge", f"issue_{i}")
                 
-                # Use run_iterative_analysis for structured responses like main code analyzer
-                analysis_result = claude.run_iterative_analysis(
+                # Use ResponseChallengerAnalyzer for proper stage-specific JSON extraction
+                # This replaces the deprecated claude.run_iterative_analysis() method
+                analyzer = ResponseChallengerAnalyzer(claude)
+                analysis_result = analyzer.run_iterative_analysis(
                     system_prompt=system_prompt,
                     user_prompt=user_message,
                     tools_executor=tools_executor,  # Provide tools for file reading
@@ -525,72 +628,60 @@ Respond with JSON format:
                 
                 if analysis_result:
                     try:
-                        # Clean and parse LLM response using the same cleanup utility as main LLM code
-                        from ..utils.json_util import clean_json_response
-                        cleaned_content = clean_json_response(analysis_result.strip())
+                        # The ResponseChallengerAnalyzer already extracts and validates JSON
+                        # Parse the result directly
+                        result = json.loads(analysis_result.strip())
                         
-                        # Check if we have valid JSON content after cleaning
-                        if cleaned_content and cleaned_content.strip():
-                            result = json.loads(cleaned_content)
-                            
-                            # Normalize arrays: if LLM returns a list, extract the first element
-                            if isinstance(result, list) and result:
-                                self.logger.debug(f"LLM returned array with {len(result)} elements, extracting first element")
-                                result = result[0]
-                            
-                            # Defensive type checking: ensure result is a dict
-                            if not isinstance(result, dict):
-                                self.logger.warning(f"Unexpected type after JSON parsing for issue {i}: {type(result).__name__}")
-                                self.logger.debug(f"cleaned_content was: {cleaned_content}")
-                                # Keep issue if result is not a dict (with empty evidence)
-                                issue_with_evidence = issue.copy()
-                                issue_with_evidence['evidence'] = ''
-                                challenged_issues.append(issue_with_evidence)
-                                continue
-                            
-                            should_filter = result.get('result', False)
-                            reason = result.get('reason', '')  # Empty string if no reason provided
-                            
-                            if not should_filter:
-                                # Keep the issue and attach evidence if available
-                                issue_with_evidence = issue.copy()
-                                
-                                # Only attach evidence if reason is non-empty AND capture is enabled
-                                # If LLM doesn't generate evidence, field remains empty (no error/warning)
-                                if reason and self.capture_evidence:
-                                    issue_with_evidence['evidence'] = reason
-                                    self.logger.debug(f"Attached evidence to issue {i}: {reason[:100]}...")
-                                else:
-                                    issue_with_evidence['evidence'] = ''  # Empty by default
-                                
-                                challenged_issues.append(issue_with_evidence)
-                            else:
-                                # Filter out the issue (LLM says it's not worth pursuing)
-                                dropped_count += 1
-                                issue_summary = issue.get('issue', '')[:100]
-                                self.logger.info(f"Issue {i} challenged as not worth pursuing by LLM: {issue_summary}...")
-                                self.logger.debug(f"Reason: {reason}")
-                                
-                                # Save the dropped issue
-                                self._save_dropped_issue(issue, reason)
-                        else:
-                            self.logger.warning(f"No valid JSON content after cleaning for issue {i}")
-                            self.logger.warning(f"Original response was: {analysis_result}")
-                            # Keep issue if no valid content after cleaning (with empty evidence)
+                        # Normalize arrays: if LLM returns a list, extract the first element
+                        if isinstance(result, list) and result:
+                            self.logger.debug(f"LLM returned array with {len(result)} elements, extracting first element")
+                            result = result[0]
+                        
+                        # Defensive type checking: ensure result is a dict
+                        if not isinstance(result, dict):
+                            self.logger.warning(f"Unexpected type after JSON parsing for issue {i}: {type(result).__name__}")
+                            self.logger.debug(f"analysis_result was: {analysis_result}")
+                            # Keep issue if result is not a dict (with empty evidence)
                             issue_with_evidence = issue.copy()
                             issue_with_evidence['evidence'] = ''
                             challenged_issues.append(issue_with_evidence)
+                            continue
+                        
+                        should_filter = result.get('result', False)
+                        reason = result.get('reason', '')  # Empty string if no reason provided
+                        
+                        if not should_filter:
+                            # Keep the issue and attach evidence if available
+                            issue_with_evidence = issue.copy()
+                            
+                            # Only attach evidence if reason is non-empty AND capture is enabled
+                            # If LLM doesn't generate evidence, field remains empty (no error/warning)
+                            if reason and self.capture_evidence:
+                                issue_with_evidence['evidence'] = reason
+                                self.logger.debug(f"Attached evidence to issue {i}: {reason[:100]}...")
+                            else:
+                                issue_with_evidence['evidence'] = ''  # Empty by default
+                            
+                            challenged_issues.append(issue_with_evidence)
+                        else:
+                            # Filter out the issue (LLM says it's not worth pursuing)
+                            dropped_count += 1
+                            issue_summary = issue.get('issue', '')[:100]
+                            self.logger.info(f"Issue {i} challenged as not worth pursuing by LLM: {issue_summary}...")
+                            self.logger.debug(f"Reason: {reason}")
+                            
+                            # Save the dropped issue
+                            self._save_dropped_issue(issue, reason)
                             
                     except json.JSONDecodeError as e:
-                        self.logger.warning(f"Failed to parse cleaned LLM response for issue {i}: {e}")
-                        self.logger.warning(f"Cleaned response content was: {cleaned_content}")
-                        self.logger.warning(f"Original response was: {analysis_result}")
-                        # Keep issue if we can't parse cleaned response (with empty evidence)
+                        self.logger.warning(f"Failed to parse LLM response for issue {i}: {e}")
+                        self.logger.warning(f"Response was: {analysis_result}")
+                        # Keep issue if we can't parse response (with empty evidence)
                         issue_with_evidence = issue.copy()
                         issue_with_evidence['evidence'] = ''
                         challenged_issues.append(issue_with_evidence)
                 else:
-                    self.logger.warning(f"No response from structured analysis for issue {i}")
+                    self.logger.warning(f"No response from ResponseChallengerAnalyzer for issue {i}")
                     # Keep issue if no response (with empty evidence)
                     issue_with_evidence = issue.copy()
                     issue_with_evidence['evidence'] = ''

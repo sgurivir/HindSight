@@ -24,6 +24,7 @@ An issue is considered **TRIVIAL** if it falls into any of these categories:
 12. **Testability Issues**: Is the issue about code being difficult to test, constructor complexity, tight coupling, lack of dependency injection, or hard-to-test code structure?
 13. **Complexity Issues**: Is the issue about high cyclomatic complexity, deeply nested conditionals, long functions, complex state management, or multiple responsibilities in one function?
 14. **Error Handling Patterns**: Is the issue about inconsistent error handling, missing error propagation, ambiguous error conditions, or silent failures?
+15. **Defensive Programming**: Is the issue about unused enum cases, unreachable default branches, or edge cases prevented by documented domain constraints (e.g., comments like "only one", "by design", "defensive")?
 
 **Use these field hints for classification:**
 - If `category` or `issueType` contains terms like: `nullPointer`, `nullCheck`, `nullSafety`, `unsafeCast`, `arrayBounds`, `boundsCheck`, `exceptionHandling`, `readability`, `codeQuality`, `testability`, `complexity`, `errorHandling` → likely TRIVIAL
@@ -33,12 +34,14 @@ An issue is considered **TRIVIAL** if it falls into any of these categories:
 - If the issue text mentions "testability", "difficult to test", "constructor complexity", "tight coupling", "dependency injection" → likely TRIVIAL
 - If the issue text mentions "cyclomatic complexity", "nested conditionals", "long function", "complex state management" → likely TRIVIAL
 - If the issue text mentions "inconsistent error handling", "error propagation", "ambiguous error", "silent failure" → likely TRIVIAL
+- If the issue text mentions "unused enum", "never returned", "unreachable", "dead code" with domain constraints → likely TRIVIAL
+- If the issue text mentions "defensive", "by design", "intentional", "only one" in comments or description → likely TRIVIAL
 
 ## Question to Answer
 
 **Is this issue trivial?**
 
-Answer this question by providing true or false based on whether the issue matches any of the 14 trivial categories listed above.
+Answer this question by providing true or false based on whether the issue matches any of the 15 trivial categories listed above.
 
 ## Structured Output Schema
 
@@ -62,7 +65,7 @@ OR
 
 {"result": false}
 
-- Use `"result": true` if the issue IS trivial (matches any of the 14 categories above)
+- Use `"result": true` if the issue IS trivial (matches any of the 15 categories above)
 - Use `"result": false` if the issue is NOT trivial (does not match any of the categories)
 
 ## CRITICAL RULES - FOLLOW EXACTLY
@@ -134,4 +137,16 @@ Response: {"result": true}
 
 **Example 14 - Trivial Issue (Error Handling)**
 Input: {"issue": "Inconsistent error handling pattern", "description": "Helper functions return empty vectors on error with no way to distinguish from legitimate empty data", "category": "errorHandling"}
+Response: {"result": true}
+
+**Example 15 - Trivial Issue (Defensive Programming - Unused Enum)**
+Input: {"issue": "Status.Unknown enum case is never used", "description": "The Unknown enum case is defined but never returned by any function in the codebase", "category": "logicBug"}
+Response: {"result": true}
+
+**Example 16 - Trivial Issue (Defensive Programming - Domain Constraint)**
+Input: {"issue": "Equality check always returns true for singleton objects", "description": "The comparison logic assumes there is only one instance, as documented in comments stating 'singleton by design'", "category": "logicBug"}
+Response: {"result": true}
+
+**Example 17 - Trivial Issue (Defensive Programming - Unreachable Default)**
+Input: {"issue": "Default case in switch statement is unreachable", "description": "All enum values are explicitly handled, making the default case unreachable but kept for defensive programming", "category": "logicBug"}
 Response: {"result": true}

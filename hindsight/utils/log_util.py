@@ -246,7 +246,7 @@ def setup_default_logging(log_file: str = None, repo_path: str = None, override_
         log_file=log_file,
         log_level="INFO",
         console_level="INFO",
-        file_level="DEBUG"
+        file_level="INFO"
     )
 
 

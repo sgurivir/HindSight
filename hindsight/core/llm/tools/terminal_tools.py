@@ -114,8 +114,7 @@ class TerminalToolsMixin:
         start_time = time.time()
         self.tool_usage_stats['runTerminalCmd']['count'] += 1
 
-        logger.info(f"[TOOL] runTerminalCmd called #{self.tool_usage_stats['runTerminalCmd']['count']} - Command: {command}")
-        logger.info(f"[AI REASONING] {reason if reason else 'No reason provided'}")
+        logger.info(f"[TOOL] runTerminalCmd called #{self.tool_usage_stats['runTerminalCmd']['count']} - Command: {command} | [AI REASONING] {reason if reason else 'No reason provided'}")
 
         try:
             # Validate command safety

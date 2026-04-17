@@ -19,7 +19,7 @@ CONFIG_SCHEMA = {
     "description": {"type": str, "required": False},
     "api_end_point": {"type": str, "required": True},
     "model": {"type": str, "required": False},  # Optional: defaults to DEFAULT_LLM_MODEL based on provider
-    "llm_provider_type": {"type": str, "required": False},  # Optional: claude, aws_bedrock
+    "llm_provider_type": {"type": str, "required": False},  # Optional: aws_bedrock
     "credentials": {"type": str, "required": False},
     "path_to_repo": {"type": str, "required": False},
     "user_prompts": {"type": list, "required": False},  # Optional value
@@ -30,7 +30,7 @@ CONFIG_SCHEMA = {
 }
 
 # Centralized list of supported LLM provider types
-SUPPORTED_LLM_PROVIDER_TYPES = ["claude", "aws_bedrock", "dummy"]
+SUPPORTED_LLM_PROVIDER_TYPES = ["aws_bedrock"]
 
 
 def get_supported_llm_provider_types() -> List[str]:
@@ -397,14 +397,14 @@ if __name__ == "__main__":
 def get_llm_provider_type(config: Dict[str, Any]) -> str:
     """
     Get LLM provider type from config with default fallback.
-    
+
     Args:
         config: Configuration dictionary
-        
+
     Returns:
-        str: LLM provider type ('claude', 'aws_bedrock', 'dummy')
+        str: LLM provider type ('aws_bedrock')
     """
-    return config.get('llm_provider_type', 'claude')
+    return config.get('llm_provider_type', 'aws_bedrock')
 
 
 def get_credentials(config: Dict[str, Any]) -> Optional[str]:
@@ -434,23 +434,10 @@ def get_api_key_from_config(config: Dict[str, Any]) -> Optional[str]:
     from .api_key_util import get_api_key
     
     llm_provider_type = get_llm_provider_type(config)
-    
-    if llm_provider_type == "dummy":
-        logger.info("Using dummy provider - skipping API key retrieval")
-        return "dummy-key"  # Use dummy key for dummy provider
-    elif llm_provider_type == "aws_bedrock":
-        # For AWS Bedrock, check both api_key and credentials fields
-        config_api_key = config.get('api_key') or get_credentials(config)
-        return get_api_key(config_api_key)
-    else:
-        # For Claude and other providers, check both api_key and credentials fields
-        config_api_key = config.get('api_key') or get_credentials(config)
-        if config_api_key:
-            logger.info("Using API key from configuration")
-            return config_api_key
-        else:
-            logger.warning("No API key provided in configuration")
-            return None
+
+    # For AWS Bedrock, check both api_key and credentials fields
+    config_api_key = config.get('api_key') or get_credentials(config)
+    return get_api_key(config_api_key)
 
 
 def get_llm_config_values(config: Dict[str, Any]) -> Dict[str, Any]:

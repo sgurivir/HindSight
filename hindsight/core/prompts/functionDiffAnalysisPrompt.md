@@ -155,8 +155,8 @@ When reporting issues, assign each to one of these categories:
 **Example Tool Invocation**:
 ```json
 {
-  "tool": "getImplementation",
-  "name": "TMTimeSynthesizer",
+  "tool": "readFile",
+  "path": "src/TMTimeSynthesizer.m",
   "reason": "Need to understand the implementation of TMTimeSynthesizer class to analyze its logic flow and data transformations"
 }
 ```
@@ -180,14 +180,13 @@ When reporting issues, assign each to one of these categories:
 
 **CRITICAL**: You MUST ONLY use these exact tool names - no variations, abbreviations, or similar names are allowed:
 
-1. `getImplementation`: retrieve complete class implementation from all associated files.
-2. `checkFileSize`: check if file exists and get size information to determine if readFile can be used. Only use readFile for small files < 16000 characters.
-3. `readFile`: inspect specific files only when getImplementation is not applicable.
-4. `runTerminalCmd`: run safe commands for exploration and searching (including grep for file searches).
-5. `getSummaryOfFile`: retrieve summary of file's functionality
-6. `list_files`: list files and directories within a specified directory.
-7. `getFileContentByLines`: retrieve content from a file between specific line numbers
-8. `getFileContent`: alias for `getFileContentByLines` - retrieve content from a file between specific line numbers
+1. `checkFileSize`: check if file exists and get size information to determine if readFile can be used. Only use readFile for small files < 16000 characters.
+2. `readFile`: inspect specific files.
+3. `runTerminalCmd`: run safe commands for exploration and searching (including grep for file searches).
+4. `getSummaryOfFile`: retrieve summary of file's functionality
+5. `list_files`: list files and directories within a specified directory.
+6. `getFileContentByLines`: retrieve content from a file between specific line numbers
+7. `getFileContent`: alias for `getFileContentByLines` - retrieve content from a file between specific line numbers
 
 **CRITICAL TOOL USAGE PRIORITY:**
 1. **ALWAYS use `checkFileSize` BEFORE `readFile` or `getFileContentByLines`** to determine if file is within size limits and get the total line count (prevents out-of-bounds errors)
@@ -240,19 +239,6 @@ When reporting issues, assign each to one of these categories:
 }
 ```
 
-#### getImplementation Tool
-**Purpose**: Retrieve the complete implementation of a class, struct or enum from ALL associated files
-**Usage**: Whenever you need to understand any class, struct, or enum
-
-**Example Usage**:
-```json
-{
-  "tool": "getImplementation",
-  "name": "TMTimeSynthesizer",
-  "reason": "Need to understand the complete implementation of TMTimeSynthesizer class to analyze its logic and behavior"
-}
-```
-
 #### getSummaryOfFile Tool
 **Purpose**: Retrieve file summary for quick understanding of file purpose and context
 **Usage**: When you need to quickly understand what a file does before deeper analysis
@@ -267,8 +253,8 @@ When reporting issues, assign each to one of these categories:
 ```
 
 #### readFile Tool
-**Purpose**: Read specific files when getImplementation is not applicable
-**Usage**: Reading non-class files (headers, config files, build files, etc.)
+**Purpose**: Read specific files
+**Usage**: Reading source files, headers, config files, build files, etc.
 **CRITICAL**: **ALWAYS use checkFileSize FIRST** to ensure file is within size limits and get line count for getFileContentByLines
 
 **Example Usage**:
@@ -283,6 +269,11 @@ When reporting issues, assign each to one of these categories:
 #### runTerminalCmd Tool (Exploration & Search)
 **Purpose**: Execute safe terminal commands to explore the codebase structure and search for patterns.
 **Allowed Commands**: ls, find, grep, wc, head, tail, cat (for small files), tree, file, sed
+
+**⛔ CRITICAL: Repository Boundary Constraint**
+All terminal commands MUST stay within the repository root. Commands that search outside will timeout and fail.
+- ❌ `find /Users -name '*.swift'` → ✅ `find . -name '*.swift'`
+- ❌ `grep -rn 'pattern' /` → ✅ `grep -rn 'pattern' .`
 
 **Example Usage**:
 ```json
@@ -307,7 +298,7 @@ Need to understand code?
 │   └── YES → Use runTerminalCmd with grep or list_files
 ├── Need to list directory contents
 │   └── YES → Use list_files
-└── If unsure → Use list_files first, then getImplementation, then getSummaryOfFile, then checkFileSize + readFile as needed
+└── If unsure → Use list_files first, then getSummaryOfFile, then checkFileSize + readFile as needed
 ```
 
 ## Handling Uncertainty

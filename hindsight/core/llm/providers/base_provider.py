@@ -13,34 +13,16 @@ This system uses JSON-embedded tool requests in system prompts, making it provid
    - LLM returns JSON objects in markdown code blocks: ```json {"tool": "readFile", "path": "file.py", "reason": "..."} ```
    - System prompts describe tools as JSON objects, not structured API tool definitions
    - llm.py extracts these JSON requests using regex patterns and executes them
-   - This approach works identically across Claude, AWS Bedrock, and other providers
 
-2. Provider Differences (Minimal):
-   - Both ClaudeProvider and AWSBedrockProvider work the same way with JSON-embedded tools
-   - Main difference is response format detection, not tool handling
+2. Structured/native tool calls are NEVER used (enable_tools=False always):
+   - Avoids provider-specific tool_use format mismatches
+   - Works identically across all providers
 
-3. llm_provider_type Configuration:
-   - Set in config as 'llm_provider_type': 'claude' | 'aws_bedrock' | 'dummy'
-   - Passed to ClaudeConfig and used by create_llm_provider() factory
-   - Determines response format handling, not tool invocation mechanism
-
-4. Response Format Handling:
-   - Claude native: {"content": [{"type": "text", "text": "..."}, {"type": "tool_use", ...}]}
+3. Response Format Handling:
    - AWS Bedrock: {"choices": [{"message": {"content": "...", "tool_calls": [...]}}]}
    - Detection uses duck-typing (hasattr checks) instead of isinstance()
-   - Both formats contain text with JSON tool requests that are parsed identically
 
-5. No isinstance() Usage:
-   - Format detection uses hasattr(obj, 'attribute') for duck-typing
-   - Provider type is determined by llm_provider_type config, not runtime type checking
-   - Makes code more maintainable and human-readable
-
-LEGACY STRUCTURED TOOL SUPPORT:
-================================
-The system still supports structured tool calls (Claude's native tool_use blocks) as a fallback,
-but the primary mechanism is JSON-embedded tool requests which work universally across providers.
-
-Example JSON-Embedded Tool Request (Works with Both Providers):
+Example JSON-Embedded Tool Request:
 
 System Prompt:
 "To read a file, return: ```json {\"tool\": \"readFile\", \"path\": \"file.py\", \"reason\": \"...\"} ```"

@@ -168,8 +168,7 @@ class FileToolsMixin:
         logger.debug(f"  end_line: {repr(end_line)} (type: {type(end_line)})")
         logger.debug(f"  reason: {repr(reason)} (type: {type(reason)})")
 
-        logger.info(f"[TOOL] getFileContentByLines called #{self.tool_usage_stats['getFileContentByLines']['count']} - Path: {path}, Lines: {start_line}-{end_line}")
-        logger.info(f"[AI REASONING] {reason if reason else 'No reason provided'}")
+        logger.info(f"[TOOL] getFileContentByLines called #{self.tool_usage_stats['getFileContentByLines']['count']} - Path: {path}, Lines: {start_line}-{end_line} | [AI REASONING] {reason if reason else 'No reason provided'}")
 
         try:
             # Validate input parameters
@@ -213,9 +212,19 @@ class FileToolsMixin:
                 # Validate line numbers against actual file content
                 total_lines = len(lines)
                 if start_line > total_lines:
-                    error_msg = f"Error: startLine ({start_line}) exceeds file length ({total_lines} lines)"
-                    logger.warning(f"[TOOL] getFileContentByLines - {error_msg}")
-                    return error_msg
+                    # Return JSON response with explicit end_of_file signal to prevent pagination loops
+                    # This helps the LLM understand that there is no more content to read
+                    error_response = {
+                        "end_of_file": True,
+                        "error": f"startLine ({start_line}) exceeds file length",
+                        "file": path,
+                        "total_lines": total_lines,
+                        "valid_range": f"1-{total_lines}",
+                        "message": f"File has only {total_lines} lines. There is no more content to read.",
+                        "suggestion": f"The entire file content is available in lines 1-{total_lines}. Do not request lines beyond {total_lines}."
+                    }
+                    logger.warning(f"[TOOL] getFileContentByLines - startLine ({start_line}) exceeds file length ({total_lines} lines) - returning end_of_file signal")
+                    return json.dumps(error_response, indent=2)
 
                 if end_line > total_lines:
                     logger.warning(f"[TOOL] getFileContentByLines - endLine ({end_line}) exceeds file length ({total_lines} lines), adjusting to file end")
@@ -232,8 +241,8 @@ class FileToolsMixin:
                 
                 result = '\n'.join(numbered_lines)
                 
-                # Add header information
-                header = f"File: {path} (lines {start_line}-{min(end_line, total_lines)})\n"
+                # Solution 1: Enhanced header with total line count
+                header = f"File: {path} (lines {start_line}-{min(end_line, total_lines)} of {total_lines} total)\n"
                 header += "=" * 50 + "\n"
                 final_result = header + result
 
@@ -274,8 +283,7 @@ class FileToolsMixin:
         start_time = time.time()
         self.tool_usage_stats['checkFileSize']['count'] += 1
 
-        logger.info(f"[TOOL] checkFileSize called #{self.tool_usage_stats['checkFileSize']['count']} - Path: {path}")
-        logger.info(f"[AI REASONING] {reason if reason else 'No reason provided'}")
+        logger.info(f"[TOOL] checkFileSize called #{self.tool_usage_stats['checkFileSize']['count']} - Path: {path} | [AI REASONING] {reason if reason else 'No reason provided'}")
 
         try:
             # Validate path parameter

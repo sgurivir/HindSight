@@ -32,7 +32,7 @@ Before reporting ANY issue, you MUST verify:
 You MUST use tools to search the codebase for counter-evidence:
 
 1. **USE `runTerminalCmd` with grep** to search the entire codebase for counter-evidence (e.g., search for error handling patterns, null checks, or the claimed missing functionality)
-2. **USE `getImplementation`** to check related classes that might handle the concern elsewhere
+2. **USE `readFile`** to check related classes that might handle the concern elsewhere
 3. **USE `getFileContentByLines`** to verify the claim in the full context of the file
 
 **If you cannot prove the absence with tool-verified evidence, DO NOT report the issue.**
@@ -174,8 +174,8 @@ If you identify ANY of the following, you MUST use the `loggingError` category:
 **Example Tool Invocation**:
 ```json
 {
-  "tool": "getImplementation",
-  "name": "TMTimeSynthesizer",
+  "tool": "readFile",
+  "path": "src/TMTimeSynthesizer.m",
   "reason": "Need to understand the implementation of TMTimeSynthesizer class to analyze its logic flow and data transformations"
 }
 ```
@@ -197,15 +197,14 @@ If you identify ANY of the following, you MUST use the `loggingError` category:
 You have access to the following tools to help understand the codebase context. **CRITICAL**: You MUST ONLY use these exact tool names - no variations, abbreviations, or similar names are allowed:
 
 ### AUTHORIZED TOOLS LIST (USE ONLY THESE):
-1. `getImplementation`: retrieve complete class implementation from all associated files.
-2. `findSpecificFilesWithSearchString`: find files containing specific text patterns with extension filtering.
-3. `checkFileSize`: check if file exists and get size information to determine if readFile can be used. Only use readFile for small files < 16000 characters.
-4. `readFile`: inspect specific files only when getImplementation is not applicable.
-5. `runTerminalCmd`: run safe commands for exploration and searching (including grep for file searches).
-6. `getSummaryOfFile`: retrieve summary of file's functionality
-7. `list_files`: list files and directories within a specified directory.
-8. `getFileContentByLines`: retrieve content from a file between specific line numbers
-9. `getFileContent`: alias for `getFileContentByLines` - retrieve content from a file between specific line numbers
+1. `findSpecificFilesWithSearchString`: find files containing specific text patterns with extension filtering.
+2. `checkFileSize`: check if file exists and get size information to determine if readFile can be used. Only use readFile for small files < 16000 characters.
+3. `readFile`: inspect specific files.
+4. `runTerminalCmd`: run safe commands for exploration and searching (including grep for file searches).
+5. `getSummaryOfFile`: retrieve summary of file's functionality
+6. `list_files`: list files and directories within a specified directory.
+7. `getFileContentByLines`: retrieve content from a file between specific line numbers
+8. `getFileContent`: alias for `getFileContentByLines` - retrieve content from a file between specific line numbers
 
 **CRITICAL TOOL USAGE PRIORITY:**
 1. **ALWAYS use `checkFileSize` BEFORE `readFile` or `getFileContentByLines`** to determine if file is within size limits and get the total line count (prevents out-of-bounds errors)
@@ -338,20 +337,6 @@ File: app/src/main/java/org/thoughtcrime/securesms/util/ViewUtil.java (lines 208
 
 **CRITICAL**: Always use checkFileSize before readFile or getFileContentByLines when file size is unknown. This prevents analysis interruption due to size limits and out-of-bounds line number errors.
 
-### getImplementation Tool
-**Purpose**: Retrieve the complete implementation of a class, struct or enum from ALL associated files
-**Usage**: Whenever you need to understand any class, struct, or enum. This tool automatically finds and reads all relevant files for a class.
-**Advantages**: More efficient than multiple readFile calls, provides complete context, includes all related files
-
-**Example Usage**:
-```json
-{
-  "tool": "getImplementation",
-  "name": "TMTimeSynthesizer",
-  "reason": "Need to understand the complete implementation of TMTimeSynthesizer class to analyze its logic and behavior"
-}
-```
-
 ### getSummaryOfFile Tool
 **Purpose**: Retrieve file summary using ProjectSummaryGenerator for quick understanding of file purpose and context
 **Usage**: **USE WHEN:**
@@ -370,11 +355,9 @@ File: app/src/main/java/org/thoughtcrime/securesms/util/ViewUtil.java (lines 208
 ```
 
 ### readFile Tool
-**Purpose**: Read specific files when getImplementation is not applicable
+**Purpose**: Read specific files
 **Usage**:
-  - Reading non-class files (headers, config files, build files, etc.)
-  - getImplementation failed to find the class
-  - You need a specific file that's not part of a class implementation
+  - Reading source files, headers, config files, build files, etc.
   - **ALWAYS use checkFileSize FIRST** to ensure file is within size limits
 
 **CRITICAL REQUIREMENTS**:
@@ -400,8 +383,35 @@ File: app/src/main/java/org/thoughtcrime/securesms/util/ViewUtil.java (lines 208
 **Allowed Commands**: ls, find, grep, wc, head, tail, cat (for small files), tree, file, sed
 **Usage**:
   - You need to search for patterns or explore project structure
-  - You need to find class names before using getImplementation
+  - You need to find class names or function definitions
   - You need to search for text patterns across files (use grep)
+
+#### ⛔ CRITICAL: Repository Boundary Constraint
+
+**Searching outside the current repository is a SYSTEM ERROR that will cause timeouts and failures.**
+
+All terminal commands MUST stay within the repository root. The repository root is your working directory (`.`).
+
+**❌ FORBIDDEN - These commands search outside the repository and WILL FAIL:**
+```bash
+# DO NOT USE - searches entire /Users directory, causes 30+ second timeouts
+find /Users -name '*.swift' -path '*Orange*' 2>/dev/null | xargs grep -l 'UserDefaultsAppStateKeys' | head -5
+
+# DO NOT USE - searches from filesystem root
+grep -rn 'pattern' /
+
+# DO NOT USE - uses absolute paths outside repo
+cat /Users/username/some/path/file.swift
+```
+
+**✅ CORRECT - Always use relative paths from repo root:**
+```bash
+# Search within repository only
+grep -rn 'UserDefaultsAppStateKeys' . --include='*.swift' | head -20
+
+# Find files within repository
+find . -name '*.swift' -path '*Orange*' | head -10
+```
 
 #### ✅ DO - Reliable grep usage (single-word patterns)
 ```json
@@ -418,6 +428,7 @@ File: app/src/main/java/org/thoughtcrime/securesms/util/ViewUtil.java (lines 208
 - **Regex patterns**: ❌ `grep 'enum.*Type'` → ✅ `grep 'EnumType'` (use exact name)
 - **OR patterns**: ❌ `grep 'word1\|word2'` → ✅ Run two separate grep commands
 - **Wildcard file paths**: ❌ `grep 'pattern' dir/*.swift` → ✅ `grep -r 'pattern' --include='*.swift' dir/`
+- **Absolute paths outside repo**: ❌ `find /Users -name '*.swift'` → ✅ `find . -name '*.swift'`
 
 **Strategy**: Search for the most distinctive single word, then use `getFileContentByLines` to examine context around matches.
 
@@ -462,7 +473,7 @@ Need to understand code?
 │   └── YES → Use runTerminalCmd with grep, findSpecificFilesWithSearchString, or list_files
 ├── Need to list directory contents
 │   └── YES → Use list_files
-└── If unsure → Use list_files first, then getImplementation, then getSummaryOfFile, then checkFileSize + readFile as needed
+└── If unsure → Use list_files first, then getSummaryOfFile, then checkFileSize + readFile as needed
 ```
 
 ## CRITICAL TOOL USAGE ENFORCEMENT
@@ -470,7 +481,6 @@ Need to understand code?
 **MANDATORY PRE-TOOL CHECKLIST**: Before invoking ANY tool, you MUST:
 
 1. **VERIFY TOOL NAME**: Confirm the tool name EXACTLY matches one from the authorized list:
-   - ✅ `getImplementation`
    - ✅ `findSpecificFilesWithSearchString`
    - ✅ `checkFileSize`
    - ✅ `readFile`
@@ -485,7 +495,7 @@ Need to understand code?
 3. **COMMON SUBSTITUTIONS**:
    - Want `searchCode`? → Use `runTerminalCmd` with grep or `findSpecificFilesWithSearchString`
    - Want `findCode`? → Use `findSpecificFilesWithSearchString` or `runTerminalCmd` with grep
-   - Want `getCode`? → Use `getImplementation` or `readFile`
+   - Want `getCode`? → Use `readFile`
    - Want file content? → Use `readFile`
    - Want directory listing? → Use `list_files`
    - Want `getDirectoryListing`? → Use `list_files` instead

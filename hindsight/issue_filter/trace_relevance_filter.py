@@ -99,7 +99,7 @@ An issue is IRRELEVANT if it:
         from ..core.llm.llm import create_llm_provider, ClaudeConfig
         
         # Extract provider_type using the same logic as trace_analyzer.py
-        provider_type = self.config.get('llm_provider_type', 'claude') if self.config else 'claude'
+        provider_type = self.config.get('llm_provider_type', 'aws_bedrock') if self.config else 'aws_bedrock'
         
         # Use api_url if available, otherwise fall back to api_end_point
         api_url = self.config.get('api_url') or self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT)

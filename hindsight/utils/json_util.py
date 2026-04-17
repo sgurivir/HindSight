@@ -71,8 +71,7 @@ def clean_json_response(content: str) -> str:
                         potential_json = cleaned_content[i:j + 1]
                         try:
                             parsed = json.loads(potential_json)
-                            # Check if this looks like a response object (has common response fields)
-                            if isinstance(parsed, dict) and ('result' in parsed or 'status' in parsed or 'response' in parsed):
+                            if isinstance(parsed, dict):
                                 json_candidates.append((i, potential_json))
                         except json.JSONDecodeError:
                             pass
@@ -97,10 +96,12 @@ def clean_json_response(content: str) -> str:
                             pass
                         break
     
-    # Return the last valid JSON candidate (most likely to be the final response)
+    # Return the LARGEST valid JSON candidate (most likely to be the complete response).
+    # This prevents returning nested inner objects instead of the full outer structure.
     if json_candidates:
-        json_candidates.sort(key=lambda x: x[0])  # Sort by position
-        return json_candidates[-1][1].strip()
+        # Sort by length (largest first), then by position (later is better for ties)
+        json_candidates.sort(key=lambda x: (-len(x[1]), -x[0]))
+        return json_candidates[0][1].strip()
 
     # Strategy 2: Look for markdown code blocks and extract content from them
     lines = cleaned_content.split('\n')

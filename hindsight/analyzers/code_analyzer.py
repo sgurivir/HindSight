@@ -170,10 +170,6 @@ class CodeAnalyzer(LLMBasedAnalyzer):
                 json.dump(dict(func_record), temp_file, indent=2)
                 temp_input_path = temp_file.name
 
-            # Create output file path
-            with tempfile.NamedTemporaryFile(mode='w', suffix='_analysis.json', delete=False) as temp_output:
-                temp_output_path = temp_output.name
-
             try:
                 # Create AnalysisConfig
                 analysis_config = AnalysisConfig(
@@ -182,14 +178,14 @@ class CodeAnalyzer(LLMBasedAnalyzer):
                     api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
                     model=self.config.get('model', DEFAULT_LLM_MODEL),
                     repo_path=self.repo_path,
-                    output_file=temp_output_path,
+                    output_file="",
                     max_tokens=DEFAULT_MAX_TOKENS,
                     temperature=DEFAULT_TEMPERATURE,
                     processed_cache_file=None,  # Using new publisher-subscriber caching system
                     config=self.config,
                     file_content_provider=self.file_content_provider,
                     file_filter=self.config.get('file_filter', []),
-                    min_function_body_length=self.config.get('min_function_body_length', 7)
+                    min_function_body_length=self.config.get('min_function_body_length', 7),
                 )
 
                 # Create CodeAnalysis instance with pre-loaded data
@@ -201,41 +197,41 @@ class CodeAnalyzer(LLMBasedAnalyzer):
                 # Store the analysis instance for token tracking
                 self._last_analysis = code_analysis
 
-                success = code_analysis.run_analysis()
+                # Stage 4a: Context collection
+                # Derive a unique cache key from the function name + file path.
+                # NOTE: func_record is a processed_entry whose keys are 'function'
+                # (not 'name') and 'context.file' (not 'checksum').  Using the
+                # wrong keys caused every function to resolve to 'unknown' and
+                # share the same bundle path (ad921d60.json).
+                import hashlib as _hashlib
+                func_name_for_key = func_record.get('function', func_record.get('name', 'unknown'))
+                func_file_for_key = func_record.get('context', {}).get('file', '')
+                func_checksum = f"{func_file_for_key}:{func_name_for_key}"
+                func_checksum_hex = _hashlib.md5(func_checksum.encode()).hexdigest()
 
-                if success:
-                    # Read the result
-                    try:
-                        with open(temp_output_path, 'r', encoding='utf-8') as f:
-                            result = json.load(f)
+                context_bundle = code_analysis.run_context_collection(
+                    json_data=dict(func_record),
+                    checksum=func_checksum_hex
+                )
 
-                        # Handle new schema format - extract results array
-                        if result and isinstance(result, dict) and 'results' in result:
-                            # New schema format
-                            actual_results = result['results']
-                            # Post-process each result item
-                            if isinstance(actual_results, list):
-                                processed_results = [self._post_process_analysis_result(item) if isinstance(item, dict) else item for item in actual_results]
-                            else:
-                                processed_results = self._post_process_analysis_result(actual_results) if isinstance(actual_results, dict) else actual_results
-                            return processed_results
-                        else:
-                            # Legacy format - handle as before
-                            if result and isinstance(result, dict):
-                                result = self._post_process_analysis_result(result)
-                            elif result and isinstance(result, list):
-                                result = [self._post_process_analysis_result(item) if isinstance(item, dict) else item for item in result]
-                            return result
-                    except (FileNotFoundError, json.JSONDecodeError):
-                        return None
-                else:
+                if context_bundle is None:
+                    self.logger.warning(f"Stage 4a failed for {func_record.get('name', 'unknown')} - skipping Stage 4b")
                     return None
 
+                # Stage 4b: Analysis from context
+                issues = code_analysis.run_analysis_from_context(context_bundle)
+
+                if issues is None:
+                    return None
+
+                # Post-process results
+                result = [self._post_process_analysis_result(item) if isinstance(item, dict) else item for item in issues]
+                return result if result else []
+
             finally:
-                # Clean up temporary files
+                # Clean up temporary input file
                 try:
                     os.unlink(temp_input_path)
-                    os.unlink(temp_output_path)
                 except OSError:
                     pass
 
@@ -1045,7 +1041,15 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
 
         # Initialize publisher-subscriber system
         self._initialize_publisher_subscriber(config, output_base_dir)
-        
+
+        # If the startup token fetch failed transiently (e.g. network not ready),
+        # retry Apple Connect now that the environment is more likely to be ready.
+        if not api_key:
+            self.logger.info("API key not available from startup — retrying Apple Connect token fetch...")
+            api_key = get_api_key_from_config(config)
+            if api_key:
+                self.logger.info("Apple Connect token retrieved on retry — proceeding with code analysis")
+
         # Initialize unified issue filter
         self._initialize_unified_issue_filter(api_key, config)
 
@@ -1123,12 +1127,8 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
 
         # Initialize analyzer
         llm_provider_type = get_llm_provider_type(config)
-        if llm_provider_type == "dummy":
-            analyzer: AnalyzerProtocol = DummyCodeAnalyzer()
-            self.logger.info("Using DummyCodeAnalyzer for analysis (llm_provider_type=dummy)")
-        else:
-            analyzer: AnalyzerProtocol = CodeAnalyzer()
-            self.logger.info(f"Using CodeAnalyzer for analysis (llm_provider_type={llm_provider_type})")
+        analyzer: AnalyzerProtocol = CodeAnalyzer()
+        self.logger.info(f"Using CodeAnalyzer for analysis (llm_provider_type={llm_provider_type})")
 
         # Initialize analyzer with configuration values
         # Note: file_filter and min_function_body_length are NOT passed because
@@ -1151,7 +1151,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         if hasattr(analyzer, 'set_publisher') and self.results_publisher:
             analyzer.set_publisher(self.results_publisher)
 
-        if not api_key and llm_provider_type != "dummy":
+        if not api_key:
             self.logger.warning("No API key available from config or other ways")
             self.logger.info("Skipping code analysis due to missing API key")
             return 0, 0
@@ -1167,6 +1167,11 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                     self.logger.info(f"Analysis cancelled at function {i}/{total_functions}")
                     self.logger.info(f"Processed {successful_analyses} successfully, {failed_analyses} failed before cancellation")
                     return successful_analyses, failed_analyses
+            
+            # Start issue-specific prompt logging for this function
+            # This creates a numbered subdirectory (e.g., prompts_sent/1/, prompts_sent/2/)
+            # to prevent prompts from being overwritten when analyzing multiple functions
+            Claude.start_issue_logging(i)
             
             func_entry = func_data['func_entry']
             function_length = func_data['length']
@@ -1187,7 +1192,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             # Check if already processed using publisher with concurrent lookup across all prior result stores
             if self.results_publisher:
                 current_checksum = function_checksum if function_checksum and function_checksum != "None" else checksum_hash
-                self.logger.info(f"DEBUG: [{i}/{total_functions}] Checking cache for function='{function_name}', file='{primary_file}', checksum='{current_checksum}'")
+                self.logger.debug(f"[{i}/{total_functions}] Checking cache for function='{function_name}', file='{primary_file}', checksum='{current_checksum}'")
 
                 existing_result = self.results_publisher.check_existing_result(
                     primary_file,
@@ -1250,9 +1255,9 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                     successful_analyses += 1
                     continue
                 else:
-                    self.logger.info(f"DEBUG: [{i}/{total_functions}] NO existing result found for {function_name} - will analyze")
+                    self.logger.debug(f"[{i}/{total_functions}] NO existing result found for {function_name} - will analyze")
             else:
-                self.logger.info(f"DEBUG: [{i}/{total_functions}] No results publisher available - will analyze {function_name}")
+                self.logger.debug(f"[{i}/{total_functions}] No results publisher available - will analyze {function_name}")
 
             # Generate temporary function file on-demand
             temp_file_path = self._generate_temp_function_file(func_entry, repo_path)
@@ -1263,7 +1268,12 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
 
             try:
                 progress_msg = f"[{i}/{total_functions}]"
+                self.logger.info("")
+                self.logger.info("")
+                self.logger.info("")
+                self.logger.info("=" * 80)
                 self.logger.info(f"{progress_msg} Analyzing: {function_name} ({function_length} lines)")
+                self.logger.info("=" * 80)
 
                 # Start function analysis tracking
                 self._start_function_analysis_tracking(function_name)
@@ -1384,23 +1394,16 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                         success = False
 
                     # Use centralized token tracking
-                    if llm_provider_type == "dummy":
-                        input_tokens, output_tokens = self.token_tracker.record_dummy_tokens()
+                    # Get real token counts from the analyzer's last analysis instance
+                    if hasattr(analyzer, '_last_analysis') and analyzer._last_analysis:
+                        input_tokens, output_tokens = self.token_tracker.record_tokens_from_analysis(analyzer._last_analysis)
                     else:
-                        # Get real token counts from the analyzer's last analysis instance
-                        if hasattr(analyzer, '_last_analysis') and analyzer._last_analysis:
-                            input_tokens, output_tokens = self.token_tracker.record_tokens_from_analysis(analyzer._last_analysis)
-                        else:
-                            # Fallback: no tokens recorded for failed analysis
-                            input_tokens, output_tokens = 0, 0
+                        # Fallback: no tokens recorded for failed analysis
+                        input_tokens, output_tokens = 0, 0
                 else:
                     # Only consider it a failure if result is None (no response or malformed response)
                     success = False
                     input_tokens, output_tokens = 0, 0
-                    # Still record the failure in token tracker for consistency
-                    if self.token_tracker and llm_provider_type == "dummy":
-                        self.token_tracker.record_dummy_tokens()
-                    # For failed real analysis, don't record tokens since no API call was made
 
                 # Record function analysis result
                 self._record_function_analysis_result(
@@ -1435,6 +1438,9 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
 
                 # NOTE: Analysis result files in code_analysis_dir are preserved for caching
                 # They allow skipping re-analysis when the program runs again on the same repository
+                
+                # End issue-specific prompt logging for this function
+                Claude.end_issue_logging()
 
         # Finalize analyzer
         try:
@@ -2810,8 +2816,7 @@ EXAMPLES:
 # Use recently_modified_files strategy with function filter
 %(prog)s --config config.json --repo /path/to/repo --analysys_type recently_modified_files --function-filter /path/to/functions_modified.json
 
-# Use dummy analyzer via config (set llm_provider_type to "dummy" in config.json)
-%(prog)s --config config_with_dummy.json --repo /path/to/repo
+%(prog)s --config config.json --repo /path/to/repo
         """
     )
     parser.add_argument(
@@ -2948,14 +2953,14 @@ EXAMPLES:
     runner.add_results_subscriber(default_subscriber)
 
     # Add default file system prior results store for duplicate checking
-    print(f"DEBUG: Creating FileSystemResultsCache with base_dir='{args.out_dir}'")
+    logger.debug(f"Creating FileSystemResultsCache with base_dir='{args.out_dir}'")
     default_prior_store = FileSystemResultsCache(args.out_dir)
 
     # Initialize the store for this repository to build the result index
-    print(f"DEBUG: Initializing FileSystemResultsCache for repo='{repo_name}'")
+    logger.debug(f"Initializing FileSystemResultsCache for repo='{repo_name}'")
     default_prior_store.initialize_for_repo(repo_name)
 
-    print(f"DEBUG: Registering FileSystemResultsCache with runner")
+    logger.debug(f"Registering FileSystemResultsCache with runner")
     runner.register_prior_result_store(default_prior_store)
 
     # Check if user wants to generate report from existing issues only

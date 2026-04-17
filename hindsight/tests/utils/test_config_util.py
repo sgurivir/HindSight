@@ -43,31 +43,31 @@ class TestSupportedLLMProviderTypes:
     def test_get_supported_llm_provider_types(self):
         """Test getting supported LLM provider types."""
         providers = get_supported_llm_provider_types()
-        
+
         assert isinstance(providers, list)
-        assert 'claude' in providers
         assert 'aws_bedrock' in providers
-        assert 'dummy' in providers
+        assert 'claude' not in providers
+        assert 'dummy' not in providers
 
     def test_get_supported_llm_provider_types_returns_copy(self):
         """Test that get_supported_llm_provider_types returns a copy."""
         providers1 = get_supported_llm_provider_types()
         providers2 = get_supported_llm_provider_types()
-        
+
         # Modify one list
         providers1.append('test')
-        
+
         # Other list should not be affected
         assert 'test' not in providers2
 
     def test_is_valid_llm_provider_type_valid(self):
         """Test is_valid_llm_provider_type with valid types."""
-        assert is_valid_llm_provider_type('claude') is True
         assert is_valid_llm_provider_type('aws_bedrock') is True
-        assert is_valid_llm_provider_type('dummy') is True
 
     def test_is_valid_llm_provider_type_invalid(self):
         """Test is_valid_llm_provider_type with invalid types."""
+        assert is_valid_llm_provider_type('claude') is False
+        assert is_valid_llm_provider_type('dummy') is False
         assert is_valid_llm_provider_type('invalid') is False
         assert is_valid_llm_provider_type('openai') is False
         assert is_valid_llm_provider_type('') is False
@@ -75,15 +75,13 @@ class TestSupportedLLMProviderTypes:
     def test_validate_llm_provider_type_valid(self):
         """Test validate_llm_provider_type with valid type."""
         # Should not raise
-        validate_llm_provider_type('claude')
         validate_llm_provider_type('aws_bedrock')
-        validate_llm_provider_type('dummy')
 
     def test_validate_llm_provider_type_invalid(self):
         """Test validate_llm_provider_type with invalid type raises ValueError."""
         with pytest.raises(ValueError) as exc_info:
             validate_llm_provider_type('invalid_provider')
-        
+
         assert 'Unsupported provider type' in str(exc_info.value)
         assert 'invalid_provider' in str(exc_info.value)
 
@@ -203,10 +201,10 @@ class TestValidateConfigValues:
 
     def test_validate_config_values_valid_llm_provider(self):
         """Test validation with valid LLM provider type."""
-        config = {'llm_provider_type': 'claude'}
-        
+        config = {'llm_provider_type': 'aws_bedrock'}
+
         is_valid, errors = validate_config_values(config)
-        
+
         assert is_valid is True
 
 
@@ -350,7 +348,7 @@ class TestLLMConfigFunctions:
         """Test getting LLM provider type with default."""
         config = {}
         
-        assert get_llm_provider_type(config) == 'claude'
+        assert get_llm_provider_type(config) == 'aws_bedrock'
 
     def test_get_llm_provider_type_specified(self):
         """Test getting specified LLM provider type."""
@@ -373,16 +371,16 @@ class TestLLMConfigFunctions:
     def test_get_llm_config_values(self):
         """Test getting all LLM config values."""
         config = {
-            'llm_provider_type': 'dummy',
+            'llm_provider_type': 'aws_bedrock',
             'credentials': 'test-key'
         }
-        
+
         with patch('hindsight.utils.config_util.get_api_key_from_config') as mock_get_api_key:
-            mock_get_api_key.return_value = 'dummy-key'
-            
+            mock_get_api_key.return_value = 'test-api-key'
+
             result = get_llm_config_values(config)
-            
-            assert result['llm_provider_type'] == 'dummy'
+
+            assert result['llm_provider_type'] == 'aws_bedrock'
             assert result['credentials'] == 'test-key'
             assert 'api_key' in result
 

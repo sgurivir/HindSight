@@ -7,16 +7,14 @@ You have contextual tools available to explore the repository.
 ### Tool Priority
 
 1. \`\` → Always first, check sizes before reading files.
-2. \`\` → Retrieve full class/struct/enum implementation.
-3. \`\` → For quick understanding of large files.
-4. \`\` → For specific small files when other tools fail.
-5. \`\` → Last resort, for searching or exploration.
+2. \`\` → For quick understanding of large files.
+3. \`\` → For specific small files.
+4. \`\` → Last resort, for searching or exploration.
 
 ### Tool Decision Flow
 
 ```
 Need context? → getDirectoryListing (check size)
-├── Is it a class/struct/enum? → getImplementation
 ├── Need quick context only? → getSummaryOfFile
 ├── Is it a small standalone file? → readFile
 └── Need to search/explore? → runTerminalCmd
@@ -25,11 +23,10 @@ Need context? → getDirectoryListing (check size)
 Each tool call \*\*must include a \*\*\`\` describing why it's needed.
 
 **CRITICAL TOOL USAGE PRIORITY:**
-1. **ALWAYS try `getImplementation` FIRST** when you need to understand any class, struct, or enum
-2. **ALWAYS use `getDirectoryListing` SECOND** to check file sizes before reading any files
-3. Use `getSummaryOfFile` to quickly understand a file's purpose and context before deeper analysis
-4. Only use `readFile` for non-class files (headers, config files, etc.) or when `getImplementation` fails
-5. Use `findSpecificFilesWithSearchString` to find list of files, with specific extensions and having a given string
+1. **ALWAYS use `getDirectoryListing` FIRST** to check file sizes before reading any files
+2. Use `getSummaryOfFile` to quickly understand a file's purpose and context before deeper analysis
+3. Use `readFile` for reading source files, headers, config files, etc.
+4. Use `findSpecificFilesWithSearchString` to find list of files, with specific extensions and having a given string
 5. Use `runTerminalCmd` for exploration and searching when the above tools are insufficient
 
 
@@ -54,12 +51,6 @@ core/llm/
 
 **CRITICAL**: Always use checkFileSize (or getDirectoryListing) before readFile or getFileContentByLines to avoid "file too large" errors and out-of-bounds line number errors that interrupt analysis. The checkFileSize tool returns line_count which should be used to validate line ranges for getFileContentByLines. If a file is not found, use `list_files` on the parent directory to discover actual filenames.
 
-### getImplementation Tool (PREFERRED)
-**Purpose**: Retrieve the complete implementation of a class, struct or enum from ALL associated files
-**Usage**: **USE THIS FIRST** whenever you need to understand any class, struct, or enum. This tool automatically finds and reads all relevant files for a class.
-**Advantages**: More efficient than multiple readFile calls, provides complete context, includes all related files
-**Usage**: Use the structured tool call format provided by the API. The tool will be called with name and reason parameters.
-
 ### getSummaryOfFile Tool (Context)
 **Purpose**: Retrieve file summary using ProjectSummaryGenerator for quick understanding of file purpose and context
 **Usage**: **USE WHEN:**
@@ -71,12 +62,10 @@ core/llm/
 
 **CRITICAL**: The `path` parameter must be a STRING containing only the file path. 
 
-### readFile Tool (Secondary)
-**Purpose**: Read specific files when getImplementation is not applicable
-**Usage**: **ONLY use when:**
-  - Reading non-class files (headers, config files, build files, etc.)
-  - getImplementation failed to find the class
-  - You need a specific file that's not part of a class implementation
+### readFile Tool
+**Purpose**: Read specific files
+**Usage**:
+  - Reading source files, headers, config files, build files, etc.
 **Usage**: Use the structured tool call format provided by the API. The tool will be called with path and reason parameters.
 
 **CRITICAL**: The `path` parameter must be a STRING containing only the file path. 
@@ -85,20 +74,27 @@ core/llm/
 **Purpose**: Execute safe terminal commands to explore the codebase structure and search for patterns.
 **Allowed Commands**: ls, find, grep, wc, head, tail, cat (for small files), tree, file, sed
 **Usage**: **Use when:**
-  - getImplementation and readFile cannot provide the needed information
+  - readFile cannot provide the needed information
   - You need to search for patterns or explore project structure
-  - You need to find class names before using getImplementation
+  - You need to find class names or function definitions
   - You need to search for text patterns across files (use grep)
 **Usage**: Use the structured tool call format provided by the API. The tool will be called with command and reason parameters.
 
+#### ⛔ CRITICAL: Repository Boundary Constraint
+All terminal commands MUST stay within the repository root. Commands that search outside will timeout and fail.
+- ❌ `find /Users -name '*.swift'` → ✅ `find . -name '*.swift'`
+- ❌ `grep -rn 'pattern' /` → ✅ `grep -rn 'pattern' .`
+
 #### ✅ DO - Reliable grep usage
 - Search for single word: `grep -rn 'functionName' --include='*.java' .`
+- Always use relative paths (`.` or `./dir`)
 
 #### ❌ DON'T - Patterns that frequently fail
 - **Multi-word patterns**: ❌ `grep 'class MyClassName'` → ✅ `grep 'MyClassName'`
 - **Regex patterns**: ❌ `grep 'enum.*Type'` → ✅ `grep 'EnumType'` (use exact name)
 - **OR patterns**: ❌ `grep 'word1\|word2'` → ✅ Run two separate grep commands
 - **Wildcard file paths**: ❌ `grep 'pattern' dir/*.swift` → ✅ `grep -r 'pattern' --include='*.swift' dir/`
+- **Absolute paths outside repo**: ❌ `find /Users -name '*.swift'` → ✅ `find . -name '*.swift'`
 
 **Strategy**: Search for the most distinctive single word, then use `getFileContentByLines` to examine context.
 
@@ -127,9 +123,6 @@ core/llm/
 ```
 Need to understand code?
 ├── FIRST: Check file sizes → Use getDirectoryListing with path
-├── Is it a class/struct/enum?
-│   ├── YES → Use getImplementation with class name
-│   └── NO → Continue to next question
 ├── Need quick context about a file?
 │   ├── YES → Use getSummaryOfFile with file path
 │   └── NO → Continue to next question
@@ -138,13 +131,13 @@ Need to understand code?
 │   └── NO → Continue to next question
 ├── Need to search/explore/find class names?
 │   └── YES → Use runTerminalCmd
-└── If unsure → Use getDirectoryListing first, then getImplementation, then getSummaryOfFile, then readFile if needed
+└── If unsure → Use getDirectoryListing first, then getSummaryOfFile, then readFile if needed
 ```
 
 **Common Scenarios:**
 - **Before any file reading** → `getDirectoryListing` with directory/file path
-- **Analyzing a function in a class** → `getDirectoryListing` first, then `getImplementation` with class name
-- **Understanding class behavior** → `getDirectoryListing` first, then `getImplementation` with class name
+- **Analyzing a function in a class** → `getDirectoryListing` first, then `readFile` with file path
+- **Understanding class behavior** → `getDirectoryListing` first, then `readFile` with file path
 - **Quick file context** → `getDirectoryListing` first, then `getSummaryOfFile` with file path
 - **Checking header files** → `getDirectoryListing` first, then `readFile` with header path (if small enough)
 - **Reading config/build files** → `getDirectoryListing` first, then `readFile` with file path (if small enough)

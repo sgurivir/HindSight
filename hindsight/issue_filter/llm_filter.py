@@ -179,14 +179,19 @@ class LLMBasedFilter:
     
     def _llm_filter_issues(self, issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Real LLM-based filtering using the trivial issue filter prompt with structured tools.
+        Real LLM-based filtering using the trivial issue filter prompt with TrivialFilterAnalyzer.
+        
+        Uses the TrivialFilterAnalyzer from hindsight.core.llm.iterative for proper
+        stage-specific JSON extraction and validation. This approach avoids the deprecated
+        Claude.run_iterative_analysis() method.
         """
         import json
-        from ..core.llm.code_analysis import CodeAnalysis, AnalysisConfig
+        from ..core.llm.llm import Claude, ClaudeConfig
+        from ..core.llm.iterative import TrivialFilterAnalyzer
         from ..utils.config_util import get_llm_provider_type
         
         original_count = len(issues)
-        self.logger.info(f"LLMBasedFilter: Starting LLM-based filtering of {original_count} issues using structured tools")
+        self.logger.info(f"LLMBasedFilter: Starting LLM-based filtering of {original_count} issues using TrivialFilterAnalyzer")
         
         # Load the trivial issue filter prompt
         prompt_path = Path(__file__).parent.parent / "core" / "prompts" / "trivialIssueFilterPrompt.md"
@@ -198,10 +203,29 @@ class LLMBasedFilter:
             # Fallback to dummy filtering
             return self._dummy_filter_issues(issues)
         
+        # Create Claude instance directly using ClaudeConfig
+        try:
+            llm_provider_type = get_llm_provider_type(self.config)
+            claude_config = ClaudeConfig(
+                api_key=self.api_key,
+                api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
+                model=self.config.get('model', 'claude-3-5-sonnet-20241022'),
+                max_tokens=self.config.get('max_tokens', 64000),
+                temperature=self.config.get('temperature', 0.1),
+                provider_type=llm_provider_type
+            )
+            claude = Claude(claude_config)
+            
+            # Create TrivialFilterAnalyzer for proper JSON extraction
+            analyzer = TrivialFilterAnalyzer(claude)
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Claude/TrivialFilterAnalyzer: {e}")
+            return self._dummy_filter_issues(issues)
+        
         filtered_issues = []
         dropped_count = 0
         
-        # Process each issue individually using structured tools approach
+        # Process each issue individually using TrivialFilterAnalyzer
         for i, issue in enumerate(issues, 1):
             try:
                 # Prepare issue data for LLM
@@ -217,105 +241,47 @@ class LLMBasedFilter:
                 # Create user message with issue data
                 user_message = json.dumps(issue_data, indent=2)
                 
-                # Create temporary input file for structured analysis
-                import tempfile
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
-                    json.dump(issue_data, temp_file, indent=2)
-                    temp_input_path = temp_file.name
+                # Use TrivialFilterAnalyzer.run_iterative_analysis for structured JSON response
+                self.logger.debug(f"Analyzing issue {i}/{original_count} with TrivialFilterAnalyzer")
+                result = analyzer.run_iterative_analysis(
+                    system_prompt=system_prompt,
+                    user_prompt=user_message,
+                    tools_executor=None,  # No tools needed for trivial filtering
+                    supported_tools=None,  # No tools needed for trivial filtering
+                    max_iterations=3  # Limit iterations for filtering
+                )
                 
-                # Create temporary output file
-                with tempfile.NamedTemporaryFile(mode='w', suffix='_analysis.json', delete=False) as temp_output:
-                    temp_output_path = temp_output.name
-                
-                try:
-                    # Get repo_path from config - try multiple possible keys
-                    # Even though trivial filtering doesn't need file access, having repo_path
-                    # ensures tools work correctly if they're ever used
-                    repo_path = self.config.get('repo_path', '') or self.config.get('path_to_repo', '')
-                    
-                    # If still empty, try to get from file_content_provider
-                    if not repo_path and self.file_content_provider:
-                        if hasattr(self.file_content_provider, 'repo_path'):
-                            repo_path = self.file_content_provider.repo_path or ''
-                        elif hasattr(self.file_content_provider, 'get_repo_path'):
-                            try:
-                                repo_path = self.file_content_provider.get_repo_path() or ''
-                            except Exception:
-                                pass
-                    
-                    # Create AnalysisConfig for structured analysis
-                    analysis_config = AnalysisConfig(
-                        json_file_path=temp_input_path,
-                        api_key=self.api_key,
-                        api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-                        model=self.config.get('model', 'claude-3-5-sonnet-20241022'),
-                        repo_path=repo_path,  # Use resolved repo_path for tool compatibility
-                        output_file=temp_output_path,
-                        max_tokens=self.config.get('max_tokens', 64000),
-                        temperature=self.config.get('temperature', 0.1),
-                        processed_cache_file=None,
-                        config=self.config,
-                        file_content_provider=self.file_content_provider,
-                        file_filter=[],
-                        min_function_body_length=0
-                    )
-                    
-                    # Create CodeAnalysis instance for structured tool support
-                    # Skip AST validation since we don't need AST data for trivial issue filtering
-                    code_analysis = CodeAnalysis(analysis_config)
-                    # Clear AST validation requirement for trivial filtering
-                    code_analysis.ast_index._ast_dir_resolved = "/dev/null"  # Dummy path to skip validation
-                    
-                    # Use run_iterative_analysis from the Claude client for structured JSON response
-                    self.logger.debug(f"Analyzing issue {i}/{original_count} with structured tools")
-                    result = code_analysis.claude.run_iterative_analysis(
-                        system_prompt=system_prompt,
-                        user_prompt=user_message,
-                        tools_executor=None,  # No tools needed for trivial filtering
-                        supported_tools=None,  # No tools needed for trivial filtering
-                        max_iterations=3  # Limit iterations for filtering
-                    )
-                    
-                    # Parse the JSON result returned by run_iterative_analysis
-                    parsed_result = None
-                    if result:
-                        try:
-                            # result is a JSON string, parse it to get the dictionary
-                            parsed_result = json.loads(result) if isinstance(result, str) else result
-                        except json.JSONDecodeError as e:
-                            self.logger.warning(f"Failed to parse JSON result for issue {i}: {e}")
-                            self.logger.debug(f"Raw result: {result}")
-                    
-                    if parsed_result and isinstance(parsed_result, dict) and 'result' in parsed_result:
-                        is_trivial = parsed_result.get('result', False)
-                        
-                        if not is_trivial:
-                            filtered_issues.append(issue)
-                        else:
-                            dropped_count += 1
-                            issue_summary = issue.get('issue', '')[:100]
-                            self.logger.info(f"Issue {i} marked as trivial by LLM: {issue_summary}...")
-                            
-                            # Save the dropped issue
-                            self._save_dropped_issue(issue, "Marked as trivial by LLM")
-                    else:
-                        self.logger.warning(f"Invalid or empty result from structured analysis for issue {i}")
-                        if result:
-                            self.logger.debug(f"Raw result received: {result}")
-                        # Keep issue if we can't get valid result
-                        filtered_issues.append(issue)
-                        
-                finally:
-                    # Clean up temporary files
+                # Parse the JSON result returned by run_iterative_analysis
+                parsed_result = None
+                if result:
                     try:
-                        import os
-                        os.unlink(temp_input_path)
-                        os.unlink(temp_output_path)
-                    except OSError:
-                        pass
+                        # result is a JSON string, parse it to get the dictionary
+                        parsed_result = json.loads(result) if isinstance(result, str) else result
+                    except json.JSONDecodeError as e:
+                        self.logger.warning(f"Failed to parse JSON result for issue {i}: {e}")
+                        self.logger.debug(f"Raw result: {result}")
+                
+                if parsed_result and isinstance(parsed_result, dict) and 'result' in parsed_result:
+                    is_trivial = parsed_result.get('result', False)
+                    
+                    if not is_trivial:
+                        filtered_issues.append(issue)
+                    else:
+                        dropped_count += 1
+                        issue_summary = issue.get('issue', '')[:100]
+                        self.logger.info(f"Issue {i} marked as trivial by LLM: {issue_summary}...")
+                        
+                        # Save the dropped issue
+                        self._save_dropped_issue(issue, "Marked as trivial by LLM")
+                else:
+                    self.logger.warning(f"Invalid or empty result from TrivialFilterAnalyzer for issue {i}")
+                    if result:
+                        self.logger.debug(f"Raw result received: {result}")
+                    # Keep issue if we can't get valid result
+                    filtered_issues.append(issue)
                     
             except Exception as e:
-                self.logger.error(f"Error processing issue {i} with structured LLM analysis: {e}")
+                self.logger.error(f"Error processing issue {i} with TrivialFilterAnalyzer: {e}")
                 # Keep issue if error occurs
                 filtered_issues.append(issue)
         

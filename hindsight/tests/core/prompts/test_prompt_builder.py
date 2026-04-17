@@ -944,6 +944,121 @@ class TestLookupDataTypeBody:
                 "code": [{"file_name": "types.h", "start": 2, "end": 4}]
             }
         }
-        
+
         result = PromptBuilder._lookup_data_type_body("MyStruct", merged_data)
         assert result is None
+
+
+# ============================================================================
+# Two-Stage Prompt Builder Tests
+# ============================================================================
+
+class TestBuildContextCollectionPrompt:
+    """Tests for PromptBuilder.build_context_collection_prompt()"""
+
+    def test_returns_tuple(self):
+        """build_context_collection_prompt() returns a non-empty (system_prompt, user_prompt) tuple."""
+        json_content = json.dumps({
+            "function": "myFunc",
+            "file": "myFile.swift",
+            "code": "func myFunc() {}"
+        })
+        with patch('hindsight.core.prompts.prompt_builder._read_package_file') as mock_read:
+            mock_read.return_value = "# Context Collection System Prompt"
+            result = PromptBuilder.build_context_collection_prompt(
+                json_content=json_content,
+                config={"project_name": "TestProject", "description": "A test project"}
+            )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        system_prompt, user_prompt = result
+        assert len(system_prompt) > 0
+        assert len(user_prompt) > 0
+
+    def test_function_name_appears_in_prompt(self):
+        """The function name from the input JSON appears in the built prompt."""
+        json_content = json.dumps({
+            "function": "uniqueFunctionName123",
+            "file": "myFile.swift",
+            "code": "func uniqueFunctionName123() {}"
+        })
+        with patch('hindsight.core.prompts.prompt_builder._read_package_file') as mock_read:
+            mock_read.return_value = "# Context Collection Prompt"
+            system_prompt, user_prompt = PromptBuilder.build_context_collection_prompt(
+                json_content=json_content,
+                config={"project_name": "TestProject", "description": "Test"}
+            )
+        combined = system_prompt + user_prompt
+        assert 'uniqueFunctionName123' in combined
+
+    def test_handles_missing_prompt_file(self):
+        """Returns a valid tuple even if the prompt file is not found."""
+        json_content = json.dumps({"function": "myFunc", "file": "myFile.swift"})
+        with patch('hindsight.core.prompts.prompt_builder._read_package_file') as mock_read:
+            mock_read.return_value = None  # Simulate missing file
+            result = PromptBuilder.build_context_collection_prompt(
+                json_content=json_content,
+                config={}
+            )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+
+class TestBuildAnalysisFromContextPrompt:
+    """Tests for PromptBuilder.build_analysis_from_context_prompt()"""
+
+    @pytest.fixture
+    def context_bundle(self):
+        return {
+            "primary_function": {
+                "name": "myFunc",
+                "file_path": "myFile.swift",
+                "start_line": 10,
+                "end_line": 20,
+                "source": "  10: func myFunc() {}"
+            },
+            "callers": [],
+            "callees": [],
+            "data_types": [],
+            "constants_and_globals": [],
+            "file_summaries": {},
+            "knowledge_hits": [],
+            "collection_notes": "Context gathered successfully"
+        }
+
+    def test_context_bundle_in_user_prompt(self, context_bundle):
+        """The serialised context bundle is present in the user prompt."""
+        with patch('hindsight.core.prompts.prompt_builder._read_package_file') as mock_read:
+            mock_read.return_value = "# Analysis Process Prompt"
+            with patch.object(PromptBuilder, 'build_output_requirements', return_value="## Output Requirements\n\n"):
+                system_prompt, user_prompt = PromptBuilder.build_analysis_from_context_prompt(
+                    context_bundle=context_bundle,
+                    config={"project_name": "TestProject", "description": "Test"}
+                )
+        # The context bundle should appear in the user prompt
+        assert 'myFunc' in user_prompt
+        assert 'myFile.swift' in user_prompt
+
+    def test_returns_tuple(self, context_bundle):
+        """build_analysis_from_context_prompt() returns a non-empty tuple."""
+        with patch('hindsight.core.prompts.prompt_builder._read_package_file') as mock_read:
+            mock_read.return_value = "# Analysis Process"
+            with patch.object(PromptBuilder, 'build_output_requirements', return_value="Output requirements here"):
+                result = PromptBuilder.build_analysis_from_context_prompt(
+                    context_bundle=context_bundle,
+                    config={}
+                )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert all(len(p) > 0 for p in result)
+
+    def test_output_requirements_in_user_prompt(self, context_bundle):
+        """The output schema section is included in the user prompt."""
+        with patch('hindsight.core.prompts.prompt_builder._read_package_file') as mock_read:
+            mock_read.return_value = "# Analysis Process"
+            with patch.object(PromptBuilder, 'build_output_requirements', return_value="UNIQUE_OUTPUT_SCHEMA_MARKER"):
+                system_prompt, user_prompt = PromptBuilder.build_analysis_from_context_prompt(
+                    context_bundle=context_bundle,
+                    config={}
+                )
+        assert 'UNIQUE_OUTPUT_SCHEMA_MARKER' in user_prompt

@@ -17,12 +17,12 @@ class TokenTracker:
     eliminating the duplicate tracking systems that were causing discrepancies.
     """
     
-    def __init__(self, llm_provider_type: str = "claude"):
+    def __init__(self, llm_provider_type: str = "aws_bedrock"):
         """
         Initialize token tracker.
-        
+
         Args:
-            llm_provider_type: Type of LLM provider ("claude", "aws_bedrock", "dummy")
+            llm_provider_type: Type of LLM provider ("aws_bedrock")
         """
         self.logger = get_logger(__name__)
         self.llm_provider_type = llm_provider_type

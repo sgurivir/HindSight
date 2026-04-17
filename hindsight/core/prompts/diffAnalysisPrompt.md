@@ -126,7 +126,6 @@ You MUST completely avoid suggesting caching mechanisms of ANY kind:
 Use tools when you need additional context beyond the diff:
 
 **Exploration:**
-- `getImplementation`: Complete class/struct/enum implementations
 - `readFile`: File contents (check size with `checkFileSize` first)
 - `findSpecificFilesWithSearchString`: Locate files with text
 - `list_files`: List files and directories within a specified directory
@@ -141,6 +140,9 @@ Use tools when you need additional context beyond the diff:
   - Example: `grep -rn 'pattern' --include='*.java' .` to find files containing a pattern
   - ❌ **DON'T use**: multi-word patterns (`'class Name'`), regex (`'.*Type'`), OR patterns (`'a\|b'`), wildcard paths (`dir/*.swift`)
   - Use single quotes around patterns. Use single distinctive words only.
+  - **⛔ CRITICAL: Repository Boundary Constraint** - All commands MUST stay within the repository root (`.`). Commands searching outside will timeout and fail:
+    - ❌ FORBIDDEN: `find /Users -name '*.swift' -path '*Orange*' 2>/dev/null | xargs grep -l 'UserDefaultsAppStateKeys' | head -5`
+    - ✅ CORRECT: `find . -name '*.swift' | xargs grep -l 'UserDefaultsAppStateKeys' | head -5`
 
 ### list_files Tool
 **Purpose**: List files and directories within a specified directory to understand project structure
@@ -236,7 +238,7 @@ Need to understand code?
 │   └── YES → Use runTerminalCmd with grep, findSpecificFilesWithSearchString, or list_files
 ├── Need to list directory contents
 │   └── YES → Use list_files
-└── If unsure → Use list_files first, then getImplementation, then getSummaryOfFile, then checkFileSize + readFile as needed
+└── If unsure → Use list_files first, then getSummaryOfFile, then checkFileSize + readFile as needed
 ```
 
 Choose tools based on what context you need for accurate analysis.

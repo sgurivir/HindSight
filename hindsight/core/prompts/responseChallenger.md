@@ -70,7 +70,12 @@ You have access to these tools to verify issues:
    
    ❌ **DON'T use**: multi-word patterns (`'class Name'`), regex (`'.*Type'`), OR patterns (`'a\|b'`), wildcard paths (`dir/*.swift`)
    
-   **IMPORTANT**: Always wrap search patterns in single quotes. Use single distinctive words only.
+   ⛔ **CRITICAL: Repository Boundary Constraint**
+   All terminal commands MUST stay within the repository root. Commands that search outside will timeout and fail.
+   - ❌ `find /Users -name '*.swift'` → ✅ `find . -name '*.swift'`
+   - ❌ `grep -rn 'pattern' /` → ✅ `grep -rn 'pattern' .`
+   
+   **IMPORTANT**: Always wrap search patterns in single quotes. Use single distinctive words only. Always use relative paths (`.` or `./dir`).
 
 5. **checkFileSize** - Check file size before reading
    ```json
@@ -150,11 +155,14 @@ The analyzer must prove the issue EXISTS, not that it COULD exist under hypothet
 - Guards or preconditions in calling code prevent the issue from occurring
 - Operations flagged as "redundant" are actually in different execution paths
 
-### Intentional Design Patterns
+### Intentional Design Patterns & Defensive Programming
 - The pattern appears intentional for API consistency, backward compatibility, or future extensibility
-- Comments in the code indicate the behavior is by design ("intentional", "by design", "defensive", "shouldn't happen", "expected")
+- Comments in the code indicate the behavior is by design ("intentional", "by design", "defensive", "shouldn't happen", "expected", "only one")
 - The pattern follows established conventions for the codebase or domain
 - Defensive programming patterns are being flagged as bugs
+- Unused enum cases or unreachable default branches that exist for completeness or future extensibility
+- Edge cases that are prevented by documented domain constraints (e.g., "there can only be one instance", "singleton by design")
+- Code that handles theoretically possible but practically impossible scenarios given the domain
 
 ### Behavioral Impact
 - "Fixing" the issue would not change the program's observable behavior
@@ -185,6 +193,8 @@ Before deciding, explicitly consider these questions:
 8. **Is the analyzer reading the control flow correctly?** - Are the flagged operations actually in the same execution path, or are they in different conditional branches? If in different branches, the issue is likely a false positive.
 
 9. **Does the code have proper guards?** - Are there precondition checks, status flags, or early returns that prevent the problematic scenario? If YES, the issue is likely a false positive.
+
+10. **Is this intentional design or defensive programming?** - Does the code have comments indicating intentional design ("by design", "only one", "defensive", "intentional")? Are there unused enum cases or unreachable defaults for future extensibility? Is the edge case prevented by domain constraints? If YES, reject.
 
 If any answer suggests the issue is not a real bug, reject it.
 

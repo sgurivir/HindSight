@@ -441,45 +441,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             self.logger.error(f"Failed to generate file summaries: {e}")
             return {}
 
-    def _analyze_diff_stats_per_file(self, diff_content: str) -> Dict[str, Dict[str, int]]:
-        """
-        Analyze diff content to count lines and characters changed per file.
-        
-        Args:
-            diff_content: Full diff content
-            
-        Returns:
-            Dictionary mapping file_path -> {lines_changed, chars_changed}
-        """
-        file_stats = {}
-        lines = diff_content.split('\n')
-        current_file = None
-        
-        for line in lines:
-            # Check for file headers
-            if line.startswith('diff --git'):
-                # Extract file path from diff header
-                parts = line.split()
-                if len(parts) >= 4:
-                    current_file = parts[3][2:]  # Remove 'b/' prefix from new file path
-                    if current_file not in file_stats:
-                        file_stats[current_file] = {'lines_changed': 0, 'chars_changed': 0}
-            elif line.startswith('+++'):
-                # Alternative way to get file path
-                file_path = line[4:].strip()  # Remove '+++ ' prefix
-                if file_path.startswith('b/'):
-                    file_path = file_path[2:]  # Remove 'b/' prefix
-                current_file = file_path
-                if current_file not in file_stats:
-                    file_stats[current_file] = {'lines_changed': 0, 'chars_changed': 0}
-            elif current_file and (line.startswith('+') or line.startswith('-')):
-                # Count changed lines and characters (both additions and deletions)
-                if not line.startswith('+++') and not line.startswith('---'):
-                    file_stats[current_file]['lines_changed'] += 1
-                    file_stats[current_file]['chars_changed'] += len(line)
-        
-        return file_stats
-
     def _calculate_total_characters_changed(self, file_stats: Dict[str, Dict[str, int]]) -> int:
         """
         Calculate total characters changed across all files.
@@ -491,192 +452,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             Total characters changed
         """
         return sum(stats['chars_changed'] for stats in file_stats.values())
-
-    def _create_diff_chunks(self, diff_content: str, file_stats: Dict[str, Dict[str, int]]) -> List[Dict[str, Any]]:
-        """
-        Create diff chunks that respect file boundaries, character limits, and file count limits.
-        
-        Process:
-        1. Look for files changed by commit
-        2. Filter to files with < allowed number of max characters (only count characters changed)
-        3. Sort files by full relative path to keep related files together
-        4. Create chunks from eligible files, respecting both character and file count limits
-        5. Use chunk count limit as preference - warn if exceeded but continue processing
-        
-        Args:
-            diff_content: Full diff content
-            file_stats: Dictionary mapping file_path -> {lines_changed, chars_changed}
-            
-        Returns:
-            List of chunks, each containing {diff_content, files_in_chunk, all_changed_files}
-        """
-        chunks = []
-        current_chunk_content = ""
-        current_chunk_files = []
-        current_chunk_chars = 0
-        
-        # Step 1: Look for files changed by commit (split diff into file sections)
-        file_sections = self._split_diff_by_files(diff_content)
-        self.logger.info(f"Step 1: Found {len(file_sections)} files changed by commit")
-        
-        # Step 2: Filter to files with < allowed number of max characters (count full diff content)
-        eligible_files = []
-        oversized_files = []
-        
-        for file_path, file_diff in file_sections.items():
-            file_diff_chars = len(file_diff)  # Use actual diff content length, not just changed lines
-            
-            if file_diff_chars <= MAX_CHARACTERS_PER_DIFF_ANALYSIS:
-                eligible_files.append((file_path, file_diff, file_diff_chars))
-            else:
-                oversized_files.append((file_path, file_diff_chars))
-        
-        self.logger.info(f"Step 2: After character filtering - {len(eligible_files)} eligible files, {len(oversized_files)} oversized files")
-        
-        if oversized_files:
-            for file_path, file_diff_chars in oversized_files:
-                self.logger.warning(f"Skipping file {file_path} - {file_diff_chars} diff characters exceeds limit of {MAX_CHARACTERS_PER_DIFF_ANALYSIS}")
-        
-        # Step 3: Sort files by full relative path to keep related files together
-        eligible_files.sort(key=lambda x: x[0])  # Sort by file_path (first element of tuple)
-        self.logger.info(f"Step 3: Sorted {len(eligible_files)} eligible files by full relative path")
-        
-        # Step 4: Create chunks from eligible files, respecting both character and file count limits
-        self.logger.info(f"Step 4: Creating chunks from {len(eligible_files)} eligible files (max {MAX_FILES_PER_DIFF_CHUNK} files per chunk, max {self.num_blocks_to_analyze} chunks)")
-        
-        # Track if we hit the chunk limit to avoid adding extra chunk at the end
-        hit_chunk_limit = False
-        
-        for file_path, file_diff, file_chars in eligible_files:
-            # Check if we've reached the maximum number of chunks
-            if len(chunks) >= self.num_blocks_to_analyze:
-                remaining_files = len(eligible_files) - eligible_files.index((file_path, file_diff, file_chars))
-                self.logger.warning(f"CHUNK LIMIT REACHED: Created {len(chunks)} chunks (limit: {self.num_blocks_to_analyze})")
-                self.logger.warning(f"Stopping analysis - {remaining_files} files will not be processed to respect chunk limit")
-                hit_chunk_limit = True
-                break
-            
-            # Check if adding this file would exceed limits, start a new chunk if needed
-            should_start_new_chunk = False
-            chunk_limit_reason = ""
-            
-            # Check both limits - BOTH must be respected
-            will_exceed_char_limit = current_chunk_chars + file_chars > MAX_CHARACTERS_PER_DIFF_ANALYSIS
-            will_exceed_file_limit = len(current_chunk_files) >= MAX_FILES_PER_DIFF_CHUNK
-            
-            if current_chunk_content:  # Only start new chunk if we have existing content
-                if will_exceed_char_limit:
-                    should_start_new_chunk = True
-                    chunk_limit_reason = f"character limit (current={current_chunk_chars}, adding={file_chars}, limit={MAX_CHARACTERS_PER_DIFF_ANALYSIS})"
-                elif will_exceed_file_limit:
-                    should_start_new_chunk = True
-                    chunk_limit_reason = f"file count limit (current={len(current_chunk_files)}, limit={MAX_FILES_PER_DIFF_CHUNK})"
-            
-            if should_start_new_chunk:
-                # Check if creating this new chunk would be the last allowed chunk
-                # If so, we need to check if we can still add the current file after creating the chunk
-                if len(chunks) + 1 >= self.num_blocks_to_analyze:
-                    # This will be the last chunk - add current content and the current file to it if possible
-                    # Otherwise, just save current content and stop
-                    self.logger.debug(f"Creating final chunk due to {chunk_limit_reason}")
-                    chunks.append({
-                        'diff_content': current_chunk_content,
-                        'files_in_chunk': current_chunk_files.copy(),
-                        'all_changed_files': list(file_stats.keys())
-                    })
-                    remaining_files = len(eligible_files) - eligible_files.index((file_path, file_diff, file_chars))
-                    self.logger.warning(f"CHUNK LIMIT REACHED: Created {len(chunks)} chunks (limit: {self.num_blocks_to_analyze})")
-                    self.logger.warning(f"Stopping analysis - {remaining_files} files will not be processed to respect chunk limit")
-                    hit_chunk_limit = True
-                    break
-                
-                self.logger.debug(f"Starting new chunk due to {chunk_limit_reason}")
-                chunks.append({
-                    'diff_content': current_chunk_content,
-                    'files_in_chunk': current_chunk_files.copy(),
-                    'all_changed_files': list(file_stats.keys())
-                })
-                current_chunk_content = ""
-                current_chunk_files = []
-                current_chunk_chars = 0
-            
-            # Add file to current chunk
-            current_chunk_content += file_diff
-            current_chunk_files.append(file_path)
-            current_chunk_chars += file_chars
-            
-            # Safety check: ensure we never exceed limits within a chunk
-            if len(current_chunk_files) > MAX_FILES_PER_DIFF_CHUNK:
-                self.logger.error(f"SAFETY ERROR: Chunk has {len(current_chunk_files)} files, exceeds limit of {MAX_FILES_PER_DIFF_CHUNK}")
-            if current_chunk_chars > MAX_CHARACTERS_PER_DIFF_ANALYSIS:
-                self.logger.error(f"SAFETY ERROR: Chunk has {current_chunk_chars} characters, exceeds limit of {MAX_CHARACTERS_PER_DIFF_ANALYSIS}")
-        
-        # Add the last chunk if it has content and we didn't hit the chunk limit
-        # (If we hit the limit, we already handled the final chunk above)
-        if current_chunk_content and not hit_chunk_limit:
-            chunks.append({
-                'diff_content': current_chunk_content,
-                'files_in_chunk': current_chunk_files,
-                'all_changed_files': list(file_stats.keys())
-            })
-        
-        # Step 5: Report final chunk statistics
-        total_files_processed = sum(len(chunk['files_in_chunk']) for chunk in chunks)
-        total_files_available = len(eligible_files)
-        
-        # Log chunk details for debugging
-        for i, chunk in enumerate(chunks, 1):
-            self.logger.info(f"Chunk {i}: {len(chunk['files_in_chunk'])} files, {len(chunk['diff_content'])} characters")
-        
-        if len(chunks) >= self.num_blocks_to_analyze:
-            self.logger.info(f"CHUNK LIMIT ENFORCED: Created {len(chunks)} chunks (limit: {self.num_blocks_to_analyze})")
-            self.logger.info(f"Processed {total_files_processed} files - stopped at chunk limit to respect user preference")
-        else:
-            self.logger.info(f"Created {len(chunks)} chunks from {total_files_processed} files (within limit of {self.num_blocks_to_analyze} chunks)")
-        
-        # Ensure we processed all eligible files
-        if total_files_processed != total_files_available:
-            self.logger.error(f"PROCESSING ERROR: Expected to process {total_files_available} files but only processed {total_files_processed}")
-        
-        return chunks
-
-    def _split_diff_by_files(self, diff_content: str) -> Dict[str, str]:
-        """
-        Split diff content into separate sections per file.
-        
-        Args:
-            diff_content: Full diff content
-            
-        Returns:
-            Dictionary mapping file_path -> file_diff_content
-        """
-        file_sections = {}
-        lines = diff_content.split('\n')
-        current_file = None
-        current_file_lines = []
-        
-        for line in lines:
-            if line.startswith('diff --git'):
-                # Save previous file section
-                if current_file and current_file_lines:
-                    file_sections[current_file] = '\n'.join(current_file_lines)
-                
-                # Start new file section
-                parts = line.split()
-                if len(parts) >= 4:
-                    current_file = parts[3][2:]  # Remove 'b/' prefix
-                    current_file_lines = [line]
-                else:
-                    current_file = None
-                    current_file_lines = []
-            elif current_file:
-                current_file_lines.append(line)
-        
-        # Save the last file section
-        if current_file and current_file_lines:
-            file_sections[current_file] = '\n'.join(current_file_lines)
-        
-        return file_sections
 
     def _check_diff_file_count_limit(self) -> Optional[AnalysisResult]:
         """
@@ -730,435 +505,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         """
         # Call the mixin method with config
         super()._initialize_unified_issue_filter(api_key, self.config)
-
-    def analyze_diff_with_llm(self, diff_content: str) -> List[Dict[str, Any]]:
-        """
-        Analyze the diff content using LLM with chunking support.
-
-        Args:
-            diff_content: The unified diff content to analyze
-
-        Returns:
-            List of analysis results
-        """
-        self.logger.info("Starting LLM analysis of diff content with chunking support")
-
-        # Get API key and provider type
-        api_key = get_api_key_from_config(self.config)
-        if not api_key:
-            self.logger.error("No API key available for LLM analysis")
-            return []
-
-        # Initialize unified two-level issue filter
-        self._initialize_unified_issue_filter_for_diff(api_key)
-
-        try:
-            # Analyze diff stats per file (for logging purposes)
-            self.file_diff_stats = self._analyze_diff_stats_per_file(diff_content)
-            self.logger.info(f"Analyzed diff stats for {len(self.file_diff_stats)} files")
-            
-            # Split diff by files to get actual diff content sizes (consistent with chunking logic)
-            file_sections = self._split_diff_by_files(diff_content)
-            
-            # Calculate total diff content size (same metric used by chunking logic)
-            # This ensures the gate check and chunker use the same measurement
-            total_diff_chars = sum(len(content) for content in file_sections.values())
-            self.logger.info(f"Total diff content characters: {total_diff_chars}")
-            
-            # Also log the changed-lines-only metric for comparison
-            changed_lines_chars = self._calculate_total_characters_changed(self.file_diff_stats)
-            self.logger.info(f"Changed lines characters only: {changed_lines_chars}")
-            
-            # Check if chunking is needed using full diff content size (consistent with chunker)
-            if total_diff_chars <= MAX_CHARACTERS_PER_DIFF_ANALYSIS:
-                self.logger.info(f"Total diff content ({total_diff_chars}) within limit ({MAX_CHARACTERS_PER_DIFF_ANALYSIS}), analyzing as single chunk")
-                return self._analyze_single_chunk(diff_content, list(file_sections.keys()))
-            else:
-                self.logger.info(f"Total diff content ({total_diff_chars}) exceeds limit ({MAX_CHARACTERS_PER_DIFF_ANALYSIS}), chunking required")
-                return self._analyze_multiple_chunks(diff_content)
-
-        except Exception as e:
-            self.logger.error(f"Error during LLM analysis: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
-            return []
-
-    def _analyze_single_chunk(self, diff_content: str, all_changed_files: List[str]) -> List[Dict[str, Any]]:
-        """
-        Analyze diff content as a single chunk.
-        
-        Args:
-            diff_content: The unified diff content to analyze
-            all_changed_files: List of all changed files
-            
-        Returns:
-            List of analysis results
-        """
-        # Progress logging for single chunk analysis
-        self.logger.info("Analyzing diff 1/1")
-        self.logger.info(f"Single chunk contains {len(all_changed_files)} files: {', '.join(all_changed_files)}")
-        
-        # Generate file summaries first
-        self.logger.info("Generating file summaries before diff analysis...")
-        file_summaries = self._generate_file_summaries(all_changed_files)
-        
-        # Load the diff analysis system prompt using PromptBuilder for consistency with code analyzer
-        # Build system prompt with strict JSON output requirements
-        config_for_prompt = self.config.copy()
-        config_for_prompt['project_name'] = config_for_prompt.get('project_name', 'Git Diff Analysis')
-        config_for_prompt['description'] = config_for_prompt.get('description', 'Analyzing git diff for potential issues')
-        
-        # Load base diff analysis prompt
-        current_dir = Path(__file__).parent.parent
-        prompt_path = current_dir / "core" / "prompts" / "diffAnalysisPrompt.md"
-        
-        with open(prompt_path, 'r', encoding='utf-8') as f:
-            base_system_prompt = f.read()
-        
-        # Add strict JSON output requirements (same as code analyzer)
-        output_requirements = PromptBuilder.build_output_requirements()
-        system_prompt = base_system_prompt + "\n\n" + output_requirements
-
-        # Create diff analysis configuration
-        llm_provider_type = get_llm_provider_type(self.config)
-        api_url = self.config.get('api_url') or self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT)
-        
-        diff_config = DiffAnalysisConfig(
-            api_key=get_api_key_from_config(self.config),
-            api_url=api_url,
-            model=self.config.get('model', DEFAULT_LLM_MODEL),
-            repo_path=str(self.repo_checkout_dir),
-            output_file="",  # Not used for this analysis
-            max_tokens=self.config.get('max_tokens', 64000),
-            temperature=0.0,  # Most deterministic setting for JSON reliability
-            config=self.config,
-            file_content_provider=self.get_file_content_provider()
-        )
-
-        # Create diff analysis instance
-        diff_analyzer = DiffAnalysis(diff_config)
-
-        # Store the analysis instance for token tracking (similar to CodeAnalyzer)
-        self._last_analysis = diff_analyzer
-
-        # Generate additional context using the context provider
-        additional_context = ""
-        if self.context_provider:
-            try:
-                self.logger.info("Generating additional context from AST analysis...")
-                exclude_dirs = self.config.get('exclude_directories', [])
-                clang_args = self.config.get('clang_args', [])
-                additional_context = self.context_provider.get_context_for_files(
-                    all_changed_files, clang_args, all_changed_files, self.code_insights_dir, use_subprocess=not self.force_in_process_ast
-                )
-                self.logger.info("Additional context generated successfully")
-            except Exception as e:
-                self.logger.warning(f"Failed to generate additional context: {e}")
-                additional_context = ""
-
-        # Prepare file summaries section
-        file_summaries_section = ""
-        if file_summaries:
-            summaries_text = []
-            for file_path, summary in file_summaries.items():
-                summaries_text.append(f"**{file_path}**: {summary}")
-            file_summaries_section = f"""
-
-====File Summaries====
-
-The following are summaries of the files changed in this diff to help you understand their purpose and context:
-
-{chr(10).join(summaries_text)}
-
-====End File Summaries===="""
-
-        # Prepare the user message with diff content and additional context
-        user_message = f"""Please analyze the following git diff for potential issues:
-
-Repository: {self.repo_checkout_dir}
-Old Commit: {self.old_commit_hash}
-New Commit: {self.new_commit_hash}
-
-✅ COMPLETE DIFF ANALYSIS:
-- This is a COMPLETE diff (not chunked)
-- You are seeing ALL changes in this commit
-- All Changed Files: {', '.join(all_changed_files)}
-- You have complete context for analysis{file_summaries_section}
-
-Diff Content:
-```diff
-{diff_content}
-```
-
-Please analyze only the added lines (lines starting with +) and report any issues you find. Focus on newly introduced problems, not pre-existing ones. You may use tools for additional context if needed.
-
-🎯 **IMPORTANT**: When reporting line numbers, focus on the actually changed lines (lines with + prefix) to ensure your findings can be properly commented on in the pull request.
-
-🔥 **CRITICAL JSON OUTPUT REMINDER**: Your final response MUST be a valid JSON array starting with `[` and ending with `]`. No markdown, no explanatory text - ONLY the JSON array."""
-
-        # Add additional context if available
-        if additional_context:
-            user_message += f"""
-
-====Use this additional context if needed===
-
-{additional_context}
-
-This additional context provides information about the code structure and relationships in the files touched by this commit. Use this information to better understand the context of the changes when analyzing for potential issues."""
-
-        # Add user-provided prompts to system prompt if available (similar to CodeAnalysisRunner)
-        if self.user_provided_prompts:
-            user_prompts_text = "\n\n".join([f"USER INSTRUCTION {i+1}: {prompt}" for i, prompt in enumerate(self.user_provided_prompts)])
-            system_prompt += f"\n\nADDITIONAL USER INSTRUCTIONS:\n{user_prompts_text}"
-            self.logger.info(f"Added {len(self.user_provided_prompts)} user-provided prompts to system prompt")
-
-        # Run the analysis
-        issues = diff_analyzer.analyze_diff(system_prompt, user_message)
-
-        # Record token usage if token tracker is available (similar to CodeAnalyzer)
-        if self.token_tracker and hasattr(diff_analyzer, 'get_token_totals'):
-            try:
-                input_tokens, output_tokens = diff_analyzer.get_token_totals()
-                if input_tokens > 0 or output_tokens > 0:
-                    self.token_tracker.add_token_usage(input_tokens, output_tokens)
-                    self.logger.debug(f"Recorded token usage: {input_tokens} input, {output_tokens} output")
-            except Exception as e:
-                self.logger.warning(f"Failed to record token usage: {e}")
-
-        if issues is None:
-            self.logger.error("Analyzing diff 1/1 - Analysis failed")
-            return []
-
-        self.logger.info(f"Analyzing diff 1/1 - Found {len(issues)} potential issues")
-
-        # Apply unified two-level issue filter if available
-        if self.unified_issue_filter and issues:
-            self.logger.info(f"Applying unified two-level issue filter to {len(issues)} issues")
-            filtered_issues = self.unified_issue_filter.filter_issues(issues)
-            
-            if len(filtered_issues) != len(issues):
-                dropped_count = len(issues) - len(filtered_issues)
-                self.logger.info(f"Unified issue filter: dropped {dropped_count} issues, keeping {len(filtered_issues)} issues")
-            
-            return filtered_issues
-        else:
-            self.logger.info("Unified issue filter not available - returning all issues")
-            return issues
-
-    def _analyze_multiple_chunks(self, diff_content: str) -> List[Dict[str, Any]]:
-        """
-        Analyze diff content in multiple chunks with independent conversations.
-        
-        Args:
-            diff_content: The unified diff content to analyze
-            
-        Returns:
-            List of analysis results from all chunks
-        """
-        # Create chunks
-        chunks = self._create_diff_chunks(diff_content, self.file_diff_stats)
-        total_chunks = len(chunks)
-        self.logger.info(f"Created {total_chunks} chunks for analysis")
-        
-        all_issues = []
-        
-        for i, chunk in enumerate(chunks, 1):
-            # Progress logging that user requested
-            self.logger.info(f"Analyzing diff {i}/{total_chunks}")
-            self.logger.info(f"Chunk {i}/{total_chunks} contains {len(chunk['files_in_chunk'])} files: {', '.join(chunk['files_in_chunk'])}")
-            
-            # Each chunk gets an independent conversation
-            chunk_issues = self._analyze_chunk_independently(
-                chunk['diff_content'],
-                chunk['files_in_chunk'],
-                chunk['all_changed_files'],
-                i,
-                total_chunks
-            )
-            
-            if chunk_issues:
-                all_issues.extend(chunk_issues)
-                self.logger.info(f"Analyzing diff {i}/{total_chunks} - Found {len(chunk_issues)} issues")
-            else:
-                self.logger.warning(f"Analyzing diff {i}/{total_chunks} - Analysis failed or found no issues")
-        
-        self.logger.info(f"Total issues found across all chunks: {len(all_issues)}")
-        return all_issues
-
-    def _analyze_chunk_independently(self, chunk_diff: str, files_in_chunk: List[str],
-                                   all_changed_files: List[str], chunk_num: int, total_chunks: int) -> List[Dict[str, Any]]:
-        """
-        Analyze a single chunk with independent conversation context.
-        
-        Args:
-            chunk_diff: Diff content for this chunk
-            files_in_chunk: Files included in this chunk
-            all_changed_files: All files changed in the entire diff
-            chunk_num: Current chunk number
-            total_chunks: Total number of chunks
-            
-        Returns:
-            List of analysis results for this chunk
-        """
-        try:
-            # Load the diff analysis system prompt using PromptBuilder for consistency with code analyzer
-            # Build system prompt with strict JSON output requirements
-            config_for_prompt = self.config.copy()
-            config_for_prompt['project_name'] = config_for_prompt.get('project_name', 'Git Diff Analysis')
-            config_for_prompt['description'] = config_for_prompt.get('description', 'Analyzing git diff for potential issues')
-            
-            # Load base diff analysis prompt
-            current_dir = Path(__file__).parent.parent
-            prompt_path = current_dir / "core" / "prompts" / "diffAnalysisPrompt.md"
-            
-            with open(prompt_path, 'r', encoding='utf-8') as f:
-                base_system_prompt = f.read()
-            
-            # Add strict JSON output requirements (same as code analyzer)
-            output_requirements = PromptBuilder.build_output_requirements()
-            system_prompt = base_system_prompt + "\n\n" + output_requirements
-
-            # Create diff analysis configuration for this chunk
-            llm_provider_type = get_llm_provider_type(self.config)
-            api_url = self.config.get('api_url') or self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT)
-            
-            diff_config = DiffAnalysisConfig(
-                api_key=get_api_key_from_config(self.config),
-                api_url=api_url,
-                model=self.config.get('model', DEFAULT_LLM_MODEL),
-                repo_path=str(self.repo_checkout_dir),
-                output_file="",  # Not used for this analysis
-                max_tokens=self.config.get('max_tokens', 64000),
-                temperature=0.0,  # Most deterministic setting for JSON reliability
-                config=self.config,
-                file_content_provider=self.get_file_content_provider()
-            )
-
-            # Create NEW diff analysis instance for independent conversation
-            diff_analyzer = DiffAnalysis(diff_config)
-    
-            # Store the analysis instance for token tracking (similar to CodeAnalyzer)
-            self._last_analysis = diff_analyzer
-    
-            # Generate file summaries for files in this chunk
-            self.logger.debug(f"Generating file summaries for chunk {chunk_num}...")
-            chunk_file_summaries = self._generate_file_summaries(files_in_chunk)
-            
-            # Generate additional context for this chunk
-            additional_context = ""
-            if self.context_provider:
-                try:
-                    self.logger.debug(f"Generating additional context for chunk {chunk_num}...")
-                    exclude_dirs = self.config.get('exclude_directories', [])
-                    clang_args = self.config.get('clang_args', [])
-                    # Use files in this chunk for context generation, but pass all changed files for caching
-                    additional_context = self.context_provider.get_context_for_files(
-                        files_in_chunk, clang_args, all_changed_files, self.code_insights_dir, use_subprocess=not self.force_in_process_ast
-                    )
-                    self.logger.debug(f"Additional context generated for chunk {chunk_num}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to generate additional context for chunk {chunk_num}: {e}")
-                    additional_context = ""
-
-            # Prepare file summaries section for this chunk
-            file_summaries_section = ""
-            if chunk_file_summaries:
-                summaries_text = []
-                for file_path, summary in chunk_file_summaries.items():
-                    summaries_text.append(f"**{file_path}**: {summary}")
-                file_summaries_section = f"""
-
-====File Summaries for This Chunk====
-
-The following are summaries of the files being analyzed in this chunk to help you understand their purpose and context:
-
-{chr(10).join(summaries_text)}
-
-====End File Summaries===="""
-
-            # Prepare the user message with chunk context
-            user_message = f"""Please analyze the following git diff for potential issues:
-
-Repository: {self.repo_checkout_dir}
-Old Commit: {self.old_commit_hash}
-New Commit: {self.new_commit_hash}
-
-🚨 CRITICAL CHUNKED DIFF NOTICE:
-- This is chunk {chunk_num} of {total_chunks} total chunks
-- You are seeing ONLY A PARTIAL VIEW of the complete diff
-- COMPLETE list of ALL files changed in this commit: {', '.join(all_changed_files)}
-- Files being analyzed in THIS CHUNK ONLY: {', '.join(files_in_chunk)}
-- MISSING from this chunk: {len(all_changed_files) - len(files_in_chunk)} other changed files
-
-⚠️  MANDATORY REQUIREMENTS FOR CHUNKED ANALYSIS:
-1. You MUST use tools to explore the complete codebase context before reporting any issues
-2. NEVER report breaking changes (like function renames) without verifying through tools that corresponding implementation files and call sites were NOT updated
-3. If you cannot verify complete context through tools, DO NOT report the issue
-4. Focus only on issues that can be proven with the available chunk content plus tool verification{file_summaries_section}
-
-Diff Content for this chunk:
-```diff
-{chunk_diff}
-```
-
-Please analyze only the added lines (lines starting with +) and report any issues you find. Focus on newly introduced problems, not pre-existing ones. Remember: Use tools to verify complete context before reporting any issues.
-
-🎯 **IMPORTANT**: When reporting line numbers, focus on the actually changed lines (lines with + prefix) to ensure your findings can be properly commented on in the pull request.
-
-🔥 **CRITICAL JSON OUTPUT REMINDER**: Your final response MUST be a valid JSON array starting with `[` and ending with `]`. No markdown, no explanatory text - ONLY the JSON array."""
-
-            # Add additional context if available
-            if additional_context:
-                user_message += f"""
-
-====Use this additional context if needed===
-
-{additional_context}
-
-This additional context provides information about the code structure and relationships in the files being analyzed in this chunk. Use this information to better understand the context of the changes when analyzing for potential issues."""
-
-            # Add user-provided prompts to system prompt if available (similar to CodeAnalysisRunner)
-            if self.user_provided_prompts:
-                user_prompts_text = "\n\n".join([f"USER INSTRUCTION {i+1}: {prompt}" for i, prompt in enumerate(self.user_provided_prompts)])
-                system_prompt += f"\n\nADDITIONAL USER INSTRUCTIONS:\n{user_prompts_text}"
-                self.logger.debug(f"Added {len(self.user_provided_prompts)} user-provided prompts to chunk {chunk_num} system prompt")
-    
-            # Run the analysis with NEW conversation context
-            issues = diff_analyzer.analyze_diff(system_prompt, user_message)
-    
-            # Record token usage if token tracker is available (similar to CodeAnalyzer)
-            if self.token_tracker and hasattr(diff_analyzer, 'get_token_totals'):
-                try:
-                    input_tokens, output_tokens = diff_analyzer.get_token_totals()
-                    if input_tokens > 0 or output_tokens > 0:
-                        self.token_tracker.add_token_usage(input_tokens, output_tokens)
-                        self.logger.debug(f"Chunk {chunk_num} recorded token usage: {input_tokens} input, {output_tokens} output")
-                except Exception as e:
-                    self.logger.warning(f"Failed to record token usage for chunk {chunk_num}: {e}")
-    
-            if issues is None:
-                self.logger.error(f"Chunk {chunk_num} analysis failed")
-                return []
-    
-            self.logger.info(f"Chunk {chunk_num} analysis found {len(issues)} potential issues")
-
-            # Apply unified two-level issue filter if available
-            if self.unified_issue_filter and issues:
-                self.logger.info(f"Applying unified two-level issue filter to chunk {chunk_num} with {len(issues)} issues")
-                filtered_issues = self.unified_issue_filter.filter_issues(issues)
-                
-                if len(filtered_issues) != len(issues):
-                    dropped_count = len(issues) - len(filtered_issues)
-                    self.logger.info(f"Chunk {chunk_num} unified issue filter: dropped {dropped_count} issues, keeping {len(filtered_issues)} issues")
-                
-                return filtered_issues
-            else:
-                self.logger.info(f"Unified issue filter not available for chunk {chunk_num} - returning all issues")
-                return issues
-
-        except Exception as e:
-            self.logger.error(f"Error during chunk {chunk_num} analysis: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
-            return []
 
     # ==================== FUNCTION-LEVEL DIFF ANALYSIS METHODS ====================
     
@@ -1242,18 +588,24 @@ This additional context provides information about the code structure and relati
             api_url=api_url,
             model=self.config.get('model', DEFAULT_LLM_MODEL),
             repo_path=str(self.repo_checkout_dir),
-            output_file="",
+            output_file="",  # Not used in two-stage flow
             max_tokens=self.config.get('max_tokens', 64000),
             temperature=0.0,
             config=self.config,
-            file_content_provider=self.get_file_content_provider()
+            file_content_provider=getattr(self, 'file_content_provider', None),
         )
-        
+
         for i, func_info in enumerate(affected_functions, 1):
             func_name = func_info.get('function', 'unknown')
             file_path = func_info.get('file', 'unknown')
             
             self.logger.info(f"Analyzing function {i}/{total_functions}: {func_name} in {file_path}")
+            
+            # Start issue-specific prompt logging for this function
+            # This creates a numbered subdirectory (e.g., prompts_sent/1/, prompts_sent/2/)
+            # to prevent prompts from being overwritten when analyzing multiple functions
+            from ..core.llm.llm import Claude
+            Claude.start_issue_logging(i)
             
             try:
                 # Build function-specific prompt data
@@ -1271,9 +623,15 @@ This additional context provides information about the code structure and relati
                 # Create a new DiffAnalysis instance for each function
                 diff_analyzer = DiffAnalysis(diff_config)
                 self._last_analysis = diff_analyzer
-                
-                # Run the analysis
-                issues = diff_analyzer.analyze_function_diff(prompt_data)
+
+                # Stage Da: Collect diff context
+                diff_context_bundle = diff_analyzer.run_diff_context_collection(prompt_data)
+                if diff_context_bundle is None:
+                    self.logger.warning(f"Stage Da failed for {func_name} - skipping Stage Db")
+                    continue
+
+                # Stage Db: Analyze from context
+                issues = diff_analyzer.run_diff_analysis_from_context(diff_context_bundle)
                 
                 # Record token usage
                 if self.token_tracker and hasattr(diff_analyzer, 'get_token_totals'):
@@ -1302,6 +660,10 @@ This additional context provides information about the code structure and relati
                 self.logger.error(f"Error analyzing function {func_name}: {e}")
                 self.logger.error(f"Full traceback: {traceback.format_exc()}")
                 continue
+            finally:
+                # End issue-specific prompt logging for this function
+                # This resets the issue tracking so the next function gets its own directory
+                Claude.end_issue_logging()
         
         self.logger.info(f"Function-level analysis complete: {len(all_issues)} total issues from {total_functions} functions")
         return all_issues
@@ -1544,119 +906,6 @@ This additional context provides information about the code structure and relati
                 })
         
         return result
-
-    def run_function_level_analysis(self) -> str:
-        """
-        Run function-level diff analysis workflow.
-        
-        This is the new analysis mode that analyzes each affected function individually.
-        
-        Returns:
-            Path to the generated analysis report
-        """
-        try:
-            self.logger.info("Starting Function-Level Diff Analysis")
-            
-            # Step 0: Clear existing contents
-            self._clear_diff_output_directory()
-            
-            # Step 1: Setup repository
-            self.setup_repository()
-            
-            # Step 2: Determine commit order
-            self.determine_commit_order()
-            
-            # Step 2.5: Configure OutputDirectoryProvider
-            output_provider = OutputDirectoryProvider()
-            output_provider.configure(
-                repo_path=str(self.repo_checkout_dir),
-                custom_base_dir=str(self.analysis_dir.parent)
-            )
-            
-            # Step 2.5.1: Initialize context provider
-            try:
-                exclude_dirs = self.config.get('exclude_directories', [])
-                self.context_provider = CommitExtendedContextProvider(
-                    repo_path=str(self.repo_checkout_dir),
-                    exclude_directories=exclude_dirs,
-                    commit_hash=self.new_commit_hash
-                )
-                self.logger.info(f"Initialized context provider for commit {self.new_commit_hash[:8]}")
-            except Exception as e:
-                self.logger.warning(f"Failed to initialize context provider: {e}")
-                self.context_provider = None
-            
-            # Step 2.6: Initialize publisher-subscriber system
-            self._initialize_publisher_subscriber(str(self.analysis_dir))
-            
-            # Step 2.7: Setup conversation logging
-            from ..core.llm.llm import Claude
-            Claude.setup_prompts_logging()
-            Claude.clear_older_prompts()
-            
-            # Step 3: Generate diff
-            diff_file_path = self.analysis_dir / f"diff_{self.old_commit_hash[:8]}_to_{self.new_commit_hash[:8]}.diff"
-            diff_content = self.generate_diff(str(diff_file_path))
-            
-            if not diff_content.strip():
-                self.logger.warning("No diff content generated")
-                return self.save_results([])
-            
-            # Step 4: Extract changed lines per file
-            self.logger.info("Extracting changed lines per file...")
-            changed_lines_per_file = extract_changed_lines_per_file(diff_content)
-            self.logger.info(f"Extracted changes for {len(changed_lines_per_file)} files")
-            
-            # Step 5: Build AST for changed files
-            self.logger.info("Building AST for changed files...")
-            ast_artifacts = self._build_ast_for_changed_files()
-            
-            if not ast_artifacts:
-                self.logger.warning("No AST artifacts generated - falling back to chunk-based analysis")
-                return self.run_analysis()
-            
-            # Step 6: Identify affected functions
-            self.logger.info("Identifying affected functions...")
-            detector = AffectedFunctionDetector(
-                call_graph=ast_artifacts.get('call_graph', {}),
-                functions=ast_artifacts.get('functions', {}),
-                changed_lines_per_file=changed_lines_per_file,
-                repo_path=str(self.repo_checkout_dir)
-            )
-            
-            affected_functions = detector.get_affected_functions(
-                include_callers=True,
-                include_callees=True,
-                max_depth=1
-            )
-            
-            self.logger.info(f"Found {len(affected_functions)} affected functions")
-            
-            if not affected_functions:
-                self.logger.warning("No affected functions found - falling back to chunk-based analysis")
-                return self.run_analysis()
-            
-            # Step 7: Analyze affected functions
-            self.logger.info("Analyzing affected functions...")
-            issues = self._analyze_affected_functions(
-                affected_functions=affected_functions,
-                all_changed_files=self.changed_files,
-                changed_lines_per_file=changed_lines_per_file,
-                ast_artifacts=ast_artifacts
-            )
-            
-            # Step 8: Save results and generate report
-            report_path = self.save_results(issues)
-            
-            self.logger.info(f"Function-level diff analysis completed: {report_path}")
-            return report_path
-            
-        except Exception as e:
-            self.logger.error(f"Function-level diff analysis failed: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
-            raise
-
-    # ==================== END FUNCTION-LEVEL DIFF ANALYSIS METHODS ====================
 
     def _initialize_publisher_subscriber(self, output_base_dir: str) -> None:
         """
@@ -2192,11 +1441,11 @@ This additional context provides information about the code structure and relati
             )
             
             self.logger.info(f"Found {len(affected_functions)} affected functions")
-            
+
             if not affected_functions:
                 self.logger.warning("No affected functions found in the diff")
                 return self.save_results([])
-            
+
             # Step 7: Analyze each affected function with LLM (function-level analysis)
             self.logger.info("Analyzing affected functions with LLM...")
             issues = self._analyze_affected_functions(

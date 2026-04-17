@@ -194,38 +194,6 @@ class TestCredentialsEnvVarFallbackChain:
         assert config.credentials == 'aws-key'
 
 
-class TestClaudeProviderEnvVars:
-    """Test environment variable handling for Claude provider."""
-    
-    def test_claude_loads_anthropic_api_key(self, clean_env):
-        """Test Claude provider loads ANTHROPIC_API_KEY."""
-        os.environ['ANTHROPIC_API_KEY'] = 'claude-env-key'
-        
-        config_dict = {
-            "llm_provider_type": "claude",
-            "api_end_point": "https://api.anthropic.com/v1/messages",
-            "model": "claude-3-opus-20240229"
-        }
-        
-        config = LLMProviderConfig(**config_dict)
-        
-        assert config.credentials == 'claude-env-key'
-    
-    def test_claude_loads_claude_api_key(self, clean_env):
-        """Test Claude provider loads CLAUDE_API_KEY as fallback."""
-        os.environ['CLAUDE_API_KEY'] = 'claude-specific-key'
-        
-        config_dict = {
-            "llm_provider_type": "claude",
-            "api_end_point": "https://api.anthropic.com/v1/messages",
-            "model": "claude-3-opus-20240229"
-        }
-        
-        config = LLMProviderConfig(**config_dict)
-        
-        assert config.credentials == 'claude-specific-key'
-
-
 class TestNoEnvVarsSet:
     """Test behavior when no environment variables are set."""
     

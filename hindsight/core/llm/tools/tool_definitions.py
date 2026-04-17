@@ -28,7 +28,7 @@ TOOL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "aliases": {}
     },
     "getFileContentByLines": {
-        "description": "Read specific line ranges from a file. Use this when you need to examine a specific section of a file.",
+        "description": "Read specific line ranges from a file. IMPORTANT: Call checkFileSize first to get the total line count before using this tool - this prevents requesting lines beyond the file's end. The checkFileSize tool returns 'line_count' which tells you the valid range (1 to line_count). Response header also includes total line count for subsequent calls.",
         "parameters": {
             "path": {
                 "type": "string",
@@ -52,13 +52,14 @@ TOOL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             }
         },
         "aliases": {
+            "file": "path",
             "file_path": "path",
             "start_line": "startLine",
             "end_line": "endLine"
         }
     },
     "checkFileSize": {
-        "description": "Check if a file exists and get its size and line count information. Use this before readFile or getFileContentByLines to determine if the file is within size limits and to get the total line count for valid line range validation.",
+        "description": "Check if a file exists and get its size and LINE COUNT. ALWAYS use this before getFileContentByLines to know the valid line range (1 to line_count). Returns: file_available, size_bytes, size_characters, line_count. Use the line_count value to ensure your endLine parameter doesn't exceed the file length.",
         "parameters": {
             "path": {
                 "type": "string",
@@ -129,7 +130,8 @@ TOOL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             }
         },
         "aliases": {
-            "directory_path": "path"
+            "directory_path": "path",
+            "directory": "path"
         }
     },
     "getImplementation": {

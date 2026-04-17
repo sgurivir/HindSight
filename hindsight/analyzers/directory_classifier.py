@@ -470,15 +470,15 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
     code.
     """
     
-    def __init__(self, api_key: str, api_url: str = None, model: str = None, provider_type: str = "claude"):
+    def __init__(self, api_key: str, api_url: str = None, model: str = None, provider_type: str = "aws_bedrock"):
         """
         Initialize LLMBasedDirectoryClassifier with LLM configuration using centralized factory.
-        
+
         Args:
             api_key: API key for LLM provider
             api_url: API endpoint URL (optional, uses default if not provided)
             model: Model name (optional, uses default if not provided)
-            provider_type: LLM provider type ("claude", "aws_bedrock", "dummy")
+            provider_type: LLM provider type ("aws_bedrock")
         """
         from ..core.llm.llm import Claude, ClaudeConfig, create_llm_provider
         from ..core.constants import DEFAULT_LLM_API_END_POINT, DEFAULT_LLM_MODEL
@@ -521,14 +521,10 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
         from ..utils.config_util import get_llm_provider_type, get_api_key_from_config
         provider_type = get_llm_provider_type(config)
         config_api_key = get_api_key_from_config(config)
-        
-        if provider_type == "aws_bedrock":
-            # For AWS Bedrock, use get_api_key() to handle Apple Connect fallback
-            from ..utils.api_key_util import get_api_key
-            api_key = get_api_key(config_api_key)
-        else:
-            # For other providers, use config credentials directly
-            api_key = config_api_key
+
+        # For AWS Bedrock, use get_api_key() to handle Apple Connect fallback
+        from ..utils.api_key_util import get_api_key
+        api_key = get_api_key(config_api_key)
         
         return cls(
             api_key=api_key,
@@ -1190,8 +1186,8 @@ def main():
     # Individual LLM parameters (used when --api-key is provided instead of --config)
     parser.add_argument("--api-url", help="API endpoint URL (optional, used with --api-key)")
     parser.add_argument("--model", help="Model name (optional, used with --api-key)")
-    parser.add_argument("--provider", default="claude", choices=["claude", "aws_bedrock", "dummy"],
-                       help="LLM provider type (default: claude, used with --api-key)")
+    parser.add_argument("--provider", default="aws_bedrock", choices=["aws_bedrock"],
+                       help="LLM provider type (default: aws_bedrock, used with --api-key)")
     
     # Analysis options
     parser.add_argument("--subdirs", nargs="*", help="Specific subdirectories to analyze (optional)")

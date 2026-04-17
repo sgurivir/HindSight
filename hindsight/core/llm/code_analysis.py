@@ -13,6 +13,7 @@ from typing import Optional, Dict, Any, Tuple, List
 
 from .llm import Claude, ClaudeConfig
 from .tools import Tools
+from .iterative import ContextCollectionAnalyzer, CodeAnalysisAnalyzer
 from ..constants import MAX_TOOL_ITERATIONS
 from ..prompts.prompt_builder import PromptBuilder
 from ..ast_index import RepoAstIndex
@@ -75,7 +76,7 @@ class CodeAnalysis:
             model=config.model,
             max_tokens=config.max_tokens,
             temperature=config.temperature,
-            provider_type=config.config.get('llm_provider_type', 'claude') if config.config else 'claude'
+            provider_type=config.config.get('llm_provider_type', 'aws_bedrock') if config.config else 'aws_bedrock'
         )
         self.claude = Claude(claude_config)
 
@@ -528,181 +529,251 @@ class CodeAnalysis:
         except Exception as e:
             logger.error(f"Error updating processed cache: {e}")
 
-    def run_analysis(self) -> bool:
+    def run_context_collection(self, json_data: dict, checksum: str) -> Optional[dict]:
         """
-        Run the complete code analysis process with iterative tool usage.
+        Context Collection: Collect code context for the given function.
+
+        Args:
+            json_data: Function record dict (already parsed)
+            checksum: Function checksum for caching
 
         Returns:
-            bool: True if analysis completed successfully
+            Context bundle dict on success, None on failure
         """
-        logger.info("Starting code analysis...")
+        logger.info(f"Context Collection: Starting for checksum {checksum[:8]}...")
         start_time = time.time()
+
+        # Check for existing context bundle on disk (retry optimization)
+        try:
+            output_provider = get_output_directory_provider()
+            context_bundles_dir = f"{output_provider.get_repo_artifacts_dir()}/context_bundles"
+            bundle_path = f"{context_bundles_dir}/{checksum[:8]}.json"
+
+            if os.path.exists(bundle_path):
+                with open(bundle_path, 'r', encoding='utf-8') as f:
+                    cached = json.load(f)
+                # A valid context bundle must contain primary_function.  Malformed
+                # bundles lacking this key are discarded so Stage 4a re-runs and
+                # produces a proper bundle.
+                if isinstance(cached, dict) and 'primary_function' in cached:
+                    logger.info(f"Context Collection: Found existing bundle at {bundle_path}, skipping collection")
+                    return cached
+                else:
+                    logger.warning(
+                        f"Context Collection: Cached bundle at {bundle_path} is malformed "
+                        f"(missing 'primary_function'). Deleting and re-running Stage 4a."
+                    )
+                    try:
+                        os.remove(bundle_path)
+                    except OSError as del_err:
+                        logger.warning(f"Context Collection: Could not delete malformed bundle: {del_err}")
+        except Exception as e:
+            logger.warning(f"Context Collection: Could not check for existing bundle: {e}")
+            bundle_path = None
+            context_bundles_dir = None
 
         # Start conversation tracking
         context_info = os.path.basename(self.config.json_file_path)
-        self.claude.start_conversation("code_analysis", context_info)
+        self.claude.start_conversation("context_collection", context_info)
 
         try:
-            # Load and validate JSON using utility function
-            parsed_data = read_json_file(self.config.json_file_path)
-            if parsed_data is None:
-                logger.error(f"Failed to read or parse JSON file: {self.config.json_file_path}")
-                return False
+            json_content = json.dumps(json_data, ensure_ascii=False)
 
-            # Convert back to string for prompt building (since prompts expect JSON string)
-            json_content = json.dumps(parsed_data, ensure_ascii=False)
-            logger.info(f"Successfully loaded and validated JSON: {self.config.json_file_path}")
-            logger.info(f"JSON content length: {len(json_content)} characters")
-
-            # Apply file filtering if enabled
-            if self.file_filter:
-                filtered_json_content = self._filter_json_content(json_content)
-                if filtered_json_content != json_content:
-                    logger.info(f"Applied file filtering - content length changed from {len(json_content)} to {len(filtered_json_content)} characters")
-                    json_content = filtered_json_content
-
-                    # Check if everything was filtered out
-                    try:
-                        filtered_data = json.loads(json_content)
-                        if isinstance(filtered_data, dict) and filtered_data.get("filtered"):
-                            logger.info(f"All content filtered out: {filtered_data.get('reason', 'Unknown reason')}")
-                            # Update processed cache and return success (no analysis needed)
-                            end_time = time.time()
-                            execution_time = end_time - start_time
-                            self._update_processed_cache(True, execution_time)
-                            logger.info("Analysis completed (all content filtered out)")
-                            return True
-                    except json.JSONDecodeError:
-                        pass
-
-            # Build prompts - get user-provided prompts from config if available
+            # Build context collection prompts
             user_provided_prompts = None
-            if self.config.config and hasattr(self.config.config, 'get'):
-                # First try to get from nested config (original location)
+            if self.config.config and isinstance(self.config.config, dict):
                 user_provided_prompts = self.config.config.get('user_provided_prompts')
-                # If not found, try to get from top-level config (where analyzer passes it)
-                if not user_provided_prompts and hasattr(self.config.config, 'get'):
-                    user_provided_prompts = self.config.config.get('user_provided_prompts')
-            
-            # Also check if it's passed directly in the top-level config
-            if not user_provided_prompts and hasattr(self.config, 'config') and self.config.config:
-                if isinstance(self.config.config, dict):
-                    user_provided_prompts = self.config.config.get('user_provided_prompts')
-            
-            system_prompt, user_prompt = self._build_prompts(json_content, user_provided_prompts)
 
-            # Check token limits with more detailed analysis
+            system_prompt, user_prompt = PromptBuilder.build_context_collection_prompt(
+                json_content=json_content,
+                config=self.config.config,
+                merged_functions_data=self.ast_index.merged_functions,
+                merged_data_types_data=self.ast_index.merged_types,
+                merged_call_graph_data=self.ast_index.merged_call_graph,
+                user_provided_prompts=user_provided_prompts
+            )
+
+            # Check token limits
             if not self.claude.check_token_limit(system_prompt, user_prompt):
-                total_chars = len(system_prompt + user_prompt)
-                estimated_tokens = self.claude.estimate_tokens(system_prompt + user_prompt)
-                max_input_tokens = self.claude.config.max_tokens - 5000
+                logger.error("Context Collection: Input exceeds token limits - aborting")
+                return None
 
-                logger.error(f"CRITICAL: Input exceeds token limits - ABORTING analysis to prevent API error")
-                logger.error(f"System prompt: {len(system_prompt):,} chars")
-                logger.error(f"User prompt: {len(user_prompt):,} chars")
-                logger.error(f"Total content: {total_chars:,} chars")
-                logger.error(f"Estimated tokens: {estimated_tokens:,}")
-                logger.error(f"Max input tokens allowed: {max_input_tokens:,}")
-                logger.error(f"Model limit: {self.claude.config.max_tokens:,}")
-                logger.error(f"JSON file: {self.config.json_file_path}")
-                
-                # Try to provide helpful suggestions for fixing the issue
-                if len(user_prompt) > len(system_prompt):
-                    logger.error(f"SUGGESTION: The user prompt is very large ({len(user_prompt):,} chars). Consider:")
-                    logger.error(f"  1. Splitting the function into smaller chunks")
-                    logger.error(f"  2. Reducing the amount of context data included")
-                    logger.error(f"  3. Using a model with higher token limits")
-                else:
-                    logger.error(f"SUGGESTION: The system prompt is very large ({len(system_prompt):,} chars). Consider:")
-                    logger.error(f"  1. Reducing the merged data context")
-                    logger.error(f"  2. Optimizing the prompt template")
+            # Run iterative analysis with FULL tool set (including knowledge tools)
+            # Using stage-specific ContextCollectionAnalyzer for proper JSON extraction
+            available_tools = [
+                "readFile", "runTerminalCmd", "getSummaryOfFile",
+                "inspectDirectoryHierarchy", "list_files", "getFileContentByLines",
+                "getFileContent", "checkFileSize"
+            ]
 
-                # Log final token usage summary even for failed analysis due to token limits
-                self._log_final_token_summary()
-                return False
-
-            logger.info(f"Token limit check passed - estimated tokens: {self.claude.estimate_tokens(system_prompt + user_prompt):,}")
-
-            # Run iterative analysis with tool usage using unified method
-            analysis_result = self.claude.run_iterative_analysis(
+            # Use ContextCollectionAnalyzer for stage-specific JSON extraction
+            analyzer = ContextCollectionAnalyzer(self.claude)
+            raw_result = analyzer.run_iterative_analysis(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                tools_executor=self,  # Pass self so tools can be accessed via self.tools
-                supported_tools=[
-                    "readFile", "runTerminalCmd", "getImplementation", "getSummaryOfFile",
-                    "inspectDirectoryHierarchy", "list_files",
-                    "getFileContentByLines", "getFileContent", "checkFileSize"
-                ],
+                tools_executor=self,
+                supported_tools=available_tools,
                 context_guidance_template="""
-Based on the tool results above, please continue your code analysis. Remember to:
-1. Analyze the information provided by the tools
-2. Identify patterns, issues, or improvements
-3. Provide specific, actionable recommendations
-4. Focus on the original analysis request: {user_prompt}
+Based on the tool results above, continue gathering context. Remember:
+1. Include ALL relevant callers, callees, data types, and constants
+2. Preserve original source-file line numbers in ALL code snippets
+3. Your output MUST be a valid JSON object — your response MUST start with `{{` and end with `}}` — no markdown, no arrays, no prose
 
-Please provide your analysis based on all the information gathered so far.
+{user_prompt}
 """,
                 token_usage_callback=self._extract_and_log_token_usage
             )
 
-            # Calculate execution time
             end_time = time.time()
-            execution_time = end_time - start_time
+            logger.info(f"Context Collection: Completed in {end_time - start_time:.2f}s")
 
-            # Process results
-            if analysis_result:
-                # Process and clean the result
-                success, processed_result, is_double_check_drop = self._process_analysis_result(analysis_result)
+            if not raw_result:
+                logger.error("Context Collection: No result from LLM")
+                return None
 
-                # Log complete conversation
-                self.claude.log_complete_conversation(
-                    final_result=processed_result if success else analysis_result
+            # Parse context bundle - the analyzer already extracted the correct JSON
+            try:
+                context_bundle = json.loads(raw_result)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Context Collection: Invalid JSON from analyzer, retrying: {e}")
+                # Retry once with fix request using the same analyzer
+                retry_analyzer = ContextCollectionAnalyzer(self.claude)
+                retry_result = retry_analyzer.run_iterative_analysis(
+                    system_prompt=system_prompt,
+                    user_prompt=f"Your previous response was not valid JSON. Please return ONLY the JSON context bundle with no markdown or prose. Error: {e}",
+                    tools_executor=self,
+                    supported_tools=available_tools,
+                    token_usage_callback=self._extract_and_log_token_usage
                 )
+                if not retry_result:
+                    logger.error("Context Collection: Retry failed - no result")
+                    return None
+                try:
+                    context_bundle = json.loads(retry_result)
+                except json.JSONDecodeError:
+                    logger.error("Context Collection: Retry also returned invalid JSON")
+                    return None
 
-                if success:
-                    # Save result
-                    save_success = self._save_result(processed_result)
-
-                    # Update processed cache
-                    self._update_processed_cache(save_success, execution_time)
-
-                    if save_success:
-                        logger.info("Analysis completed successfully!")
-                        logger.info(f"Total time taken: {execution_time:.2f} seconds")
-                        self.tools.log_tool_usage_summary()
-                        # Log final token usage summary
-                        self._log_final_token_summary()
-                        return True
-                    else:
-                        logger.error("Failed to save results")
-                        return False
+            if isinstance(context_bundle, list):
+                # LLM wrapped the bundle in an array — unwrap if it contains exactly one dict bundle
+                candidate = next((item for item in context_bundle if isinstance(item, dict) and 'primary_function' in item), None)
+                if candidate:
+                    logger.warning("Context Collection: LLM returned a list; unwrapped single context bundle object")
+                    context_bundle = candidate
                 else:
-                    logger.error("Failed to process results")
-                    return False
-            else:
-                # Log conversation even for failed analysis
-                self.claude.log_complete_conversation(
-                    final_result="Analysis failed - no result from Claude API"
-                )
+                    logger.error(f"Context Collection: LLM returned a list with no valid context bundle inside")
+                    return None
+            if not isinstance(context_bundle, dict):
+                logger.error(f"Context Collection: Expected dict context bundle, got {type(context_bundle)}")
+                return None
 
-                # Update processed cache even for failed analysis
-                self._update_processed_cache(False, execution_time)
+            # Save context bundle to disk
+            if context_bundles_dir and bundle_path:
+                try:
+                    os.makedirs(context_bundles_dir, exist_ok=True)
+                    with open(bundle_path, 'w', encoding='utf-8') as f:
+                        json.dump(context_bundle, f, indent=2, ensure_ascii=False)
+                    logger.info(f"Context Collection: Bundle saved to {bundle_path}")
+                except Exception as e:
+                    logger.warning(f"Context Collection: Could not save bundle: {e}")
 
-                logger.error("Analysis failed - no result from Claude API")
-                logger.info(f"Total time taken: {execution_time:.2f} seconds")
-                # Log final token usage summary even for failed analysis
-                self._log_final_token_summary()
-                return False
+            self.claude.log_complete_conversation(final_result=json.dumps(context_bundle))
+            logger.info(f"Context Collection: Successful")
+            return context_bundle
 
         except Exception as e:
-            # Log conversation even for unexpected errors
-            self.claude.log_complete_conversation(
-                final_result=f"Unexpected error during analysis: {e}"
+            logger.error(f"Context Collection: Unexpected error: {e}")
+            self.claude.log_complete_conversation(final_result=f"Error: {e}")
+            return None
+
+    def run_analysis_from_context(self, context_bundle: dict) -> Optional[list]:
+        """
+        Analysis: Perform analysis using the gathered context bundle.
+
+        Args:
+            context_bundle: Context bundle dict from Context Collection
+
+        Returns:
+            List of issue dicts on success, None on failure
+        """
+        logger.info("Analysis: Starting from context bundle...")
+        start_time = time.time()
+
+        # Start conversation tracking
+        func_name = context_bundle.get("primary_function", {}).get("name", "unknown")
+        self.claude.start_conversation("analysis", func_name)
+
+        try:
+            # Build analysis prompts
+            system_prompt, user_prompt = PromptBuilder.build_analysis_from_context_prompt(
+                context_bundle=context_bundle,
+                config=self.config.config
             )
 
-            logger.error(f"Unexpected error during analysis: {e}")
-            # Log final token usage summary even for unexpected errors
+            # Use analysis tool set (reduced); using stage-specific CodeAnalysisAnalyzer for proper JSON extraction
+            stage_b_supported_tools = ["readFile", "runTerminalCmd"]
+
+            # Use CodeAnalysisAnalyzer for stage-specific JSON extraction (expects array of issue dicts)
+            analyzer = CodeAnalysisAnalyzer(self.claude)
+            raw_result = analyzer.run_iterative_analysis(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                tools_executor=self,
+                supported_tools=stage_b_supported_tools,
+                context_guidance_template="""
+Based on the tool results above, complete your analysis. Remember:
+1. Your response MUST be ONLY a valid JSON array starting with [ and ending with ]
+2. If no issues found, return exactly: []
+
+{user_prompt}
+""",
+                token_usage_callback=self._extract_and_log_token_usage
+            )
+
+            end_time = time.time()
+            logger.info(f"Analysis: Completed in {end_time - start_time:.2f}s")
+
+            if not raw_result:
+                logger.error("Analysis: No result from LLM")
+                return None
+
+            # Parse issues list - the analyzer already extracted the correct JSON
+            from ...utils.json_util import validate_and_format_json
+            is_valid, processed = validate_and_format_json(raw_result)
+
+            try:
+                issues = json.loads(processed if is_valid else raw_result)
+            except json.JSONDecodeError as e:
+                logger.error(f"Analysis: Failed to parse result as JSON: {e}")
+                self.claude.log_complete_conversation(final_result=f"JSON parse failed: {e}")
+                return None
+
+            if not isinstance(issues, list):
+                # Might be a dict envelope with 'results' key
+                if isinstance(issues, dict) and 'results' in issues:
+                    issues = issues['results']
+                elif isinstance(issues, dict):
+                    # LLM returned a single issue object instead of a one-element array
+                    logger.warning("Analysis: LLM returned a single dict; wrapping in list")
+                    issues = [issues]
+                else:
+                    logger.warning(f"Analysis: Expected list, got {type(issues)}; treating as empty")
+                    issues = []
+
+            valid_issues = [i for i in issues if isinstance(i, dict)]
+            if len(valid_issues) != len(issues):
+                logger.warning(f"Analysis: Filtered out {len(issues) - len(valid_issues)} invalid issues")
+
+            self.claude.log_complete_conversation(final_result=json.dumps(valid_issues))
+            self.tools.log_tool_usage_summary()
             self._log_final_token_summary()
-            return False
+
+            logger.info(f"Analysis: Found {len(valid_issues)} issues")
+            return valid_issues
+
+        except Exception as e:
+            logger.error(f"Analysis: Unexpected error: {e}")
+            self.claude.log_complete_conversation(final_result=f"Error: {e}")
+            return None
 
     # Removed _run_iterative_analysis and _execute_claude_tool_use - now using unified methods in llm.py

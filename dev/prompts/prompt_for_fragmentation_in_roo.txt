@@ -1,0 +1,21 @@
+See memory fragmentation report of allocation and deallocation callstacks at
+/Users/sgurivireddy/bugs/jeff/fragmentation_suspects_report.txt
+
+Remember that memory fragmentation happens when short lived and long lived allocations interleave in same memory page. On iOS size of memory page is 16 KB.
+
+Callstacks are provided below. 
+1) Go through one allocation-deallocation pair at a time
+2) Read relavant code. In some cases, code may be from linked frameworks which does not exist in this repository
+3) Understand how relavant code is used in the context of project
+4) Check if memory fragmentation can be addressed by making a localized code change
+4) CRITICAL : We cannot change behavior of underlying software
+
+Provide any recommendation if code can be modified to mitigate fragmentation. In some cases, fragmentation may not be addressable. In such cases, report no optimization being identified.
+
+This task is very long running. Use seperate context window for analyzing each alloc-dealloc pair. Update your learnings and remember them in a markdown document as you process long. 
+
+Create a file progress.md to track your progress, so if analysis is restarted you dont have to redo the work.
+
+the fragmentation_suspects_report.txt file is very large. Read it in chunks.
+
+Create a HtML report at end with a table. Table has three columns, alloc callstack, dealloc callstack and mitigation identified. If no mitigation is identified, report them in a different tab in the same HTML.

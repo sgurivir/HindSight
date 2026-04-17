@@ -133,7 +133,7 @@ class TestCodeAnalysisInitialization:
             model="claude-3-5-sonnet-20241022",
             repo_path=temp_repo,
             output_file=os.path.join(temp_repo, "output.json"),
-            config={"llm_provider_type": "dummy"}
+            config={"llm_provider_type": "aws_bedrock"}
         )
 
     @patch('hindsight.core.llm.code_analysis.get_output_directory_provider')
@@ -175,7 +175,7 @@ class TestCodeAnalysisInitialization:
             model="claude-3-5-sonnet-20241022",
             repo_path=temp_repo,
             output_file=os.path.join(temp_repo, "output.json"),
-            config={"llm_provider_type": "dummy"},
+            config={"llm_provider_type": "aws_bedrock"},
             file_filter=file_filter
         )
         
@@ -211,7 +211,7 @@ class TestCodeAnalysisPublisher:
                 model="test-model",
                 repo_path=temp_dir,
                 output_file=os.path.join(temp_dir, "output.json"),
-                config={"llm_provider_type": "dummy"}
+                config={"llm_provider_type": "aws_bedrock"}
             )
             
             code_analysis = CodeAnalysis(config)
@@ -291,7 +291,7 @@ class TestCodeAnalysisFileFiltering:
                 model="test-model",
                 repo_path=temp_dir,
                 output_file=os.path.join(temp_dir, "output.json"),
-                config={"llm_provider_type": "dummy"},
+                config={"llm_provider_type": "aws_bedrock"},
                 file_filter=["src/main.py", "src/utils.py"]
             )
             
@@ -405,7 +405,7 @@ class TestCodeAnalysisTokenTracking:
                 model="test-model",
                 repo_path=temp_dir,
                 output_file=os.path.join(temp_dir, "output.json"),
-                config={"llm_provider_type": "dummy"}
+                config={"llm_provider_type": "aws_bedrock"}
             )
             
             code_analysis = CodeAnalysis(config)
@@ -502,7 +502,7 @@ class TestCodeAnalysisResultProcessing:
                 model="test-model",
                 repo_path=temp_dir,
                 output_file=os.path.join(temp_dir, "output.json"),
-                config={"llm_provider_type": "dummy"}
+                config={"llm_provider_type": "aws_bedrock"}
             )
             
             code_analysis = CodeAnalysis(config)
@@ -575,7 +575,7 @@ class TestCodeAnalysisCacheManagement:
                 model="test-model",
                 repo_path=temp_dir,
                 output_file=os.path.join(temp_dir, "output.json"),
-                config={"llm_provider_type": "dummy"},
+                config={"llm_provider_type": "aws_bedrock"},
                 processed_cache_file=cache_file
             )
             
@@ -612,13 +612,13 @@ class TestCodeAnalysisCacheManagement:
              patch('hindsight.core.llm.code_analysis.Claude'), \
              patch('hindsight.core.llm.code_analysis.Tools'), \
              patch('hindsight.core.llm.code_analysis.RepoAstIndex'):
-            
+
             temp_dir = tempfile.mkdtemp()
             json_file = os.path.join(temp_dir, "input.json")
-            
+
             with open(json_file, 'w') as f:
                 json.dump({"function": "test"}, f)
-            
+
             config = AnalysisConfig(
                 json_file_path=json_file,
                 api_key="test-key",
@@ -626,14 +626,206 @@ class TestCodeAnalysisCacheManagement:
                 model="test-model",
                 repo_path=temp_dir,
                 output_file=os.path.join(temp_dir, "output.json"),
-                config={"llm_provider_type": "dummy"}
+                config={"llm_provider_type": "aws_bedrock"}
                 # No processed_cache_file
             )
-            
+
             code_analysis = CodeAnalysis(config)
             cache = code_analysis._load_processed_cache()
-            
+
             assert cache == {}
-            
+
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
+
+
+# ============================================================================
+# Two-Stage Analysis Tests
+# ============================================================================
+
+class TestRunContextCollection:
+    """Tests for CodeAnalysis.run_context_collection()"""
+
+    @pytest.fixture
+    def analysis_config(self, tmp_path):
+        """Create a real temp file as json_file_path."""
+        temp_json = tmp_path / "func.json"
+        temp_json.write_text('{"function": "myFunc", "file": "myFile.swift", "code": "func myFunc() {}"}')
+        return AnalysisConfig(
+            json_file_path=str(temp_json),
+            api_key="test-key",
+            api_url="https://api.test.com",
+            model="claude-3-5-sonnet",
+            repo_path="/repo",
+            output_file="",
+            config={"project_name": "TestProject", "description": "Test"}
+        )
+
+    @patch('hindsight.core.llm.code_analysis.get_output_directory_provider')
+    @patch('hindsight.core.llm.code_analysis.RepoAstIndex')
+    @patch('hindsight.core.llm.code_analysis.Claude')
+    @patch('hindsight.core.llm.code_analysis.Tools')
+    @patch('hindsight.core.llm.code_analysis.ContextCollectionAnalyzer')
+    def test_returns_valid_context_bundle_on_success(self, mock_analyzer_cls, mock_tools, mock_claude_cls, mock_ast_cls, mock_provider, analysis_config):
+        """Returns a valid context bundle dict on success."""
+        mock_provider.return_value.get_repo_artifacts_dir.return_value = "/tmp/artifacts"
+        mock_provider.return_value.get_custom_base_dir.return_value = "/tmp"
+
+        mock_ast = MagicMock()
+        mock_ast_cls.return_value = mock_ast
+        mock_ast.merged_functions = {}
+        mock_ast.merged_types = {}
+        mock_ast.merged_call_graph = {}
+
+        mock_claude = MagicMock()
+        mock_claude_cls.return_value = mock_claude
+        mock_claude.check_token_limit.return_value = True
+        mock_claude.estimate_tokens.return_value = 1000
+
+        # Mock the analyzer to return valid JSON
+        mock_analyzer = MagicMock()
+        mock_analyzer_cls.return_value = mock_analyzer
+        mock_analyzer.run_iterative_analysis.return_value = '{"primary_function": {"name": "myFunc", "file_path": "myFile.swift", "start_line": 1, "end_line": 3, "source": "  1: func myFunc() {}"}, "callers": [], "callees": [], "data_types": [], "constants_and_globals": [], "file_summaries": {}, "knowledge_hits": [], "collection_notes": "OK"}'
+
+        with patch('hindsight.core.prompts.prompt_builder.PromptBuilder.build_context_collection_prompt', return_value=("sys", "usr")):
+            code_analysis = CodeAnalysis(analysis_config)
+            result = code_analysis.run_context_collection(
+                json_data={"function": "myFunc", "file": "myFile.swift"},
+                checksum="abc123"
+            )
+
+        assert result is not None
+        assert isinstance(result, dict)
+        assert 'primary_function' in result
+
+    @patch('os.path.exists', return_value=False)
+    @patch('hindsight.core.llm.code_analysis.get_output_directory_provider')
+    @patch('hindsight.core.llm.code_analysis.RepoAstIndex')
+    @patch('hindsight.core.llm.code_analysis.Claude')
+    @patch('hindsight.core.llm.code_analysis.Tools')
+    @patch('hindsight.core.llm.code_analysis.ContextCollectionAnalyzer')
+    def test_returns_none_on_invalid_json_after_retry(self, mock_analyzer_cls, mock_tools, mock_claude_cls, mock_ast_cls, mock_provider, mock_exists, analysis_config):
+        """Returns None if LLM returns invalid JSON after retry."""
+        mock_provider.return_value.get_repo_artifacts_dir.return_value = "/tmp/artifacts"
+        mock_provider.return_value.get_custom_base_dir.return_value = "/tmp"
+
+        mock_ast = MagicMock()
+        mock_ast_cls.return_value = mock_ast
+        mock_ast.merged_functions = {}
+        mock_ast.merged_types = {}
+        mock_ast.merged_call_graph = {}
+
+        mock_claude = MagicMock()
+        mock_claude_cls.return_value = mock_claude
+        mock_claude.check_token_limit.return_value = True
+
+        # Mock the analyzer to return invalid JSON
+        mock_analyzer = MagicMock()
+        mock_analyzer_cls.return_value = mock_analyzer
+        mock_analyzer.run_iterative_analysis.return_value = "This is not JSON at all"
+
+        with patch('hindsight.core.prompts.prompt_builder.PromptBuilder.build_context_collection_prompt', return_value=("sys", "usr")):
+            code_analysis = CodeAnalysis(analysis_config)
+            result = code_analysis.run_context_collection(
+                json_data={"function": "myFunc"},
+                checksum="abc123"
+            )
+
+        assert result is None
+
+
+class TestRunAnalysisFromContext:
+    """Tests for CodeAnalysis.run_analysis_from_context()"""
+
+    @pytest.fixture
+    def context_bundle(self):
+        return {
+            "primary_function": {
+                "name": "myFunc",
+                "file_path": "myFile.swift",
+                "start_line": 10,
+                "end_line": 20,
+                "source": "  10: func myFunc() {}"
+            },
+            "callers": [],
+            "callees": [],
+            "data_types": [],
+            "constants_and_globals": [],
+            "file_summaries": {},
+            "knowledge_hits": [],
+            "collection_notes": "OK"
+        }
+
+    @pytest.fixture
+    def analysis_config(self, tmp_path):
+        temp_json = tmp_path / "func.json"
+        temp_json.write_text('{"function": "myFunc"}')
+        return AnalysisConfig(
+            json_file_path=str(temp_json),
+            api_key="test-key",
+            api_url="https://api.test.com",
+            model="claude-3-5-sonnet",
+            repo_path="/repo",
+            output_file="",
+            config={"project_name": "TestProject", "description": "Test"}
+        )
+
+    @patch('hindsight.core.llm.code_analysis.get_output_directory_provider')
+    @patch('hindsight.core.llm.code_analysis.RepoAstIndex')
+    @patch('hindsight.core.llm.code_analysis.Claude')
+    @patch('hindsight.core.llm.code_analysis.Tools')
+    @patch('hindsight.core.llm.code_analysis.CodeAnalysisAnalyzer')
+    def test_returns_issues_list_on_success(self, mock_analyzer_cls, mock_tools, mock_claude_cls, mock_ast_cls, mock_provider, analysis_config, context_bundle):
+        """Returns a list of issues matching the output schema."""
+        mock_provider.return_value.get_repo_artifacts_dir.return_value = "/tmp/artifacts"
+        mock_provider.return_value.get_custom_base_dir.return_value = "/tmp"
+
+        mock_ast = MagicMock()
+        mock_ast_cls.return_value = mock_ast
+
+        mock_claude = MagicMock()
+        mock_claude_cls.return_value = mock_claude
+        mock_claude.check_token_limit.return_value = True
+
+        # Mock the analyzer to return valid issues JSON
+        mock_analyzer = MagicMock()
+        mock_analyzer_cls.return_value = mock_analyzer
+        issues_json = '[{"file_path": "myFile.swift", "file_name": "myFile.swift", "function_name": "myFunc", "line_number": "10", "severity": "high", "issue": "Null pointer", "description": "desc", "suggestion": "fix", "category": "logicBug", "issueType": "logicBug"}]'
+        mock_analyzer.run_iterative_analysis.return_value = issues_json
+
+        with patch('hindsight.core.prompts.prompt_builder.PromptBuilder.build_analysis_from_context_prompt', return_value=("sys", "usr")):
+            code_analysis = CodeAnalysis(analysis_config)
+            result = code_analysis.run_analysis_from_context(context_bundle)
+
+        assert result is not None
+        assert isinstance(result, list)
+        if result:
+            assert isinstance(result[0], dict)
+
+    @patch('hindsight.core.llm.code_analysis.get_output_directory_provider')
+    @patch('hindsight.core.llm.code_analysis.RepoAstIndex')
+    @patch('hindsight.core.llm.code_analysis.Claude')
+    @patch('hindsight.core.llm.code_analysis.Tools')
+    @patch('hindsight.core.llm.code_analysis.CodeAnalysisAnalyzer')
+    def test_returns_empty_list_when_no_issues(self, mock_analyzer_cls, mock_tools, mock_claude_cls, mock_ast_cls, mock_provider, analysis_config, context_bundle):
+        """Returns empty list when LLM finds no issues."""
+        mock_provider.return_value.get_repo_artifacts_dir.return_value = "/tmp/artifacts"
+        mock_provider.return_value.get_custom_base_dir.return_value = "/tmp"
+
+        mock_ast = MagicMock()
+        mock_ast_cls.return_value = mock_ast
+
+        mock_claude = MagicMock()
+        mock_claude_cls.return_value = mock_claude
+        mock_claude.check_token_limit.return_value = True
+
+        # Mock the analyzer to return empty array
+        mock_analyzer = MagicMock()
+        mock_analyzer_cls.return_value = mock_analyzer
+        mock_analyzer.run_iterative_analysis.return_value = '[]'
+
+        with patch('hindsight.core.prompts.prompt_builder.PromptBuilder.build_analysis_from_context_prompt', return_value=("sys", "usr")):
+            code_analysis = CodeAnalysis(analysis_config)
+            result = code_analysis.run_analysis_from_context(context_bundle)
+
+        assert result == []

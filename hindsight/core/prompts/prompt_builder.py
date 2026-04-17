@@ -4,7 +4,7 @@ import json
 import os
 import pkgutil
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..lang_util.code_context_pruner import CodeContextPruner
 from ..lang_util.call_tree_section_generator import generate_call_tree_section_for_function
@@ -48,6 +48,10 @@ OUTPUT_SCHEMA_FILE = "outputSchema.json"
 GENERIC_ISSUE_CATEGORY_FILE = "genericIssueCategory.md"
 DETAILED_ANALYSIS_PROCESS_FILE = "detailedAnalysisProcess.md"
 JSON_OUTPUT_GUIDANCE_FILE = "jsonOutputGuidance.md"
+CONTEXT_COLLECTION_PROCESS_FILE = "contextCollectionProcess.md"
+ANALYSIS_PROCESS_FILE = "analysisProcess.md"
+DIFF_CONTEXT_COLLECTION_PROCESS_FILE = "diffContextCollectionProcess.md"
+DIFF_ANALYSIS_PROCESS_FILE = "diffAnalysisProcess.md"
 
 # Get logger using logUtil
 logger = get_logger(__name__)
@@ -874,6 +878,140 @@ class PromptBuilder:
                 return "specific_function"
         except json.JSONDecodeError:
             return "specific_function"
+
+    @staticmethod
+    def build_context_collection_prompt(
+        json_content: str,
+        config: Dict[str, Any] = None,
+        merged_functions_data: Optional[Dict[str, Any]] = None,
+        merged_data_types_data: Optional[Dict[str, Any]] = None,
+        merged_call_graph_data: Optional[Dict[str, Any]] = None,
+        user_provided_prompts: List[str] = None
+    ) -> Tuple[str, str]:
+        """
+        Build system and user prompts for Stage 4a context collection.
+
+        Args:
+            json_content: JSON content of the function to collect context for
+            config: Configuration dictionary
+            merged_functions_data: Pre-loaded merged functions data (optional)
+            merged_data_types_data: Pre-loaded merged data types data (optional)
+            merged_call_graph_data: Pre-loaded merged call graph data (optional)
+            user_provided_prompts: Optional list of user-provided prompts
+
+        Returns:
+            Tuple[str, str]: (system_prompt, user_prompt)
+        """
+        try:
+            # Load Stage 4a process prompt
+            process_content = _read_package_file(CONTEXT_COLLECTION_PROCESS_FILE)
+            if not process_content:
+                logger.warning(f"{CONTEXT_COLLECTION_PROCESS_FILE} not found, using fallback")
+                process_content = "You are a context-gathering agent. Collect all code context needed to analyze the primary function. Output a JSON context bundle."
+
+            # Build system prompt
+            system_prompt = process_content
+
+            # Add project context if available
+            if config:
+                project_name = config.get("project_name", "")
+                project_description = config.get("description", "")
+                if project_name or project_description:
+                    system_prompt += f"\n\n## Project Context\n\n"
+                    if project_name:
+                        system_prompt += f"**Project Name**: {project_name}\n\n"
+                    if project_description:
+                        system_prompt += f"**Project Description**: {project_description}\n\n"
+
+            # Add user-provided prompts if available
+            if user_provided_prompts and any(p.strip() for p in user_provided_prompts):
+                system_prompt += "\n\n## Additional Collection Instructions\n\n"
+                for i, prompt in enumerate(user_provided_prompts, 1):
+                    if prompt.strip():
+                        system_prompt += f"{i}. {prompt.strip()}\n\n"
+
+            # Build user prompt: the function data in comment format + instruction
+            analysis_type = PromptBuilder.determine_analysis_type(json_content)
+            code_comment_format = PromptBuilder._convert_json_to_comment_format(
+                json_content,
+                merged_functions_data=merged_functions_data,
+                merged_data_types_data=merged_data_types_data,
+                merged_call_graph_data=merged_call_graph_data
+            )
+
+            user_prompt = f"## Function to Analyze\n\n{code_comment_format}\n\n"
+            user_prompt += "Collect all context needed to analyze this function and return a JSON context bundle as described in the system prompt. Your response MUST start with `{` and end with `}` — return a JSON object, not an array."
+
+            logger.info(f"Built Stage 4a prompts - System: {len(system_prompt)} chars, User: {len(user_prompt)} chars")
+            return system_prompt, user_prompt
+
+        except Exception as e:
+            logger.error(f"Error building context collection prompt: {e}")
+            return (
+                "You are a context-gathering agent. Collect all code context needed to analyze the primary function.",
+                f"Collect context for:\n{json_content}"
+            )
+
+    @staticmethod
+    def build_analysis_from_context_prompt(
+        context_bundle: Dict[str, Any],
+        config: Dict[str, Any] = None
+    ) -> Tuple[str, str]:
+        """
+        Build system and user prompts for Stage 4b analysis from a context bundle.
+
+        Args:
+            context_bundle: Context bundle dict from Stage 4a
+            config: Configuration dictionary
+
+        Returns:
+            Tuple[str, str]: (system_prompt, user_prompt)
+        """
+        try:
+            # Load Stage 4b analysis process prompt
+            process_content = _read_package_file(ANALYSIS_PROCESS_FILE)
+            if not process_content:
+                logger.warning(f"{ANALYSIS_PROCESS_FILE} not found, using fallback")
+                process_content = "You are a senior software engineer. Analyze the provided context bundle and identify bugs and performance issues."
+
+            # Build system prompt
+            system_prompt = process_content
+
+            # Add project context if available
+            if config:
+                project_name = config.get("project_name", "")
+                project_description = config.get("description", "")
+                if project_name or project_description:
+                    system_prompt += f"\n\n## Project Context\n\n"
+                    if project_name:
+                        system_prompt += f"**Project Name**: {project_name}\n\n"
+                    if project_description:
+                        system_prompt += f"**Project Description**: {project_description}\n\n"
+
+            # Load output schema requirements
+            output_requirements = PromptBuilder.build_output_requirements()
+
+            # Build user prompt: context bundle + output schema
+            primary_func_name = context_bundle.get("primary_function", {}).get("name", "unknown")
+            primary_func_file = context_bundle.get("primary_function", {}).get("file_path", "unknown")
+
+            user_prompt = f"## Context Bundle for Analysis\n\n"
+            user_prompt += f"**Function**: `{primary_func_name}` in `{primary_func_file}`\n\n"
+            user_prompt += "The following context bundle contains all code needed for your analysis. Line numbers in source fields are original source-file line numbers — use them directly in your output.\n\n"
+            user_prompt += "```json\n"
+            user_prompt += json.dumps(context_bundle, indent=2, ensure_ascii=False)
+            user_prompt += "\n```\n\n"
+            user_prompt += output_requirements
+
+            logger.info(f"Built Stage 4b prompts - System: {len(system_prompt)} chars, User: {len(user_prompt)} chars")
+            return system_prompt, user_prompt
+
+        except Exception as e:
+            logger.error(f"Error building analysis from context prompt: {e}")
+            return (
+                "You are a senior software engineer. Analyze the provided context bundle and identify bugs and performance issues. Return a JSON array of issues.",
+                f"Analyze this context bundle:\n{json.dumps(context_bundle, indent=2)}"
+            )
 
     # Large file handling and nested content handling removed - ProjectSummaryGenerator no longer used
 

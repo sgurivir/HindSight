@@ -10,6 +10,7 @@ Supports two analysis modes:
 2. Function-level analysis: Analyzes individual functions affected by the diff
 """
 
+import hashlib
 import json
 import os
 import time
@@ -19,6 +20,7 @@ from typing import Optional, Dict, Any, Tuple, List
 
 from .llm import Claude, ClaudeConfig
 from .tools import Tools
+from .iterative import DiffContextAnalyzer, DiffAnalysisAnalyzer
 from ..constants import MAX_TOOL_ITERATIONS
 from ...utils.file_util import write_file
 from ...utils.json_util import validate_and_format_json, clean_json_response
@@ -64,7 +66,7 @@ class DiffAnalysis:
             model=config.model,
             max_tokens=config.max_tokens,
             temperature=config.temperature,
-            provider_type=config.config.get('llm_provider_type', 'claude') if config.config else 'claude'
+            provider_type=config.config.get('llm_provider_type', 'aws_bedrock') if config.config else 'aws_bedrock'
         )
         self.claude = Claude(claude_config)
 
@@ -329,10 +331,16 @@ class DiffAnalysis:
                     issues = json.loads(processed_result)
                     
                     if not isinstance(issues, list):
-                        logger.error(f"Expected list of issues, got {type(issues)}")
-                        self._log_final_token_summary()
-                        return None
-                    
+                        if isinstance(issues, dict) and 'results' in issues:
+                            issues = issues['results']
+                        elif isinstance(issues, dict):
+                            logger.warning("Expected list of issues, got dict; wrapping in list")
+                            issues = [issues]
+                        else:
+                            logger.error(f"Expected list of issues, got {type(issues)}")
+                            self._log_final_token_summary()
+                            return None
+
                     # Validate that all items in the list are dictionaries (issue objects)
                     valid_issues = []
                     for i, issue in enumerate(issues):
@@ -487,7 +495,7 @@ YOUR ENTIRE RESPONSE MUST BE VALID JSON - START WITH [ AND END WITH ]
             user_prompt=user_prompt,
             tools_executor=self,  # Pass self so tools can be accessed via self.tools
             supported_tools=[
-                "readFile", "runTerminalCmd", "getImplementation", "getSummaryOfFile",
+                "readFile", "runTerminalCmd", "getSummaryOfFile",
                 "inspectDirectoryHierarchy", "list_files",
                 "getFileContentByLines", "getFileContent", "checkFileSize"
             ],
@@ -588,10 +596,16 @@ YOUR ENTIRE RESPONSE MUST BE VALID JSON - START WITH [ AND END WITH ]
                     issues = json.loads(processed_result)
                     
                     if not isinstance(issues, list):
-                        logger.error(f"Expected list of issues, got {type(issues)}")
-                        self._log_final_token_summary()
-                        return None
-                    
+                        if isinstance(issues, dict) and 'results' in issues:
+                            issues = issues['results']
+                        elif isinstance(issues, dict):
+                            logger.warning("Expected list of issues, got dict; wrapping in list")
+                            issues = [issues]
+                        else:
+                            logger.error(f"Expected list of issues, got {type(issues)}")
+                            self._log_final_token_summary()
+                            return None
+
                     # Validate issues
                     valid_issues = [issue for issue in issues if isinstance(issue, dict)]
                     
@@ -789,7 +803,7 @@ YOUR ENTIRE RESPONSE MUST BE VALID JSON - START WITH [ AND END WITH ]
             user_prompt=user_prompt,
             tools_executor=self,
             supported_tools=[
-                "readFile", "runTerminalCmd", "getImplementation", "getSummaryOfFile",
+                "readFile", "runTerminalCmd", "getSummaryOfFile",
                 "inspectDirectoryHierarchy", "list_files",
                 "getFileContentByLines", "getFileContent", "checkFileSize"
             ],
@@ -797,5 +811,204 @@ YOUR ENTIRE RESPONSE MUST BE VALID JSON - START WITH [ AND END WITH ]
             max_iterations=MAX_TOOL_ITERATIONS,
             token_usage_callback=self._extract_and_log_token_usage
         )
-        
+
         return analysis_result
+
+    def run_diff_context_collection(self, prompt_data: dict) -> Optional[dict]:
+        """
+        Diff Context Collection: Collect code context for diff analysis.
+
+        Uses DiffContextAnalyzer for stage-isolated JSON extraction that correctly
+        identifies dict with 'changed_functions' key (not the last valid JSON).
+
+        Args:
+            prompt_data: Dict containing function, file_path, code, changed_lines,
+                         data_types_used, constants_used, invoked_functions,
+                         invoking_functions, diff_context
+        Returns:
+            Diff context bundle dict on success, None on failure
+        """
+        func_name = prompt_data.get('function', 'unknown')
+        file_path = prompt_data.get('file_path', 'unknown')
+        logger.info(f"Diff Context Collection: Starting for {func_name}")
+        start_time = time.time()
+
+        # Check for existing diff context bundle on disk
+        try:
+            output_provider = get_output_directory_provider()
+            diff_bundles_dir = f"{output_provider.get_repo_artifacts_dir()}/diff_context_bundles"
+            func_hash = hashlib.md5(f"{func_name}@{file_path}".encode()).hexdigest()[:8]
+            bundle_path = f"{diff_bundles_dir}/{func_hash}.json"
+
+            if os.path.exists(bundle_path):
+                logger.info(f"Diff Context Collection: Found existing bundle at {bundle_path}")
+                with open(bundle_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning(f"Diff Context Collection: Could not check for existing bundle: {e}")
+            bundle_path = None
+            diff_bundles_dir = None
+
+        # Load diff context collection prompt
+        try:
+            prompt_path = Path(__file__).parent.parent / "prompts" / "diffContextCollectionProcess.md"
+            with open(prompt_path, 'r', encoding='utf-8') as f:
+                system_prompt = f.read()
+        except Exception as e:
+            logger.error(f"Diff Context Collection: Failed to load prompt: {e}")
+            return None
+
+        # Build user message from prompt_data
+        user_message = self._build_function_analysis_user_message(prompt_data)
+        user_message += "\n\nCollect all context needed for this function diff and return a JSON diff context bundle as described in the system prompt."
+
+        # Start conversation tracking
+        self.claude.start_conversation("diff_context_collection", f"{func_name} in {file_path}")
+
+        try:
+            if not self.claude.check_token_limit(system_prompt, user_message):
+                logger.error(f"Diff Context Collection: Input exceeds token limits for {func_name}")
+                return None
+
+            available_tools = [
+                "readFile", "runTerminalCmd", "getSummaryOfFile",
+                "inspectDirectoryHierarchy", "list_files", "getFileContentByLines",
+                "getFileContent", "checkFileSize"
+            ]
+
+            # Use DiffContextAnalyzer for stage-isolated JSON extraction
+            # This ensures we find dict with 'changed_functions' key, not the last valid JSON
+            analyzer = DiffContextAnalyzer(
+                claude=self.claude,
+                tools_executor=self,
+                supported_tools=available_tools,
+                max_iterations=20,
+                token_usage_callback=self._extract_and_log_token_usage
+            )
+
+            diff_context_bundle_str = analyzer.run_iterative_analysis(
+                system_prompt=system_prompt,
+                user_prompt=user_message
+            )
+
+            end_time = time.time()
+            logger.info(f"Diff Context Collection: Completed in {end_time - start_time:.2f}s")
+
+            if diff_context_bundle_str is None:
+                logger.error(f"Diff Context Collection: No result from LLM for {func_name}")
+                return None
+
+            # Parse the JSON string into a dict
+            try:
+                diff_context_bundle = json.loads(diff_context_bundle_str)
+                if not isinstance(diff_context_bundle, dict):
+                    logger.error(f"Diff Context Collection: Expected dict, got {type(diff_context_bundle)}")
+                    return None
+            except json.JSONDecodeError as e:
+                logger.error(f"Diff Context Collection: Invalid JSON: {e}")
+                return None
+
+            # Save diff context bundle to disk
+            if diff_bundles_dir and bundle_path:
+                try:
+                    os.makedirs(diff_bundles_dir, exist_ok=True)
+                    with open(bundle_path, 'w', encoding='utf-8') as f:
+                        json.dump(diff_context_bundle, f, indent=2, ensure_ascii=False)
+                    logger.info(f"Diff Context Collection: Bundle saved to {bundle_path}")
+                except Exception as e:
+                    logger.warning(f"Diff Context Collection: Could not save bundle: {e}")
+
+            self.claude.log_complete_conversation(final_result=json.dumps(diff_context_bundle))
+            return diff_context_bundle
+
+        except Exception as e:
+            logger.error(f"Diff Context Collection: Unexpected error: {e}")
+            self.claude.log_complete_conversation(final_result=f"Error: {e}")
+            return None
+
+    def run_diff_analysis_from_context(self, diff_context_bundle: dict) -> Optional[List[Dict[str, Any]]]:
+        """
+        Diff Analysis: Perform diff analysis from the gathered diff context bundle.
+
+        Uses DiffAnalysisAnalyzer for stage-isolated JSON extraction that correctly
+        identifies array of issue dicts (not array of strings like collection_notes).
+
+        Args:
+            diff_context_bundle: Diff context bundle from Diff Context Collection
+
+        Returns:
+            List of issue dicts on success, None on failure
+        """
+        func_name = diff_context_bundle.get("primary_function", {}).get("name", "unknown")
+        file_path = diff_context_bundle.get("primary_function", {}).get("file_path", "unknown")
+        logger.info(f"Diff Analysis: Starting for {func_name}")
+        start_time = time.time()
+
+        # Load diff analysis prompt
+        try:
+            prompt_path = Path(__file__).parent.parent / "prompts" / "diffAnalysisProcess.md"
+            with open(prompt_path, 'r', encoding='utf-8') as f:
+                system_prompt = f.read()
+        except Exception as e:
+            logger.error(f"Diff Analysis: Failed to load prompt: {e}")
+            return None
+
+        # Build user message: context bundle + output schema
+        user_message = f"## Diff Context Bundle for Analysis\n\n"
+        user_message += f"**Function**: `{func_name}` in `{file_path}`\n\n"
+        user_message += "The following diff context bundle contains all code needed for your analysis.\n\n"
+        user_message += "```json\n"
+        user_message += json.dumps(diff_context_bundle, indent=2, ensure_ascii=False)
+        user_message += "\n```\n\n"
+        user_message += "Analyze the changed lines (marked with +) and return a JSON array of issues.\n\n"
+        user_message += "🔥 CRITICAL: Return ONLY a valid JSON array starting with [ and ending with ]. If no issues, return []."
+
+        # Start conversation tracking
+        self.claude.start_conversation("diff_analysis", f"{func_name} in {file_path}")
+
+        try:
+            stage_b_tools = ["readFile", "runTerminalCmd"]
+
+            # Use DiffAnalysisAnalyzer for stage-isolated JSON extraction
+            # This ensures we find array of issue dicts, not array of strings
+            analyzer = DiffAnalysisAnalyzer(
+                claude=self.claude,
+                tools_executor=self,
+                supported_tools=stage_b_tools,
+                max_iterations=15,
+                token_usage_callback=self._extract_and_log_token_usage
+            )
+
+            issues_str = analyzer.run_iterative_analysis(
+                system_prompt=system_prompt,
+                user_prompt=user_message
+            )
+
+            end_time = time.time()
+            logger.info(f"Diff Analysis: Completed in {end_time - start_time:.2f}s")
+
+            if issues_str is None:
+                logger.error(f"Diff Analysis: No result for {func_name}")
+                return None
+
+            # Parse the JSON string into a list
+            try:
+                issues = json.loads(issues_str)
+                if not isinstance(issues, list):
+                    logger.error(f"Diff Analysis: Expected list, got {type(issues)}")
+                    return None
+            except json.JSONDecodeError as e:
+                logger.error(f"Diff Analysis: Invalid JSON: {e}")
+                return None
+
+            self.claude.log_complete_conversation(final_result=json.dumps(issues))
+            self.tools.log_tool_usage_summary()
+            self._log_final_token_summary()
+
+            logger.info(f"Diff Analysis: Found {len(issues)} issues for {func_name}")
+            return issues
+
+        except Exception as e:
+            logger.error(f"Diff Analysis: Unexpected error: {e}")
+            self.claude.log_complete_conversation(final_result=f"Error: {e}")
+            return None

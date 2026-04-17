@@ -1,0 +1,23 @@
+# Example False Positives CSV File
+#
+# This file demonstrates the format expected by dev/move_false_positives.py
+# for identifying and moving false positive issues from code analysis results.
+#
+# Format: checksum,issue_title,issue_description
+#
+# The checksum is the 8-character hex string that appears in the analysis
+# filename. For example, if the analysis file is named:
+#   function_file_880f92c1_analysis.json
+# Then the checksum is: 880f92c1
+#
+# Usage:
+#   python dev/move_false_positives.py \
+#       --results-dir ~/llm_artifacts/<repo>/results/code_analysis \
+#       --false-positives-file /path/to/false_positives.csv
+#
+# Add --dry-run to preview changes without moving files.
+#
+checksum,issue_title,issue_description
+880f92c1,"GetLastError() called twice","GetLastError() called twice, potentially losing the original error code"
+abc12345,"Unchecked return value","Return value of malloc() is not checked for NULL"
+def67890,"Memory leak potential","Allocated memory may not be freed on error path"

@@ -106,7 +106,7 @@ class ProjectSummaryGenerator:
             model=config.model,
             max_tokens=config.max_tokens,
             temperature=config.temperature,
-            provider_type=getattr(config, 'provider_type', 'claude')
+            provider_type=getattr(config, 'provider_type', 'aws_bedrock')
         )
 
         # Set default ignore directories if not provided

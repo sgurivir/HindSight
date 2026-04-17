@@ -7,36 +7,23 @@ Handles communication with Claude models running on AWS Bedrock
 PROVIDER TYPE: llm_provider_type='aws_bedrock'
 ===============================================
 
-PRIMARY TOOL MECHANISM (JSON-Embedded):
+TOOL MECHANISM (JSON-Embedded):
 - System prompts describe tools as JSON objects
 - LLM returns: ```json {"tool": "readFile", "path": "file.py", "reason": "..."} ```
 - llm.py extracts and executes these JSON requests using regex patterns
-- Works identically to Claude provider - no provider-specific tool handling needed
+- Structured/native tool calls are never used (enable_tools=False always)
 
-TOOL RESULT FORMAT (Unified Body Requests):
-- Tool results use plain text format for both Claude and AWS Bedrock providers
+TOOL RESULT FORMAT (Plain Text):
+- Tool results use plain text format
 - Format: {"role": "user", "content": "[TOOL_RESULT: tool_id]\nresult"}
-- This ensures consistent behavior across all providers
-- Same implementation as Claude provider
-
-LEGACY STRUCTURED TOOL SUPPORT:
-- Still supports structured tool calls as fallback
-- Converts OpenAI format to Claude format for AWS Bedrock
-- Tools are described in system prompts and invoked via JSON in response text
 
 RESPONSE FORMAT (OpenAI-compatible):
 - Returns: {"choices": [{"message": {"content": "...", "tool_calls": [...]}}], "usage": {...}}
 - Text content contains JSON tool requests that are parsed by llm.py
-- Downstream code detects format using duck-typing (hasattr checks)
 
 AUTHENTICATION:
 - Uses Bearer token authentication
 - Special handling for Apple GenAI endpoints with OIDC tokens
-
-FORMAT DETECTION STRATEGY:
-- Uses hasattr(obj, 'attribute') instead of isinstance()
-- Response format detected by presence of "choices" key
-- No runtime type checking based on provider class
 """
 
 import os
@@ -346,12 +333,10 @@ class AWSBedrockProvider(BaseLLMProvider):
         messages: List[Dict[str, str]],
         stream: bool = False,
         enable_system_cache: bool = False,
-        cache_ttl: str = "1h",
-        enable_tools: bool = True
+        cache_ttl: str = "1h"
     ) -> Dict[str, Any]:
         """
         Create request payload for AWS Bedrock API.
-        Note: AWS Bedrock may have different caching mechanisms than direct Claude API.
 
         Args:
             messages: List of message dictionaries

@@ -11,7 +11,8 @@ DEFAULT_API_RATE_LIMIT = 80  # requests per 4 minutes 10 seconds
 DEFAULT_RATE_LIMIT_WINDOW = 250  # seconds (4 minutes 10 seconds)
 DEFAULT_LOGS_DIR = "logs"
 DEFAULT_DIFF_DAYS = 21  # Default number of days to look back for recently modified files
-MAX_TOOL_ITERATIONS = 12  # Maximum iterations for LLM tool usage
+MAX_TOOL_ITERATIONS = 20  # Maximum iterations for LLM tool usage
+SOFT_REMINDER_ITERATION = 16  # Iteration at which to send soft reminder to generate output
 RESPONSE_CHALLENGER_MAX_ITERATIONS = 12  # Maximum iterations for response challenger tool usage
 MAX_FILE_CHARACTERS_FOR_READ_FILE = 30000  # Maximum characters for read_file tool before pruning
 MAX_CHARACTERS_PER_DIFF_ANALYSIS = 20000  # Maximum characters per diff analysis conversation
@@ -99,7 +100,7 @@ CALL_TREE_ENABLED = True              # Feature flag for call tree context
 
 DEFAULT_LLM_API_END_POINT = "https://api.anthropic.com/v1/messages"
 DEFAULT_LLM_MODEL = "claude-sonnet-4-5"
-DEFAULT_LLM_PROVIDER_TYPE = "claude"
+DEFAULT_LLM_PROVIDER_TYPE = "aws_bedrock"
 
 DEFAULT_ISSUE_FILTERING_MODEL = ""
 DEFAULT_RESPONSE_CHALLENGE_MODEL = ""

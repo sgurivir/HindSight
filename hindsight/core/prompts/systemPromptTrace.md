@@ -115,21 +115,26 @@ You have access to codebase exploration tools. Use them when you need additional
 - **ALWAYS use `checkFileSize` BEFORE `readFile` or `getFileContentByLines`** to determine if file is within size limits and get the total line count (prevents out-of-bounds errors)
 
 **Exploration:**
-- `getImplementation`: Complete class/struct/enum implementations
 - `readFile`: File contents (check size with `checkFileSize` first)
 - `findSpecificFilesWithSearchString`: Locate files with text
 
 **Analysis:**
 - `getSummaryOfFile`: File purpose and context
 - `getFileContentByLines`: Specific line ranges (use `checkFileSize` first to get valid line_count)
-- `getDirectoryListing`: Directory structure
+- `list_files`: Directory structure
 - `checkFileSize`: File size and line count verification - use before readFile or getFileContentByLines. If a file is not found, use `list_files` on the parent directory to discover actual filenames.
 
 **Execution & Search:**
 - `runTerminalCmd`: Safe exploration commands and grep for file searching
   - Example: `grep -rn 'pattern' --include='*.java' .` to find files containing a pattern
   - ❌ **DON'T use**: multi-word patterns (`'class Name'`), regex (`'.*Type'`), OR patterns (`'a\|b'`), wildcard paths (`dir/*.swift`)
+  - ⛔ **CRITICAL**: Never search outside the repository. Use relative paths only (`.` or `./dir`), never absolute paths like `/Users/...`
   - Use single quotes around patterns. Use single distinctive words only.
+
+**⛔ Repository Boundary Constraint:**
+All terminal commands MUST stay within the repository root. Commands that search outside will timeout and fail.
+- ❌ `find /Users -name '*.swift'` → ✅ `find . -name '*.swift'`
+- ❌ `grep -rn 'pattern' /` → ✅ `grep -rn 'pattern' .`
 
 Choose tools based on what context you need for accurate analysis.
 
@@ -144,6 +149,32 @@ When you need to use a tool, return a JSON object in a markdown code block:
   "parameter2": "value2",
   "reason": "Specific reason why you need this tool for the analysis"
 }
+```
+
+**Examples:**
+
+```json
+{"tool": "checkFileSize", "path": "src/core/MyClass.swift", "reason": "Check file size and total line count before reading"}
+```
+
+```json
+{"tool": "getSummaryOfFile", "path": "src/core/MyClass.swift", "reason": "Quick orientation on the file before deciding what to read"}
+```
+
+```json
+{"tool": "readFile", "path": "src/core/config.json", "reason": "Read small non-class file for additional context"}
+```
+
+```json
+{"tool": "getFileContentByLines", "path": "src/core/MyClass.swift", "startLine": 45, "endLine": 80, "reason": "Read specific line range after confirming bounds with checkFileSize"}
+```
+
+```json
+{"tool": "list_files", "path": "src/core", "recursive": false, "reason": "Discover actual filenames in directory when a file is not found at expected path"}
+```
+
+```json
+{"tool": "runTerminalCmd", "command": "grep -rn 'MyFunction' --include='*.swift' .", "reason": "Find files containing this function name"}
 ```
 
 ## Issue Categories

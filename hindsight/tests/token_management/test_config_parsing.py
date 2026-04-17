@@ -242,36 +242,3 @@ class TestConfigUtilHelpers:
         assert token_type == "auto_refresh"
 
 
-class TestClaudeProviderConfig:
-    """Test configuration parsing for Claude provider."""
-    
-    def test_claude_provider_uses_credentials(self, clean_env):
-        """Test Claude provider uses credentials field."""
-        config_dict = {
-            "llm_provider_type": "claude",
-            "api_end_point": "https://api.anthropic.com/v1/messages",
-            "model": "claude-3-opus-20240229",
-            "credentials": "claude-api-key"
-        }
-        
-        config = LLMProviderConfig(**config_dict)
-        
-        assert config.credentials == "claude-api-key"
-        assert config.get_api_key() == "claude-api-key"
-
-
-class TestDummyProviderConfig:
-    """Test configuration parsing for Dummy provider."""
-    
-    def test_dummy_provider_gets_dummy_key(self, clean_env):
-        """Test Dummy provider gets dummy-key automatically."""
-        config_dict = {
-            "llm_provider_type": "dummy",
-            "api_end_point": "https://dummy.example.com",
-            "model": "dummy-model"
-        }
-        
-        config = LLMProviderConfig(**config_dict)
-        
-        assert config.credentials == "dummy-key"
-        assert config.get_api_key() == "dummy-key"

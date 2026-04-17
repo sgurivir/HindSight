@@ -18,9 +18,9 @@
 **Example Tool Invocation**:
 ```json
 {
-  "tool": "getImplementation",
-  "name": "TMTimeSynthesizer",
-  "reason": "Need to understand the implementation of TMTimeSynthesizer class to analyze its logic flow and data transformations"
+  "tool": "readFile",
+  "path": "src/MyClass.java",
+  "reason": "Need to understand the implementation of MyClass to analyze its logic flow and data transformations"
 }
 ```
 
@@ -30,6 +30,8 @@
 - After tool execution, you'll receive results and can continue your analysis
 - You can request multiple tools by including multiple ```json blocks
 - **MANDATORY**: Always include a "reason" field explaining your specific need for the tool
+
+**⚠️ CRITICAL**: Copy parameter names EXACTLY as shown in each tool's example
 
 ## WHEN TO USE TOOLS
 
@@ -43,16 +45,15 @@
 
 **CRITICAL**: You MUST ONLY use these exact tool names - no variations, abbreviations, or similar names are allowed:
 
-1. `getImplementation`: retrieve complete class implementation from all associated files.
-2. `findSpecificFilesWithSearchString`: find files containing specific text patterns with extension filtering.
-3. `checkFileSize`: check if file exists and get size information to determine if readFile can be used. Only use readFile for small files < 16000 characters.
-4. `readFile`: inspect specific files only when getImplementation is not applicable.
-5. `runTerminalCmd`: run safe commands for exploration and searching (including grep for file searches).
-6. `getSummaryOfFile`: retrieve summary of file's functionality
-7. `list_files`: list files and directories within a specified directory.
-8. `getFileContentByLines`: retrieve content from a file between specific line numbers
-9. `getFileContent`: alias for `getFileContentByLines` - retrieve content from a file between specific line numbers
-10. `inspectDirectoryHierarchy`: get detailed directory structure information including file counts and sizes
+1. `findSpecificFilesWithSearchString`: find files containing specific text patterns with extension filtering.
+2. `checkFileSize`: check if file exists and get size information to determine if readFile can be used. Only use readFile for small files < 16000 characters.
+3. `readFile`: inspect specific files.
+4. `runTerminalCmd`: run safe commands for exploration and searching (including grep for file searches).
+5. `getSummaryOfFile`: retrieve summary of file's functionality
+6. `list_files`: list files and directories within a specified directory.
+7. `getFileContentByLines`: retrieve content from a file between specific line numbers
+8. `getFileContent`: alias for `getFileContentByLines` - retrieve content from a file between specific line numbers
+9. `inspectDirectoryHierarchy`: get detailed directory structure information including file counts and sizes
 
 **CRITICAL TOOL USAGE PRIORITY:**
 1. **ALWAYS use `checkFileSize` BEFORE `readFile` or `getFileContentByLines`** to determine if file is within size limits and get the total line count (prevents out-of-bounds errors)
@@ -118,20 +119,6 @@
 }
 ```
 
-### getImplementation Tool
-**Purpose**: Retrieve the complete implementation of a class, struct or enum from ALL associated files
-**Usage**: Whenever you need to understand any class, struct, or enum. This tool automatically finds and reads all relevant files for a class.
-**Advantages**: More efficient than multiple readFile calls, provides complete context, includes all related files
-
-**Example Usage**:
-```json
-{
-  "tool": "getImplementation",
-  "name": "TMTimeSynthesizer",
-  "reason": "Need to understand the complete implementation of TMTimeSynthesizer class to analyze its logic and behavior"
-}
-```
-
 ### getSummaryOfFile Tool
 **Purpose**: Retrieve file summary for quick understanding of file purpose and context
 **Usage**: When you need to quickly understand what a file does before deeper analysis
@@ -147,8 +134,8 @@
 ```
 
 ### readFile Tool
-**Purpose**: Read specific files when getImplementation is not applicable
-**Usage**: Reading non-class files (headers, config files, build files, etc.)
+**Purpose**: Read specific files
+**Usage**: Reading source files, headers, config files, build files, etc.
 **CRITICAL**: **ALWAYS use checkFileSize FIRST** to ensure file is within size limits and get line count for getFileContentByLines
 
 **Example Usage**:
@@ -171,8 +158,35 @@
 **Allowed Commands**: ls, find, grep, wc, head, tail, cat (for small files), tree, file, sed
 **Usage**:
   - You need to search for patterns or explore project structure
-  - You need to find class names before using getImplementation
+  - You need to find class names or function definitions
   - You need to search for text patterns across files (use grep)
+
+#### ⛔ CRITICAL: Repository Boundary Constraint
+
+**Searching outside the current repository is a SYSTEM ERROR that will cause timeouts and failures.**
+
+All terminal commands MUST stay within the repository root. The repository root is your working directory (`.`).
+
+**❌ FORBIDDEN - These commands search outside the repository and WILL FAIL:**
+```bash
+# DO NOT USE - searches entire /Users directory, causes 30+ second timeouts
+find /Users -name '*.swift' -path '*Orange*' 2>/dev/null | xargs grep -l 'UserDefaultsAppStateKeys' | head -5
+
+# DO NOT USE - searches from filesystem root
+grep -rn 'pattern' /
+
+# DO NOT USE - uses absolute paths outside repo
+cat /Users/username/some/path/file.swift
+```
+
+**✅ CORRECT - Always use relative paths from repo root:**
+```bash
+# Search within repository only
+grep -rn 'UserDefaultsAppStateKeys' . --include='*.swift' | head -20
+
+# Find files within repository
+find . -name '*.swift' -path '*Orange*' | head -10
+```
 
 #### ✅ DO - Reliable grep usage (single-word patterns)
 ```json
@@ -189,6 +203,7 @@
 - **Regex patterns**: ❌ `grep 'enum.*Type'` → ✅ `grep 'EnumType'` (use exact name)
 - **OR patterns**: ❌ `grep 'word1\|word2'` → ✅ Run two separate grep commands
 - **Wildcard file paths**: ❌ `grep 'pattern' dir/*.swift` → ✅ `grep -r 'pattern' --include='*.swift' dir/`
+- **Absolute paths outside repo**: ❌ `find /Users -name '*.swift'` → ✅ `find . -name '*.swift'`
 
 **Strategy**: Search for the most distinctive single word, then use `getFileContentByLines` to examine context around matches.
 
@@ -229,13 +244,15 @@
 ```
 
 **Parameters**:
-- `path`: Directory path to inspect (relative to repository root)
+- `path`: **(use exactly this parameter name)** Directory path to inspect (relative to repository root). Do NOT use "directory" - use "path" instead.
 - `reason`: (optional) Explanation for why this inspection is needed
+
+**⚠️ IMPORTANT**: Always use `path` as the parameter name, not `directory` or `directory_path`.
 
 ## Tool Selection Decision Tree
 
 ```
-Need to understand code?
+Need to understand a function or type?
 ├── Need to read a file?
 │   ├── YES → Use checkFileSize first, then:
 │   │   ├── Large file & broad understanding → Use getSummaryOfFile
@@ -246,7 +263,7 @@ Need to understand code?
 │   └── YES → Use runTerminalCmd with grep, findSpecificFilesWithSearchString, or list_files
 ├── Need to list directory contents
 │   └── YES → Use list_files
-└── If unsure → Use list_files first, then getImplementation, then getSummaryOfFile, then checkFileSize + readFile as needed
+└── If unsure → list_files, then getSummaryOfFile, then checkFileSize + readFile as needed
 ```
 
 ## CRITICAL TOOL USAGE ENFORCEMENT
@@ -259,7 +276,7 @@ Need to understand code?
 **COMMON SUBSTITUTIONS**:
 - Want `searchCode`? → Use `runTerminalCmd` with grep or `findSpecificFilesWithSearchString`
 - Want `findCode`? → Use `findSpecificFilesWithSearchString` or `runTerminalCmd` with grep
-- Want `getCode`? → Use `getImplementation` or `readFile`
+- Want `getCode`? → Use `readFile`
 - Want file content? → Use `readFile`
 - Want directory listing? → Use `list_files`
 - Want `getDirectoryListing`? → Use `list_files` instead
