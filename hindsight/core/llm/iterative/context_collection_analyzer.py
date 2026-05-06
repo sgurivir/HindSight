@@ -68,13 +68,16 @@ class ContextCollectionAnalyzer(BaseIterativeAnalyzer):
             except json.JSONDecodeError:
                 continue
         
-        # Fallback: any dict (might be partial or different structure)
+        # Fallback: check if any dict is close (has 'primary_function' misspelled or nested differently)
+        # Log what we found for debugging, but do NOT return an invalid dict — let the
+        # retry loop send the fallback guidance instead.
         for candidate in candidates:
             try:
                 parsed = json.loads(candidate)
                 if isinstance(parsed, dict):
-                    logger.warning("[ContextCollectionAnalyzer] Found dict without 'primary_function' key - using as fallback")
-                    return candidate
+                    logger.warning(f"[ContextCollectionAnalyzer] Found dict without 'primary_function' key — "
+                                   f"top keys: {list(parsed.keys())[:5]}. Will retry with guidance.")
+                    break
             except json.JSONDecodeError:
                 continue
         
@@ -114,14 +117,21 @@ class ContextCollectionAnalyzer(BaseIterativeAnalyzer):
     def get_fallback_guidance(self) -> str:
         """
         Get context collection-specific guidance for JSON output.
-        
+
         Returns:
             Guidance message for producing a context bundle
         """
         return (
             "CRITICAL: Your previous response did not contain a valid context bundle. "
-            "You MUST respond with ONLY a valid JSON context bundle object. "
+            "You MUST respond with ONLY a valid JSON object matching this EXACT structure:\n\n"
+            '{"schema_version": "1.0", "primary_function": {"function_name": "ClassName::methodName()", '
+            '"class_name": "ClassName", "file_path": "relative/path/to/File.swift", '
+            '"file_name": "File.swift", "language": "swift", '
+            '"start_line": 45, "end_line": 80, "source": "func methodName() { ... }"}, '
+            '"callees": [], "callers": [], "data_types": [], '
+            '"constants_and_globals": [], "collection_notes": []}\n\n'
+            "The 'primary_function' key wrapping the function data is MANDATORY. "
+            "Do NOT put function_name, file_path, or source at the top level. "
             "Your response MUST start with `{` and end with `}`. "
-            "The JSON object MUST contain a 'primary_function' key. "
             "No markdown, no arrays, no prose. Return the JSON object now."
         )

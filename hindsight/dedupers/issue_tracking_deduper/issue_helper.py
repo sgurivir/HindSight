@@ -19,6 +19,8 @@ from pathlib import Path
 from time import sleep
 from typing import List, Optional
 
+from ...utils.file_util import sanitize_filename
+
 # Default output directory for downloaded issues
 DEFAULT_ISSUE_DOWNLOAD_DIR = Path.home() / "issues_on_file"
 
@@ -59,23 +61,7 @@ def get_current_user() -> Optional[str]:
     return None
 
 
-def sanitize_filename(title: str, max_length: int = 50) -> str:
-    """
-    Sanitize issue title for use as filename.
-    
-    Args:
-        title: Issue title
-        max_length: Maximum length of filename (excluding extension)
-    
-    Returns:
-        Sanitized filename string
-    """
-    sanitized = re.sub(r'[<>:"/\\|?*]', '_', title)
-    sanitized = re.sub(r'[\s_]+', '_', sanitized)
-    sanitized = sanitized.strip('_')
-    if len(sanitized) > max_length:
-        sanitized = sanitized[:max_length].rstrip('_')
-    return sanitized
+
 
 
 def format_description(description_items) -> str:
@@ -240,7 +226,7 @@ class IssueDownloader:
                         reporter = issue.originator.username
                     else:
                         reporter = str(issue.originator)
-                except:
+                except (AttributeError, TypeError, KeyError):
                     reporter = str(issue.originator)
             
             # Get description
@@ -268,7 +254,7 @@ class IssueDownloader:
             if hasattr(issue, 'keywords'):
                 try:
                     issue_keywords = list(issue.keywords) if issue.keywords else None
-                except:
+                except (TypeError, AttributeError):
                     pass
             
             # Create markdown content

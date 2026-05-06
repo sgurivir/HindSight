@@ -188,65 +188,32 @@ class HashUtil:
         return full_hash[:truncate_length]
 
     @staticmethod
-    def hash_for_dummy_checksum_md5(identifier: str) -> str:
+    def checksum_for_function_source(repo_path: Union[str, Path], file_path: str,
+                                     start_line: int, end_line: int) -> str:
         """
-        Generate MD5 hash for dummy checksums when real content isn't available.
-        Used as fallback in AST function signature generation.
+        Compute MD5 checksum from the actual source lines of a function on disk.
 
         Args:
-            identifier: Identifier to create dummy checksum for
+            repo_path: Path to repository root
+            file_path: Relative path to the source file
+            start_line: 1-based start line (inclusive)
+            end_line: 1-based end line (inclusive)
 
         Returns:
-            str: MD5 hash as hexadecimal string
+            MD5 hex digest of the function source, or a file-path-based fallback hash
         """
-        dummy_content = f"dummy_{identifier}"
-        return hashlib.md5(dummy_content.encode('utf-8')).hexdigest()
+        try:
+            full_path = Path(repo_path) / file_path
+            if not full_path.exists():
+                return HashUtil.hash_for_file_identifier_md5(file_path)
+            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+            start_idx = max(0, start_line - 1)
+            end_idx = min(len(lines), end_line)
+            if start_idx >= end_idx or start_idx >= len(lines):
+                return HashUtil.hash_for_file_identifier_md5(file_path)
+            content = ''.join(lines[start_idx:end_idx])
+            return HashUtil.hash_for_content_md5(content)
+        except Exception:
+            return HashUtil.hash_for_file_identifier_md5(file_path)
 
-    @staticmethod
-    def hash_for_combined_components_md5(components: List[str]) -> str:
-        """
-        Generate MD5 hash for combined components in call graph checksums.
-        Used for creating final checksums from multiple components.
-
-        Args:
-            components: List of component strings to combine and hash
-
-        Returns:
-            str: MD5 hash as hexadecimal string
-        """
-        if not components:
-            return "None"
-        combined_content = "|".join(components)
-        return hashlib.md5(combined_content.encode('utf-8')).hexdigest()
-
-    @staticmethod
-    def hash_for_data_types_md5(data_type_checksums: List[str]) -> str:
-        """
-        Generate MD5 hash for data type checksums in call graph functions.
-
-        Args:
-            data_type_checksums: List of data type checksum strings
-
-        Returns:
-            str: MD5 hash as hexadecimal string
-        """
-        if not data_type_checksums:
-            return "None"
-        combined_data_types = ",".join(data_type_checksums)
-        return hashlib.md5(combined_data_types.encode('utf-8')).hexdigest()
-
-    @staticmethod
-    def hash_for_functions_md5(function_checksums: List[str]) -> str:
-        """
-        Generate MD5 hash for function checksums in call graph functions.
-
-        Args:
-            function_checksums: List of function checksum strings
-
-        Returns:
-            str: MD5 hash as hexadecimal string
-        """
-        if not function_checksums:
-            return "None"
-        combined_functions = ",".join(function_checksums)
-        return hashlib.md5(combined_functions.encode('utf-8')).hexdigest()

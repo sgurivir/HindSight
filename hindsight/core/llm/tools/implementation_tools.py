@@ -372,7 +372,7 @@ class ImplementationToolsMixin:
                                         relative_path = os.path.relpath(full_path, self.repo_path)
                                         if relative_path not in potential_files:
                                             potential_files.append(relative_path)
-                            except Exception:
+                            except (OSError, UnicodeDecodeError):
                                 continue
 
                 if potential_files:
@@ -569,7 +569,8 @@ class ImplementationToolsMixin:
                             numbered_content = CodeContextPruner.add_line_numbers(alt_content, 1)
                             processed_content = CodeContextPruner.prune_code(numbered_content)
                             return f"\n--- File: {file_path} ---\n{processed_content}"
-                        except Exception:
+                        except Exception as e:
+                            logger.debug(f"[TOOL] getImplementation - CodeContextPruner failed for {file_path}: {e}")
                             lines = alt_content.split('\n')
                             numbered_lines = [f"{i+1:4d} | {line}" for i, line in enumerate(lines)]
                             return f"\n--- File: {file_path} ---\n" + '\n'.join(numbered_lines)
@@ -826,10 +827,8 @@ class ImplementationToolsMixin:
         """Extract method information for a specific file from merged_call_graph.json."""
         file_methods = []
 
-        if isinstance(call_graph_data, dict) and 'call_graph' in call_graph_data:
-            call_graph = call_graph_data.get('call_graph', [])
-
-            for file_entry in call_graph:
+        if isinstance(call_graph_data, list):
+            for file_entry in call_graph_data:
                 file_name = file_entry.get('file', '')
                 if file_name and (file_name == target_file or target_file.endswith(file_name)):
                     functions = file_entry.get('functions', [])

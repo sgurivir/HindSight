@@ -131,26 +131,6 @@ class PythonASTUtil:
 
         logging.info(f"[+] Wrote {len(json_output)} class definitions to {out_path}")
 
-        # Add checksums to the generated file for consistency with other languages
-        try:
-            from .ast_function_signature_util import ASTFunctionSignatureGenerator
-            from pathlib import Path
-
-            # Get repo root by going up from the output file
-            repo_root = Path(out_path).parent
-            while repo_root.parent != repo_root and not (repo_root / '.git').exists():
-                repo_root = repo_root.parent
-
-            ASTFunctionSignatureGenerator.process_data_types_file(
-                repo_path=repo_root,
-                input_file=Path(out_path),
-                output_file=Path(out_path)
-            )
-            logging.info(f"[+] Added checksums to Python class definitions: {out_path}")
-        except Exception as e:
-            logging.warning(f"Failed to add checksums to Python class definitions: {e}")
-            logging.warning("Python data types will be available without checksums")
-
         return {entry["data_type_name"]: entry["files"] for entry in json_output}
 
     @staticmethod

@@ -10,6 +10,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 from ..proj_util.project_summary_generator import ProjectSummaryGenerator, SummaryConfig
+from ..constants import DEFAULT_MAX_TOKENS
 from ...utils.log_util import get_logger
 from ...utils.output_directory_provider import get_output_directory_provider
 
@@ -23,8 +24,7 @@ class SummaryServiceConfig:
     api_key: str
     api_url: str
     model: str
-    max_tokens: int = 64000
-    temperature: float = 0.1
+    max_tokens: int = DEFAULT_MAX_TOKENS
 
 
 class SummaryService:
@@ -54,8 +54,7 @@ class SummaryService:
             api_url=config.api_url,
             model=config.model,
             ignore_dirs=set(),
-            max_tokens=config.max_tokens,
-            temperature=config.temperature
+            max_tokens=config.max_tokens
         )
 
         # Use the ProjectSummaryGenerator singleton if available, otherwise create a temporary instance

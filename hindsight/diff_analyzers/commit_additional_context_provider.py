@@ -223,7 +223,7 @@ class CommitExtendedContextProvider:
                 if parent.name in self.exclude_directories:
                     return False
             return True
-        except Exception:
+        except (ValueError, TypeError):
             return False
 
     def _filter_ast_artifacts_for_files(self, artifacts: Dict[str, Any],
@@ -301,21 +301,19 @@ class CommitExtendedContextProvider:
         
         return {'function_to_location': filtered_functions}
 
-    def _filter_call_graph_for_files(self, call_graph_data: Dict[str, Any],
-                                    target_files: Set[str]) -> Dict[str, Any]:
+    def _filter_call_graph_for_files(self, call_graph_data,
+                                    target_files: Set[str]):
         """Filter call graph data for specific files."""
-        if not call_graph_data or 'call_graph' not in call_graph_data:
+        if not call_graph_data or not isinstance(call_graph_data, list):
             return call_graph_data
-        
+
         filtered_graph = []
-        call_graph = call_graph_data['call_graph']
-        
-        for file_entry in call_graph:
+        for file_entry in call_graph_data:
             file_name = file_entry.get('file', '')
             if any(target_file in file_name or file_name in target_file for target_file in target_files):
                 filtered_graph.append(file_entry)
-        
-        return {'call_graph': filtered_graph}
+
+        return filtered_graph
 
     def _filter_data_types_for_files(self, data_types_data: Dict[str, Any],
                                     target_files: Set[str]) -> Dict[str, Any]:
@@ -526,16 +524,14 @@ class CommitExtendedContextProvider:
         """
         if not call_graph_data:
             return ""
-        
-        # Extract call graph information
-        call_graph = call_graph_data.get('call_graph', [])
-        if not call_graph:
+
+        if not isinstance(call_graph_data, list):
             return ""
-        
+
         descriptions = []
         descriptions.append("FUNCTION RELATIONSHIPS:")
-        
-        for file_entry in call_graph:
+
+        for file_entry in call_graph_data:
             file_name = file_entry.get('file', 'unknown')
             functions = file_entry.get('functions', [])
             

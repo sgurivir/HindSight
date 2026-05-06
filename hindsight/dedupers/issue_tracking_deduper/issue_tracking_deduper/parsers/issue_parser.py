@@ -200,7 +200,7 @@ class IssueParser:
         # Use fallback title if none found
         if not title:
             # Clean up fallback title (replace underscores with spaces)
-            title = re.sub(r'[_-]+', ' ', fallback_title)
+            title = ' '.join(fallback_title.replace('_', ' ').replace('-', ' ').split())
             # Remove issue ID prefix if present
             title = re.sub(r'^rdar\s*\d+\s*', '', title, flags=re.IGNORECASE)
             title = title.strip() or "Untitled Issue"

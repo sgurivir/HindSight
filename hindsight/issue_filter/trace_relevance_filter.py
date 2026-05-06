@@ -18,6 +18,7 @@ from ..core.llm.llm import Claude, ClaudeConfig
 from ..core.constants import DEFAULT_MAX_TOKENS, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT
 from ..utils.log_util import get_logger
 from ..utils.output_directory_provider import get_output_directory_provider
+from ..core.prompts.fallback_prompts import FALLBACK_TRACE_RELEVANCE_FILTER_SYSTEM
 from ..utils.json_util import clean_json_response
 
 
@@ -75,20 +76,7 @@ class TraceRelevanceFilter:
         except Exception as e:
             self.logger.error(f"Failed to load system prompt: {e}")
             # Fallback prompt if file loading fails
-            return """You are a trace analysis issue relevance filter. Determine if an issue is relevant to the original callstack/trace.
-            
-Respond with JSON only: {"result": true} for relevant issues, {"result": false} for irrelevant issues.
-
-An issue is RELEVANT if it:
-1. Relates to functions in the original callstack
-2. Affects the execution path shown in the trace
-3. Could impact the behavior described in the callstack
-4. Is directly connected to the trace context
-
-An issue is IRRELEVANT if it:
-1. Relates to unrelated functions not in the callstack
-2. Is about general code quality unrelated to the trace
-3. Affects code paths not involved in the trace execution"""
+            return FALLBACK_TRACE_RELEVANCE_FILTER_SYSTEM
 
     def _create_llm_instance(self) -> Claude:
         """Create a new LLM instance for each conversation context using centralized factory."""
@@ -109,8 +97,7 @@ An issue is IRRELEVANT if it:
             api_key=self.api_key,
             api_url=api_url,
             model=self.config.get('model', DEFAULT_LLM_MODEL),
-            max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),  # Same as original trace analysis prompt
-            temperature=self.config.get('temperature', 0.1),
+            max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
             provider_type=provider_type
         )
         

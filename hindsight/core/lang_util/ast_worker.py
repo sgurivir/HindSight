@@ -15,7 +15,6 @@ sys.path.insert(0, str(project_root))
 
 from hindsight.utils.log_util import setup_default_logging
 from hindsight.utils.file_util import read_json_file, write_json_file
-from hindsight.core.lang_util.ast_function_signature_util import ASTFunctionSignatureGenerator
 from hindsight.core.lang_util.ast_merger import ASTMerger
 from hindsight.core.lang_util.ast_util_language_helper import (
     ClangAnalysisHelper,
@@ -325,10 +324,8 @@ class ASTWorker:
                 "function_to_location": merged_functions_dict
             }
 
-            # Add checksums to the merged functions and write to file
-            ASTFunctionSignatureGenerator.process_functions_with_checksums_and_write(
-                repo, merged_output, merged_symbols_out
-            )
+            # Write merged functions to file
+            write_json_file(str(merged_symbols_out), merged_output)
 
             # Write merged call graph
             logger.info(f"[+] Writing merged call graph to {merged_graph_out}")
@@ -337,17 +334,9 @@ class ASTWorker:
             # Always merge data types outputs if merged_data_types_out is provided
             # This ensures merged_defined_classes.json is generated even with only one language
             if merged_data_types_out:
-                # Merge the data types (checksums are now added in individual language analysis methods)
+                # Merge the data types
                 # JS/TS excluded from merge
                 ASTMerger.merge_data_types_outputs(clang_data_types_out, swift_data_types_out, kotlin_data_types_out, java_data_types_out, go_data_types_out, merged_data_types_out, repo)
-
-            # Add checksums to the merged call graph
-            ASTFunctionSignatureGenerator.process_call_graph_file(
-                repo_path=repo,
-                input_file=merged_graph_out,
-                data_types_file=merged_data_types_out,
-                functions_file=merged_symbols_out
-            )
 
             # Log summary
             logger.info("AST Analysis Complete!")

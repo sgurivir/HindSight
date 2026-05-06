@@ -27,7 +27,6 @@ from ..core.constants import (
 )
 
 
-from ..core.lang_util.ast_function_signature_util import ASTFunctionSignatureGenerator
 from ..core.lang_util.ast_util import ASTUtil
 from ..core.lang_util.call_tree_util import CallTreeGenerator
 from ..core.lang_util.cast_util import CASTUtil

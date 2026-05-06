@@ -14,6 +14,7 @@ the getFileContentByLines tool to inspect any function in the tree.
 """
 
 import logging
+import os
 from collections import defaultdict
 from typing import Dict, List, Set, Any, Optional, Tuple
 
@@ -45,21 +46,25 @@ class CallTreeSectionGenerator:
         call_graph_data: Dict[str, Any],
         max_ancestor_depth: int = 2,
         max_descendant_depth: int = 3,
-        max_children_per_node: int = 5
+        max_children_per_node: int = 5,
+        repo_path: Optional[str] = None
     ):
         """
         Initialize the CallTreeSectionGenerator.
-        
+
         Args:
             call_graph_data: The merged_call_graph.json data
             max_ancestor_depth: How many levels of callers to include (default: 2)
             max_descendant_depth: How many levels of callees to include (default: 3)
             max_children_per_node: Max children to show per node to prevent explosion (default: 5)
+            repo_path: Repository root path for resolving file line counts (optional)
         """
         self.max_ancestor_depth = max_ancestor_depth
         self.max_descendant_depth = max_descendant_depth
         self.max_children_per_node = max_children_per_node
-        
+        self.repo_path = repo_path
+        self._file_line_count_cache: Dict[str, int] = {}
+
         # Load call graph and implementations
         self.graph = load_call_graph_from_json(call_graph_data)
         self.implementations = extract_implementations(call_graph_data)
@@ -357,7 +362,8 @@ class CallTreeSectionGenerator:
         # Header
         lines.append("// === CALL TREE CONTEXT ===")
         lines.append("// This shows the function's position in the call hierarchy")
-        lines.append("// Use getFileContentByLines tool to read code at any location shown below")
+        lines.append("// Locations shown as {file:startLine-endLine of totalLines}")
+        lines.append("// IMPORTANT: Do NOT request lines beyond totalLines with getFileContentByLines")
         lines.append("//")
         
         target = section.get("target_function", {})
@@ -452,31 +458,62 @@ class CallTreeSectionGenerator:
     def _format_location_compact(self, location: List[Dict[str, Any]]) -> str:
         """
         Format location information compactly.
-        
+        Includes total file line count when repo_path is available to help LLM
+        avoid requesting line ranges beyond the file end.
+
         Args:
             location: List of location dicts with file_path, start_line, end_line
-            
+
         Returns:
-            Compact string like "src/file.c:10-50" or empty string if no location
+            Compact string like "src/file.c:10-50 of 616" or empty string if no location
         """
         if not location:
             return ""
-        
+
         # Take first location
         loc = location[0]
         file_path = loc.get("file_path", "")
         start_line = loc.get("start_line", 0)
         end_line = loc.get("end_line", 0)
-        
+
         if not file_path:
             return ""
-        
+
         if start_line > 0 and end_line > 0:
+            total_lines = self._get_file_line_count(file_path)
+            if total_lines > 0:
+                return f"{file_path}:{start_line}-{end_line} of {total_lines}"
             return f"{file_path}:{start_line}-{end_line}"
         elif start_line > 0:
             return f"{file_path}:{start_line}"
         else:
             return file_path
+
+    def _get_file_line_count(self, file_path: str) -> int:
+        """
+        Get the total line count for a file, using cache.
+
+        Args:
+            file_path: Relative file path from repo root
+
+        Returns:
+            Total line count, or 0 if file cannot be read
+        """
+        if not self.repo_path:
+            return 0
+
+        if file_path in self._file_line_count_cache:
+            return self._file_line_count_cache[file_path]
+
+        try:
+            full_path = os.path.join(self.repo_path, file_path)
+            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                count = sum(1 for _ in f)
+            self._file_line_count_cache[file_path] = count
+            return count
+        except (OSError, IOError):
+            self._file_line_count_cache[file_path] = 0
+            return 0
     
     def estimate_token_count(self, section: Dict[str, Any]) -> int:
         """
@@ -553,13 +590,14 @@ def generate_call_tree_section_for_function(
     max_ancestor_depth: int = 2,
     max_descendant_depth: int = 3,
     max_children_per_node: int = 5,
-    max_tokens: int = 2000
+    max_tokens: int = 2000,
+    repo_path: Optional[str] = None
 ) -> Optional[str]:
     """
     Convenience function to generate a call tree section for a function.
-    
+
     This is the main entry point for generating call tree context for LLM prompts.
-    
+
     Args:
         call_graph_data: The merged_call_graph.json data
         function_name: The function to center the tree on
@@ -567,19 +605,21 @@ def generate_call_tree_section_for_function(
         max_descendant_depth: How many levels of callees to include
         max_children_per_node: Max children per node
         max_tokens: Maximum tokens allowed for the section
-        
+        repo_path: Repository root path for resolving file line counts (optional)
+
     Returns:
         Formatted text string for inclusion in prompt, or None if over budget
     """
     if not call_graph_data or not function_name:
         return None
-    
+
     try:
         generator = CallTreeSectionGenerator(
             call_graph_data,
             max_ancestor_depth=max_ancestor_depth,
             max_descendant_depth=max_descendant_depth,
-            max_children_per_node=max_children_per_node
+            max_children_per_node=max_children_per_node,
+            repo_path=repo_path
         )
         
         # Generate section

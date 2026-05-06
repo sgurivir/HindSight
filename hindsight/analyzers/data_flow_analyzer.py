@@ -19,6 +19,7 @@ Example:
 """
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -35,10 +36,13 @@ from .directory_classifier import DirectoryClassifier
 from ..core.constants import (
     NESTED_CALL_GRAPH_FILE,
     MERGED_SYMBOLS_FILE,
-    MERGED_DEFINED_CLASSES_FILE
+    MERGED_DEFINED_CLASSES_FILE,
+    EXTERNAL_INPUT_RATE_LIMIT,
+    EXTERNAL_INPUT_DEFAULT_WORKERS,
 )
 from ..core.lang_util.call_graph_util import CallGraph, load_call_graph_from_json, print_statistics
 from ..core.lang_util.call_tree_util import CallTreeGenerator
+from ..core.mcp_tools.code_navigation_server import CodeNavigationServer
 from ..utils.config_util import (
     ConfigValidationError,
     load_and_validate_config,
@@ -304,6 +308,229 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
         
         return call_tree
 
+    def _run_external_input_analysis(
+        self,
+        config: dict,
+        call_tree: Dict[str, Any],
+        max_workers: int
+    ) -> Dict[str, Any]:
+        """
+        Step 4: Use LLM with MCP code navigation tools to determine which
+        functions accept external (untrusted) input.
+
+        Runs async workers in parallel, rate-limited to EXTERNAL_INPUT_RATE_LIMIT req/min.
+
+        Args:
+            config: Configuration dictionary (must have path_to_repo, astCallGraphDir)
+            call_tree: The call tree dict from Step 3
+            max_workers: Number of parallel async workers
+
+        Returns:
+            Annotated call tree dict with ext_input fields
+        """
+        from .external_input_analyzer import ExternalInputAnalyzer
+        from ..core.llm.llm import Claude, ClaudeConfig, create_llm_provider
+        from ..core.constants import (
+            DEFAULT_LLM_API_END_POINT, DEFAULT_LLM_MODEL,
+            DATA_FLOW_ANALYZER_MODEL, DATA_FLOW_ANALYZER_MAX_TOKENS,
+            ModelLimits,
+        )
+
+        self.logger.info("Starting external input analysis with MCP code navigation...")
+
+        # Load the raw call graph data for the MCP server
+        ast_call_graph_dir = config['astCallGraphDir']
+        nested_call_graph_path = os.path.join(ast_call_graph_dir, NESTED_CALL_GRAPH_FILE)
+
+        with open(nested_call_graph_path, 'r') as f:
+            call_graph_data = json.load(f)
+
+        # Initialize MCP code navigation server
+        mcp_server = CodeNavigationServer(
+            repo_path=config['path_to_repo'],
+            call_graph_data=call_graph_data
+        )
+        self.logger.info(f"MCP server initialized with {mcp_server.graph.get_num_nodes()} symbols")
+
+        # Build LLM provider for async requests
+        api_key = get_api_key_from_config(config)
+        llm_config = ClaudeConfig(
+            api_key=api_key or "",
+            api_url=config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
+            model=config.get('model', DATA_FLOW_ANALYZER_MODEL),
+            max_tokens=config.get('max_tokens', DATA_FLOW_ANALYZER_MAX_TOKENS),
+            provider_type=get_llm_provider_type(config)
+        )
+        provider = create_llm_provider(llm_config)
+        model_name = config.get('model', DATA_FLOW_ANALYZER_MODEL)
+        context_window = ModelLimits.get_context_window(model_name)
+
+        # Create async LLM request function that wraps the synchronous provider
+        async def async_llm_request(system_prompt: str, messages: List[Dict[str, str]]) -> str:
+            """Async wrapper around synchronous LLM provider.make_request()."""
+            loop = asyncio.get_event_loop()
+
+            def _sync_call():
+                full_messages = [{"role": "system", "content": system_prompt}] + messages
+                payload = provider.create_payload(full_messages, stream=False)
+                response = provider.make_request(payload)
+                if response is None:
+                    return ""
+                if "error" in response:
+                    return ""
+                choices = response.get("choices", [])
+                if not choices:
+                    return ""
+                return choices[0].get("message", {}).get("content", "")
+
+            return await loop.run_in_executor(None, _sync_call)
+
+        # Collect all function names from the call tree
+        all_functions: List[str] = []
+
+        def collect_functions(node: Dict[str, Any]) -> None:
+            func_name = node.get("function", "")
+            if func_name and func_name != "ROOT":
+                all_functions.append(func_name)
+            for child in node.get("children", []):
+                collect_functions(child)
+
+        collect_functions(call_tree.get("call_tree", {}))
+        # Deduplicate while preserving order
+        seen: set = set()
+        unique_functions = []
+        for f in all_functions:
+            if f not in seen:
+                seen.add(f)
+                unique_functions.append(f)
+
+        # Load cached results from previous runs
+        data_flow_paths = self.get_default_data_flow_paths(
+            config['path_to_repo'], config.get('output_base_dir')
+        )
+        cache_path = os.path.join(data_flow_paths['data_flow_dir'], "ext_input_cache.json")
+        cached_results: Dict[str, tuple] = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r') as f:
+                    cache_data = json.load(f)
+                for func_name, entry in cache_data.items():
+                    cached_results[func_name] = (entry["ext_input"], entry["reason"])
+                self.logger.info(f"Loaded {len(cached_results)} cached results from {cache_path}")
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                self.logger.warning(f"Failed to load cache file, starting fresh: {e}")
+                cached_results = {}
+
+        # Filter out functions that already have successful cached results
+        failed_reasons = {"LLM request failed", "Empty LLM response", "No answer produced",
+                          "Max iterations exhausted without valid answer"}
+        functions_to_analyze = [
+            f for f in unique_functions
+            if f not in cached_results
+            or cached_results[f][1] in failed_reasons
+            or cached_results[f][1].startswith("Error:")
+        ]
+
+        self.logger.info(f"Analyzing {len(functions_to_analyze)} functions for external input "
+                         f"({len(unique_functions) - len(functions_to_analyze)} cached, "
+                         f"workers={max_workers}, rate_limit={EXTERNAL_INPUT_RATE_LIMIT}/min)")
+
+        # Callback to persist each result incrementally
+        import threading
+        cache_lock = threading.Lock()
+
+        def _persist_result(func_name: str, ext_input: bool, reason: str) -> None:
+            with cache_lock:
+                cached_results[func_name] = (ext_input, reason)
+                cache_data = {
+                    fn: {"ext_input": ei, "reason": r}
+                    for fn, (ei, r) in cached_results.items()
+                }
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, 'w') as f:
+                    json.dump(cache_data, f, indent=2)
+
+        # Run analysis for uncached functions
+        if functions_to_analyze:
+            analyzer = ExternalInputAnalyzer(
+                mcp_server=mcp_server,
+                llm_request_fn=async_llm_request,
+                rate_limit=EXTERNAL_INPUT_RATE_LIMIT,
+                max_workers=max_workers,
+                context_window=context_window,
+                on_result_callback=_persist_result,
+            )
+
+            results = asyncio.run(analyzer.analyze_all(functions_to_analyze))
+
+            # Retry functions that failed due to LLM/rate-limit errors
+            failed_functions = [
+                func for func, (_, reason) in results.items()
+                if reason in failed_reasons or reason.startswith("Error:")
+            ]
+
+            if failed_functions:
+                self.logger.info(f"Retrying {len(failed_functions)} failed functions after 60s backoff...")
+                import time
+                time.sleep(60)
+                retry_analyzer = ExternalInputAnalyzer(
+                    mcp_server=mcp_server,
+                    llm_request_fn=async_llm_request,
+                    rate_limit=EXTERNAL_INPUT_RATE_LIMIT,
+                    max_workers=max_workers,
+                    context_window=context_window,
+                    on_result_callback=_persist_result,
+                )
+                retry_results = asyncio.run(retry_analyzer.analyze_all(failed_functions))
+                for func, result in retry_results.items():
+                    results[func] = result
+                analyzer._results.update(retry_results)
+        else:
+            # All functions were cached — create analyzer just for annotation
+            analyzer = ExternalInputAnalyzer(
+                mcp_server=mcp_server,
+                llm_request_fn=async_llm_request,
+                rate_limit=EXTERNAL_INPUT_RATE_LIMIT,
+                max_workers=max_workers,
+                context_window=context_window,
+            )
+            results = {}
+
+        # Merge cached results into analyzer for annotation
+        all_results = dict(cached_results)
+        all_results.update(results)
+        analyzer._results = all_results
+
+        # Annotate the call tree
+        annotated_tree = analyzer.annotate_call_tree(call_tree)
+
+        # Write output
+        output_path = os.path.join(data_flow_paths['data_flow_dir'], "call_tree_with_sources.json")
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(annotated_tree, f, indent=2)
+
+        # Write a flat list of functions that accept external input (with reasons)
+        ext_input_functions = [
+            {
+                "function": node["function"],
+                "location": node["location"],
+                "reason": all_results[node["function"]][1],
+            }
+            for node in annotated_tree["call_tree"]["children"]
+            if node.get("ext_input")
+        ]
+        ext_input_path = os.path.join(data_flow_paths['data_flow_dir'], "external_input_functions.json")
+        with open(ext_input_path, 'w') as f:
+            json.dump(ext_input_functions, f, indent=2)
+
+        ext_count = len(ext_input_functions)
+        self.logger.info(f"External input analysis complete: {ext_count}/{len(all_results)} functions accept external input")
+        self.logger.info(f"Output written to: {output_path}")
+        self.logger.info(f"External input functions written to: {ext_input_path}")
+
+        return annotated_tree
+
     def merge_include_exclude_directories_from_config_and_params(
         self,
         config_dict: Dict[str, Any],
@@ -346,7 +573,8 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
         include_directories: List[str] = None,
         max_call_depth: int = 20,
         show_location: bool = True,
-        sort_by_depth: bool = True
+        sort_by_depth: bool = True,
+        max_workers: int = EXTERNAL_INPUT_DEFAULT_WORKERS
     ):
         """
         Main entry point for the Data Flow Analyzer.
@@ -361,6 +589,7 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
             max_call_depth: Maximum depth for call tree generation
             show_location: Show file locations in text output
             sort_by_depth: Sort branches by depth (longest first, default: True)
+            max_workers: Number of parallel workers for external input analysis
         """
         # Merge include/exclude directories from config and params
         computed_include_directories, computed_exclude_directories = \
@@ -451,6 +680,11 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
                 self.logger.info(f"  Total functions: {metadata.get('total_functions', 0)}")
                 self.logger.info(f"  Root nodes: {metadata.get('total_root_nodes', 0)}")
                 self.logger.info(f"  DAG edges: {metadata.get('dag_edges_count', 0)}")
+
+            # Step 4: External Input Analysis (LLM + MCP tools)
+            if call_tree:
+                self.logger.info("\n\n=== EXTERNAL INPUT ANALYSIS ===")
+                self._run_external_input_analysis(config, call_tree, max_workers)
 
             self.logger.info("\n\nData flow analysis pipeline completed successfully!")
 
@@ -555,6 +789,12 @@ python -m hindsight.analyzers.data_flow_analyzer --config config.json --repo /pa
         dest="sort_by_depth",
         help="Sort branches alphabetically instead of by depth"
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=EXTERNAL_INPUT_DEFAULT_WORKERS,
+        help=f"Number of parallel workers for external input analysis (default: {EXTERNAL_INPUT_DEFAULT_WORKERS})"
+    )
 
     args = parser.parse_args()
 
@@ -581,7 +821,8 @@ python -m hindsight.analyzers.data_flow_analyzer --config config.json --repo /pa
         include_directories=args.include_directories,
         max_call_depth=args.max_call_depth,
         show_location=args.show_location,
-        sort_by_depth=args.sort_by_depth
+        sort_by_depth=args.sort_by_depth,
+        max_workers=args.workers
     )
 
 

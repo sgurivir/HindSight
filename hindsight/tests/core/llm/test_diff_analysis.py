@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch, mock_open
 import pytest
 
 from hindsight.core.llm.diff_analysis import DiffAnalysis, DiffAnalysisConfig
+from hindsight.core.constants import MODEL_CLAUDE_SONNET_3_5_V2
 
 
 @pytest.fixture
@@ -18,7 +19,7 @@ def diff_config(tmp_path):
     return DiffAnalysisConfig(
         api_key="test-key",
         api_url="https://api.test.com",
-        model="claude-3-5-sonnet",
+        model=MODEL_CLAUDE_SONNET_3_5_V2,
         repo_path=str(tmp_path),
         output_file="",
         config={"project_name": "TestProject", "description": "Test"},

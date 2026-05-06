@@ -12,7 +12,7 @@ from threading import Lock
 import time
 
 from .base_analyzer import BaseAnalyzer
-from ..core.constants import (DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, DEFAULT_API_RATE_LIMIT,
+from ..core.constants import (DEFAULT_MAX_TOKENS, DEFAULT_API_RATE_LIMIT,
                               DEFAULT_RATE_LIMIT_WINDOW)
 from ..utils.log_util import get_logger
 

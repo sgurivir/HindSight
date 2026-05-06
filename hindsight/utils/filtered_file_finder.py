@@ -3,6 +3,7 @@ import json
 import argparse
 from typing import List, Generator, Dict
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
+from .file_filter_util import matches_path_components, matches_directory_components
 
 
 class FilteredFileFinder:
@@ -59,7 +60,7 @@ class FilteredFileFinder:
     def _is_directory_excluded(self, rel_dir_path: str) -> bool:
         """
         Check if a directory should be excluded based on exclude_directories config.
-        Supports both directory names and relative paths.
+        Supports both directory names, relative paths, and partial path matches.
 
         Args:
             rel_dir_path: Relative directory path from repo root
@@ -68,20 +69,8 @@ class FilteredFileFinder:
             bool: True if directory should be excluded, False otherwise
         """
         for exclude_pattern in self.exclude_directories:
-            # Case 1: Direct match with relative path (e.g., "Daemon/Shared")
-            if rel_dir_path == exclude_pattern:
+            if matches_directory_components(rel_dir_path, exclude_pattern):
                 return True
-
-            # Case 2: Directory is a subdirectory of excluded path
-            if rel_dir_path.startswith(exclude_pattern + '/'):
-                return True
-
-            # Case 3: Directory name matches (legacy behavior)
-            # Split the path and check if any directory component matches
-            path_parts = rel_dir_path.split('/')
-            for part in path_parts:
-                if part == exclude_pattern:
-                    return True
 
         return False
 
@@ -89,36 +78,35 @@ class FilteredFileFinder:
     def _is_file_in_directory(file_path: str, directory: str) -> bool:
         """
         Helper method to check if a file is in a specific directory.
-        
+        Supports prefix matching and partial path matching.
+
         Args:
             file_path: Normalized file path
             directory: Normalized directory path
-            
+
         Returns:
             bool: True if file is in the directory
         """
         normalized_dir = directory.lstrip('./')
         normalized_file = file_path.lstrip('./')
-        return normalized_file.startswith(normalized_dir + '/') or normalized_file == normalized_dir
+        if normalized_file.startswith(normalized_dir + '/') or normalized_file == normalized_dir:
+            return True
+        return matches_path_components(normalized_file, normalized_dir)
 
     @staticmethod
     def _matches_directory_component(file_path: str, directory_name: str) -> bool:
         """
-        Helper method to check if any directory component in the file path matches the directory name.
-        
+        Helper method to check if a directory pattern matches any part of the file path.
+        Supports single component names and multi-component partial paths.
+
         Args:
             file_path: Normalized file path
-            directory_name: Directory name to match
-            
+            directory_name: Directory name or partial path to match
+
         Returns:
-            bool: True if any directory component matches
+            bool: True if pattern matches as consecutive directory components
         """
-        file_path_parts = file_path.split('/')
-        if len(file_path_parts) > 1:  # Ensure there's at least one directory component
-            for i in range(len(file_path_parts) - 1):  # Exclude the filename
-                if file_path_parts[i] == directory_name:
-                    return True
-        return False
+        return matches_path_components(file_path, directory_name)
 
     @staticmethod
     def should_analyze_by_directory_filters(file_path: str, include_directories: list = None, exclude_directories: list = None, exclude_files: list = None) -> bool:
@@ -194,27 +182,39 @@ class FilteredFileFinder:
             if exclude_directories and matching_include_dir:
                 for exclude_dir in exclude_directories:
                     normalized_exclude_dir = exclude_dir.lstrip('./')
-                    
-                    # Check if file matches the exclude pattern
-                    if normalized_file_path.startswith(normalized_exclude_dir + '/') or normalized_file_path == normalized_exclude_dir:
+
+                    # Check if file matches the exclude pattern (prefix or partial path)
+                    file_matches_exclude = (
+                        normalized_file_path.startswith(normalized_exclude_dir + '/') or
+                        normalized_file_path == normalized_exclude_dir or
+                        matches_path_components(normalized_file_path, normalized_exclude_dir)
+                    )
+                    if file_matches_exclude:
                         # If exclude_dir is the same as include_dir, include takes precedence
                         if normalized_exclude_dir == matching_include_dir:
-                            continue  # Skip this exclusion, include takes precedence
-                        
-                        # If exclude_dir is a subdirectory of include_dir, exclude it
-                        if normalized_exclude_dir.startswith(matching_include_dir + '/'):
+                            continue
+
+                        # If exclude_dir contains include_dir as components,
+                        # exclude is within include's scope → exclude wins
+                        if matches_directory_components(normalized_exclude_dir, matching_include_dir):
                             return False
-                        
-                        # If exclude_dir is a parent or sibling of include_dir, exclude it
-                        if not matching_include_dir.startswith(normalized_exclude_dir + '/'):
-                            return False
+
+                        # If include_dir contains exclude_dir as components,
+                        # include is more specific → include wins
+                        if matches_directory_components(matching_include_dir, normalized_exclude_dir):
+                            continue
+
+                        # Neither contains the other → independent, exclude wins
+                        return False
 
         else:
             # Step 3 (alternative): If no include_directories specified, just check exclude_directories
             if exclude_directories:
                 for exclude_dir in exclude_directories:
                     normalized_exclude_dir = exclude_dir.lstrip('./')
-                    if normalized_file_path.startswith(normalized_exclude_dir + '/') or normalized_file_path == normalized_exclude_dir:
+                    if (normalized_file_path.startswith(normalized_exclude_dir + '/') or
+                            normalized_file_path == normalized_exclude_dir or
+                            matches_path_components(normalized_file_path, normalized_exclude_dir)):
                         return False
 
         return True
@@ -231,15 +231,19 @@ class FilteredFileFinder:
         if not self.include_directories:
             return True
 
-        # Check if directory is in include list or is a subdirectory of an included directory
         for include_dir in self.include_directories:
             if rel_dir_path.startswith(include_dir + '/') or rel_dir_path == include_dir:
                 return True
-            # Also include if this directory is a parent of an included directory
             if include_dir.startswith(rel_dir_path + '/'):
                 return True
+            if matches_directory_components(rel_dir_path, include_dir):
+                return True
 
-        return False
+        # With partial matching, the include pattern (e.g., "Orange") could appear
+        # as a subdirectory at any depth. We cannot prune during the walk because
+        # we'd miss matches like "apps/Orange/". The file-level filter in
+        # _should_include_file handles the actual include check correctly.
+        return True
 
     def _should_include_file(self, file_path: str) -> bool:
         """Check if a file should be included based on extension and exclude criteria."""

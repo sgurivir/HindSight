@@ -7,7 +7,7 @@ Concrete implementation of subscriber that writes code analysis results to JSON 
 import os
 import json
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from .interface.code_analysis_result_store_interface import CodeAnalysisSubscriber
 
 
@@ -67,19 +67,25 @@ class CodeAnalysysResultsLocalFSSubscriber(CodeAnalysisSubscriber):
         """
         self._category_filter = category_filter
 
-    def load_existing_results(self, repo_name: str, publisher, category_filter=None) -> int:
+    def load_existing_results(self, repo_name: str, publisher, category_filter=None,
+                              current_checksums: Optional[Dict[Tuple[str, str], str]] = None) -> int:
         """
         Load existing analysis results from files and index them in the publisher for cache lookups.
         This enables checksum-based caching and avoids re-analyzing unchanged functions.
-        
+
         NOTE: This method only builds the index for cache lookups. It does NOT add results
         to the publisher's results collection. Results are added during the analysis loop
         when cached results are "republished" - this prevents duplicate issues in reports.
+
+        When current_checksums is provided, stale results (where the function's checksum has
+        changed or the function no longer exists) are deleted from disk and skipped.
 
         Args:
             repo_name: Name of the repository
             publisher: The publisher instance to index results in (for cache lookups only)
             category_filter: Optional CategoryBasedFilter (not used - filtering happens during republish)
+            current_checksums: Optional dict mapping (file_path, function_name) -> current checksum.
+                             When provided, results with mismatched checksums are deleted.
 
         Returns:
             Number of results indexed for caching
@@ -91,6 +97,7 @@ class CodeAnalysysResultsLocalFSSubscriber(CodeAnalysisSubscriber):
                 return 0
 
             indexed_count = 0
+            purged_count = 0
 
             # Find all analysis JSON files and index them for cache lookups
             for filename in os.listdir(analysis_dir):
@@ -107,6 +114,12 @@ class CodeAnalysysResultsLocalFSSubscriber(CodeAnalysisSubscriber):
                         function_checksum = result_data.get('checksum', '')
 
                         if file_path_field and function_name and function_checksum:
+                            if self._is_stale_result(file_path_field, function_name,
+                                                     function_checksum, current_checksums):
+                                self._delete_stale_file(file_path, function_name, file_path_field)
+                                purged_count += 1
+                                continue
+
                             # Only index the result for cache lookups - do NOT add to publisher's results
                             # This prevents duplicate issues when cached results are republished later
                             publisher.index_existing_result(
@@ -121,20 +134,29 @@ class CodeAnalysysResultsLocalFSSubscriber(CodeAnalysisSubscriber):
                         print(f"Error indexing existing result from {file_path}: {e}")
                         continue
 
+            if purged_count > 0:
+                print(f"Purged {purged_count} stale result files (checksum changed) from {analysis_dir}")
+
             return indexed_count
 
-    def load_existing_results_for_report(self, repo_name: str, publisher) -> int:
+    def load_existing_results_for_report(self, repo_name: str, publisher,
+                                         current_checksums: Optional[Dict[Tuple[str, str], str]] = None) -> int:
         """
         Load existing analysis results from files directly into the publisher's results collection.
         This is used by --generate-report-from-existing-issues to generate reports without
         running the analysis loop.
-        
+
         Unlike load_existing_results(), this method DOES add results to the publisher's
         results collection, making them available via get_results() for report generation.
+
+        When current_checksums is provided, stale results (where the function's checksum has
+        changed or the function no longer exists) are deleted from disk and skipped.
 
         Args:
             repo_name: Name of the repository
             publisher: The publisher instance to load results into
+            current_checksums: Optional dict mapping (file_path, function_name) -> current checksum.
+                             When provided, results with mismatched checksums are deleted.
 
         Returns:
             Number of results loaded for report generation
@@ -146,6 +168,7 @@ class CodeAnalysysResultsLocalFSSubscriber(CodeAnalysisSubscriber):
                 return 0
 
             loaded_count = 0
+            purged_count = 0
 
             # Find all analysis JSON files and load them into the publisher
             for filename in os.listdir(analysis_dir):
@@ -162,6 +185,12 @@ class CodeAnalysysResultsLocalFSSubscriber(CodeAnalysisSubscriber):
                         function_checksum = result_data.get('checksum', '')
 
                         if file_path_field and function_name and function_checksum:
+                            if self._is_stale_result(file_path_field, function_name,
+                                                     function_checksum, current_checksums):
+                                self._delete_stale_file(file_path, function_name, file_path_field)
+                                purged_count += 1
+                                continue
+
                             # Load the result directly into the publisher's results collection
                             result_id = publisher.load_existing_result_for_report(
                                 repo_name=repo_name,
@@ -177,7 +206,30 @@ class CodeAnalysysResultsLocalFSSubscriber(CodeAnalysisSubscriber):
                         print(f"Error loading existing result from {file_path}: {e}")
                         continue
 
+            if purged_count > 0:
+                print(f"Purged {purged_count} stale result files (checksum changed) from {analysis_dir}")
+
             return loaded_count
+
+    def _is_stale_result(self, file_path_field: str, function_name: str,
+                         stored_checksum: str,
+                         current_checksums: Optional[Dict[Tuple[str, str], str]]) -> bool:
+        """Check if a stored result is stale based on current checksums."""
+        if not current_checksums:
+            return False
+        key = (file_path_field, function_name)
+        if key in current_checksums:
+            return current_checksums[key] != stored_checksum
+        # Function no longer in call graph — result is stale
+        return True
+
+    def _delete_stale_file(self, file_path: str, function_name: str, source_file: str) -> None:
+        """Delete a stale result file from disk."""
+        try:
+            os.remove(file_path)
+            print(f"Deleted stale result: {function_name} in {source_file} ({os.path.basename(file_path)})")
+        except OSError as e:
+            print(f"Failed to delete stale result file {file_path}: {e}")
 
     def on_result_added(self, result_id: str, result: Dict[str, Any]) -> None:
         """

@@ -84,7 +84,7 @@ def get_commit_date_from_temp_repo(repo_url, commit_hash):
         if temp_dir and os.path.exists(temp_dir):
             try:
                 shutil.rmtree(temp_dir)
-            except:
+            except OSError:
                 pass
 
 def list_remote_branches(repo_url: str = None, repo_dir: str = None, recent_days: int = None):
@@ -149,7 +149,7 @@ def list_remote_branches(repo_url: str = None, repo_dir: str = None, recent_days
                             default_date = datetime.datetime.fromisoformat(date_part.replace(' ', 'T'))
                         else:
                             default_date = get_commit_date_from_temp_repo(repo_url, head_commit)
-                    except:
+                    except (subprocess.SubprocessError, ValueError):
                         default_date = get_commit_date_from_temp_repo(repo_url, head_commit)
                 else:
                     default_date = get_commit_date_from_temp_repo(repo_url, head_commit)

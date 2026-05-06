@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import List, Optional, Dict
 
 from ..llm.llm import Claude, ClaudeConfig
-from ..constants import DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT
+from ..constants import DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT, DEFAULT_MAX_TOKENS
 from ...utils.config_util import load_config_tolerant, get_api_key_from_config, get_llm_provider_type
 from ...utils.file_util import read_file
 from ...utils.log_util import get_logger
+from ..prompts.fallback_prompts import FALLBACK_FILE_NAME_EXTRACTION_SYSTEM
 from ...utils.file_content_provider import FileContentProvider
 
 logger = get_logger(__name__)
@@ -49,8 +50,7 @@ class FileNameExtractorFromTrace:
             api_key=api_key,
             api_url=config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
             model=config.get('model', DEFAULT_LLM_MODEL),
-            max_tokens=config.get('max_tokens', 64000),
-            temperature=config.get('temperature', 0.1),
+            max_tokens=config.get('max_tokens', DEFAULT_MAX_TOKENS),
             provider_type=get_llm_provider_type(config)
         )
         
@@ -79,7 +79,7 @@ class FileNameExtractorFromTrace:
             
             if not prompt_file.exists():
                 logger.error(f"System prompt file not found: {prompt_file}")
-                return "You are a file name extraction assistant. Extract all file names from the given trace data and return them as a JSON array."
+                return FALLBACK_FILE_NAME_EXTRACTION_SYSTEM
             
             content = read_file(str(prompt_file))
             if content:
@@ -87,7 +87,7 @@ class FileNameExtractorFromTrace:
                 return content
             else:
                 logger.warning("Failed to read system prompt file, using fallback")
-                return "You are a file name extraction assistant. Extract all file names from the given trace data and return them as a JSON array."
+                return FALLBACK_FILE_NAME_EXTRACTION_SYSTEM
                 
         except Exception as e:
             logger.error(f"Error loading system prompt: {e}")

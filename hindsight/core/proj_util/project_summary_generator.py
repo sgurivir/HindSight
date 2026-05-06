@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 from .reasoning_order_generator import ReasoningOrderGenerator
 from ..llm.llm import Claude, ClaudeConfig
-from ..constants import DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT
+from ..constants import DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT, DEFAULT_MAX_TOKENS
 from ...utils.api_key_util import get_api_key
 from ...utils.artifacts import get_repo_artifacts_dir
 from ...utils.config_util import load_config_tolerant
@@ -59,8 +59,7 @@ class SummaryConfig:
     api_url: str
     model: str
     ignore_dirs: set = None
-    max_tokens: int = 64000
-    temperature: float = 0.1
+    max_tokens: int = DEFAULT_MAX_TOKENS
     merged_functions_json_path: str = None
 
 
@@ -105,7 +104,6 @@ class ProjectSummaryGenerator:
             api_url=config.api_url,
             model=config.model,
             max_tokens=config.max_tokens,
-            temperature=config.temperature,
             provider_type=getattr(config, 'provider_type', 'aws_bedrock')
         )
 
@@ -1368,8 +1366,7 @@ def generate_file_summary_to_tmp(config_path: str, relative_file_path: str) -> N
                 api_url=api_url,
                 model=model,
                 ignore_dirs=ignore_dirs,
-                max_tokens=64000,
-                temperature=0.1
+                max_tokens=DEFAULT_MAX_TOKENS
             )
 
             # Create temporary ProjectSummaryGenerator (this is a standalone utility function)

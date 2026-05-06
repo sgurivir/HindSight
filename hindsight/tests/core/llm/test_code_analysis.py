@@ -20,6 +20,7 @@ from hindsight.core.llm.code_analysis import (
     AnalysisConfig,
     CodeAnalysis,
 )
+from hindsight.core.constants import DEFAULT_MAX_TOKENS, MODEL_CLAUDE_SONNET_3_5_V2
 
 
 # ============================================================================
@@ -35,7 +36,7 @@ class TestAnalysisConfig:
             json_file_path="/path/to/input.json",
             api_key="test-api-key",
             api_url="https://api.anthropic.com/v1/messages",
-            model="claude-3-5-sonnet-20241022",
+            model=MODEL_CLAUDE_SONNET_3_5_V2,
             repo_path="/path/to/repo",
             output_file="/path/to/output.json"
         )
@@ -43,7 +44,7 @@ class TestAnalysisConfig:
         assert config.json_file_path == "/path/to/input.json"
         assert config.api_key == "test-api-key"
         assert config.api_url == "https://api.anthropic.com/v1/messages"
-        assert config.model == "claude-3-5-sonnet-20241022"
+        assert config.model == MODEL_CLAUDE_SONNET_3_5_V2
         assert config.repo_path == "/path/to/repo"
         assert config.output_file == "/path/to/output.json"
 
@@ -53,13 +54,12 @@ class TestAnalysisConfig:
             json_file_path="/path/to/input.json",
             api_key="test-api-key",
             api_url="https://api.anthropic.com/v1/messages",
-            model="claude-3-5-sonnet-20241022",
+            model=MODEL_CLAUDE_SONNET_3_5_V2,
             repo_path="/path/to/repo",
             output_file="/path/to/output.json"
         )
         
-        assert config.max_tokens == 64000
-        assert config.temperature == 0.1
+        assert config.max_tokens == DEFAULT_MAX_TOKENS
         assert config.processed_cache_file is None
         assert config.config is None
         assert config.file_content_provider is None
@@ -70,23 +70,21 @@ class TestAnalysisConfig:
         """Test AnalysisConfig with custom values."""
         custom_config = {"llm_provider_type": "aws_bedrock"}
         file_filter = ["src/main.py", "src/utils.py"]
-        
+
         config = AnalysisConfig(
             json_file_path="/path/to/input.json",
             api_key="test-api-key",
             api_url="https://api.anthropic.com/v1/messages",
-            model="claude-3-5-sonnet-20241022",
+            model=MODEL_CLAUDE_SONNET_3_5_V2,
             repo_path="/path/to/repo",
             output_file="/path/to/output.json",
             max_tokens=32000,
-            temperature=0.5,
             config=custom_config,
             file_filter=file_filter,
             min_function_body_length=10
         )
-        
+
         assert config.max_tokens == 32000
-        assert config.temperature == 0.5
         assert config.config == custom_config
         assert config.file_filter == file_filter
         assert config.min_function_body_length == 10
@@ -130,7 +128,7 @@ class TestCodeAnalysisInitialization:
             json_file_path=temp_json_file,
             api_key="test-api-key",
             api_url="https://api.anthropic.com/v1/messages",
-            model="claude-3-5-sonnet-20241022",
+            model=MODEL_CLAUDE_SONNET_3_5_V2,
             repo_path=temp_repo,
             output_file=os.path.join(temp_repo, "output.json"),
             config={"llm_provider_type": "aws_bedrock"}
@@ -172,7 +170,7 @@ class TestCodeAnalysisInitialization:
             json_file_path=temp_json_file,
             api_key="test-api-key",
             api_url="https://api.anthropic.com/v1/messages",
-            model="claude-3-5-sonnet-20241022",
+            model=MODEL_CLAUDE_SONNET_3_5_V2,
             repo_path=temp_repo,
             output_file=os.path.join(temp_repo, "output.json"),
             config={"llm_provider_type": "aws_bedrock"},
@@ -655,7 +653,7 @@ class TestRunContextCollection:
             json_file_path=str(temp_json),
             api_key="test-key",
             api_url="https://api.test.com",
-            model="claude-3-5-sonnet",
+            model=MODEL_CLAUDE_SONNET_3_5_V2,
             repo_path="/repo",
             output_file="",
             config={"project_name": "TestProject", "description": "Test"}
@@ -764,7 +762,7 @@ class TestRunAnalysisFromContext:
             json_file_path=str(temp_json),
             api_key="test-key",
             api_url="https://api.test.com",
-            model="claude-3-5-sonnet",
+            model=MODEL_CLAUDE_SONNET_3_5_V2,
             repo_path="/repo",
             output_file="",
             config={"project_name": "TestProject", "description": "Test"}

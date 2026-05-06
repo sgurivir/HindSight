@@ -15,7 +15,6 @@ from .java_ast_util import JavaASTUtil
 from .kotlin_ast_util import KotlinASTUtil
 from .swift_ast_util import SwiftASTUtil
 from .javascript_typescript_ast_util import JavaScriptTypeScriptASTUtil
-from .ast_function_signature_util import ASTFunctionSignatureGenerator
 
 from ...utils.file_util import read_json_file, write_json_file
 
@@ -144,18 +143,6 @@ class ClangAnalysisHelper:
             use_parallel=use_parallel,
             max_workers=max_workers
         )
-        
-        # Add checksums to Clang data types if file exists
-        if clang_classes_out and clang_classes_out.exists():
-            try:
-                logger.info("[+] Adding checksums to Clang data types...")
-                ASTFunctionSignatureGenerator.process_data_types_file(
-                    repo_path=repo,
-                    input_file=clang_classes_out,
-                    output_file=clang_classes_out
-                )
-            except Exception as e:
-                logger.warning(f"Failed to add checksums to Clang data types: {e}")
 
         # Build data type usage mapping
         logger.info("[+] Building data type usage mapping. It might take a while. Please wait...")
@@ -288,18 +275,6 @@ class SwiftAnalysisHelper:
                 only_repo_defined=True,
                 registry_names=symbols_set
             )
-            
-            # Add checksums to Swift data types if file exists
-            if swift_classes_out and swift_classes_out.exists():
-                try:
-                    logger.info("[+] Adding checksums to Swift data types...")
-                    ASTFunctionSignatureGenerator.process_data_types_file(
-                        repo_path=repo,
-                        input_file=swift_classes_out,
-                        output_file=swift_classes_out
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to add checksums to Swift data types: {e}")
 
             # Build data type usage for Swift using the class registry for filtering
             logger.info("[+] Building Swift data type usage mapping. It might take a while. Please wait...")
@@ -406,18 +381,6 @@ class KotlinAnalysisHelper:
                 source_files=kotlin_files,
                 function_registry=function_names
             )
-            
-            # Add checksums to Kotlin data types if file exists
-            if kotlin_classes_out and kotlin_classes_out.exists():
-                try:
-                    logger.info("[+] Adding checksums to Kotlin data types...")
-                    ASTFunctionSignatureGenerator.process_data_types_file(
-                        repo_path=repo,
-                        input_file=kotlin_classes_out,
-                        output_file=kotlin_classes_out
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to add checksums to Kotlin data types: {e}")
 
             # Build constants usage mapping for Kotlin
             logger.info("[+] Building Kotlin constants usage mapping. It might take a while. Please wait...")
@@ -510,18 +473,6 @@ class JavaAnalysisHelper:
                 source_files=java_files,
                 function_registry=function_names
             )
-            
-            # Add checksums to Java data types if file exists
-            if java_classes_out and java_classes_out.exists():
-                try:
-                    logger.info("[+] Adding checksums to Java data types...")
-                    ASTFunctionSignatureGenerator.process_data_types_file(
-                        repo_path=repo,
-                        input_file=java_classes_out,
-                        output_file=java_classes_out
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to add checksums to Java data types: {e}")
 
             # Build data type usage for Java using the class registry for filtering
             logger.info("[+] Building Java data type usage mapping. It might take a while. Please wait...")
@@ -640,18 +591,6 @@ class GoAnalysisHelper:
                 only_repo_defined=True,
                 registry_names=function_names
             )
-            
-            # Add checksums to Go data types if file exists
-            if go_classes_out and go_classes_out.exists():
-                try:
-                    logger.info("[+] Adding checksums to Go data types...")
-                    ASTFunctionSignatureGenerator.process_data_types_file(
-                        repo_path=repo,
-                        input_file=go_classes_out,
-                        output_file=go_classes_out
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to add checksums to Go data types: {e}")
 
             # Build data type usage mapping
             logger.info("[+] Building Go data type usage mapping. It might take a while. Please wait...")

@@ -32,7 +32,7 @@ def get_apple_connect_token() -> Optional[str]:
             '-o', 'openid,dsid,accountname,profile,groups'
         ]
 
-        logger.info("Attempting to retrieve Apple Connect token...")
+        logger.debug("Retrieving Apple Connect token...")
 
         # Execute the command and capture output
         result = subprocess.run(
@@ -46,7 +46,7 @@ def get_apple_connect_token() -> Optional[str]:
             # Extract the token (last part of the output)
             token = result.stdout.strip().split()[-1]
             if token:
-                logger.info("Successfully retrieved Apple Connect token")
+                logger.debug("Successfully retrieved Apple Connect token")
                 return token
             else:
                 logger.warning("Apple Connect command succeeded but no token found in output")
@@ -67,16 +67,16 @@ def get_apple_connect_token() -> Optional[str]:
         logger.warning(f"Error retrieving Apple Connect token: {e}")
         return None
 
-# Default token refresh interval: 25 minutes (tokens expire in ~30 minutes)
-DEFAULT_TOKEN_REFRESH_INTERVAL_SECONDS = 25 * 60  # 1500 seconds
+# Default token refresh interval: 15 minutes (tokens expire in ~30 minutes)
+DEFAULT_TOKEN_REFRESH_INTERVAL_SECONDS = 15 * 60  # 900 seconds
 
 
 class AppleConnectTokenManager:
     """
     Manages AppleConnect OAuth tokens with automatic refresh support.
-    
+
     This class tracks token age and automatically refreshes tokens before they expire.
-    Tokens typically expire in ~30 minutes, so we refresh at 25 minutes by default.
+    Tokens typically expire in ~30 minutes, so we refresh at 15 minutes by default.
     
     Usage:
         # Create a token manager (singleton pattern recommended)
@@ -123,7 +123,7 @@ class AppleConnectTokenManager:
         self._is_apple_connect_token = False
         self._initialized = True
         
-        self._logger.info(
+        self._logger.debug(
             f"AppleConnectTokenManager initialized with refresh interval: "
             f"{refresh_interval_seconds} seconds ({refresh_interval_seconds // 60} minutes)"
         )
@@ -157,7 +157,7 @@ class AppleConnectTokenManager:
         needs_refresh = elapsed >= self._refresh_interval
         
         if needs_refresh:
-            self._logger.info(
+            self._logger.debug(
                 f"Token refresh needed: {elapsed:.0f}s elapsed "
                 f"(threshold: {self._refresh_interval}s)"
             )
@@ -175,14 +175,14 @@ class AppleConnectTokenManager:
             self._logger.debug("Using static API key, no refresh needed")
             return self._config_api_key
         
-        self._logger.info("Refreshing AppleConnect token...")
+        self._logger.debug("Refreshing AppleConnect token...")
         new_token = get_apple_connect_token()
-        
+
         if new_token:
             self._current_token = new_token
             self._token_acquired_at = time.time()
             self._is_apple_connect_token = True
-            self._logger.info("AppleConnect token refreshed successfully")
+            self._logger.debug("AppleConnect token refreshed successfully")
             return new_token
         else:
             self._logger.warning("Failed to refresh AppleConnect token")
@@ -284,15 +284,15 @@ def get_api_key(config_api_key: Optional[str] = None) -> Optional[str]:
 
     # First, try the API key from config
     if config_api_key:
-        logger.info("Using API key from configuration")
+        logger.debug("Using API key from configuration")
         return config_api_key
 
     # Fallback to Apple Connect token
-    logger.info("No API key in config, attempting Apple Connect token fallback...")
+    logger.debug("No API key in config, attempting Apple Connect token fallback...")
     apple_token = get_apple_connect_token()
 
     if apple_token:
-        logger.info("Using Apple Connect token as API key")
+        logger.debug("Using Apple Connect token as API key")
         return apple_token
     else:
         logger.warning("No API key available from config or Apple Connect")

@@ -1,0 +1,17 @@
+{
+    "project_name": "LLM AppKit",
+    "description": "LLM Appkit",
+    
+    "api_end_point": "https://floodgate.g.apple.com/api/openai/v1/chat/completions",
+    "model": "anthropic.claude-opus-4-7",
+    "llm_provider_type": "aws_bedrock",
+    "credentials": "",
+    
+    
+
+    "exclude_files": [],
+    
+    "min_function_body_length": 7,
+    
+    "user_prompts": [ ""]
+}

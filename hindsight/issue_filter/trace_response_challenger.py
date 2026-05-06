@@ -18,7 +18,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from ..core.constants import DEFAULT_LLM_API_END_POINT
+from ..core.constants import DEFAULT_LLM_API_END_POINT, DEFAULT_LLM_MODEL, DEFAULT_MAX_TOKENS
 from ..utils.log_util import get_logger
 from ..utils.output_directory_provider import get_output_directory_provider
 
@@ -250,9 +250,8 @@ class TraceResponseChallenger:
             claude_config = ClaudeConfig(
                 api_key=self.api_key,
                 api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-                model=self.config.get('model', 'claude-3-5-sonnet-20241022'),
-                max_tokens=self.config.get('max_tokens', 64000),
-                temperature=self.config.get('temperature', 0.1),
+                model=self.config.get('model', DEFAULT_LLM_MODEL),
+                max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
                 provider_type=llm_provider_type
             )
             

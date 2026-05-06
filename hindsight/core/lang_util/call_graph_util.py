@@ -331,11 +331,6 @@ def load_call_graph_from_json(data: Any) -> CallGraph:
     # Handle both direct list format and wrapped dict format
     if isinstance(data, list):
         call_graph_data = data
-    elif isinstance(data, dict):
-        call_graph_data = data.get('call_graph', data.get('files', []))
-        # If still a dict (not a list), try to extract the list
-        if isinstance(call_graph_data, dict):
-            call_graph_data = []
     else:
         call_graph_data = []
     

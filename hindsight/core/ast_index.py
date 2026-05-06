@@ -237,9 +237,7 @@ class RepoAstIndex:
                 summary["types_count"] = len(self._merged_types)
         
         if self._merged_call_graph:
-            if isinstance(self._merged_call_graph, dict):
-                summary["call_graph_entries"] = len(self._merged_call_graph.get("call_graph", []))
-            elif isinstance(self._merged_call_graph, list):
+            if isinstance(self._merged_call_graph, list):
                 summary["call_graph_entries"] = len(self._merged_call_graph)
         
         return summary

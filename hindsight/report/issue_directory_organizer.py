@@ -181,8 +181,8 @@ class RepositoryDirHierarchy:
                 with open(cache_path, 'rb') as f:
                     cached_data = pickle.load(f)
                     return cached_data.get('structure')
-        except Exception:
-            # If cache is corrupted or incompatible, ignore it
+        except Exception as e:
+            logger.debug(f"Could not load cached directory structure from {cache_path}: {e}")
             pass
         return None
 
@@ -196,8 +196,8 @@ class RepositoryDirHierarchy:
             }
             with open(cache_path, 'wb') as f:
                 pickle.dump(cache_data, f)
-        except Exception:
-            # If caching fails, continue without caching
+        except Exception as e:
+            logger.debug(f"Could not save directory structure cache to {cache_path}: {e}")
             pass
 
     def get_tree_structure(self, max_depth: int = 6) -> str:

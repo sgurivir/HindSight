@@ -49,6 +49,18 @@ FILE_READ_ERRORS = "ignore"
 SMALL_FILE_LINE_THRESHOLD = 1000
 
 
+import re as _re
+
+def sanitize_filename(name: str, max_length: int = 50) -> str:
+    """Sanitize a string for safe use as a filename."""
+    sanitized = _re.sub(r'[<>:"/\\|?*]', '_', name)
+    sanitized = _re.sub(r'[\s_]+', '_', sanitized)
+    sanitized = sanitized.strip('_')
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length].rstrip('_')
+    return sanitized
+
+
 def read_file(file_path: str, encoding: str = 'utf-8', errors: str = 'ignore') -> Optional[str]:
     """
     Read the content of a file.

@@ -33,8 +33,8 @@ from typing import Dict, List, Any, Set, Union, Iterable, Tuple
 
 from ...utils.log_util import setup_default_logging
 from ...utils.file_util import read_json_file, write_json_file
+from ...utils.file_filter_util import matches_path_components
 
-from .ast_function_signature_util import ASTFunctionSignatureGenerator
 from .ast_merger import ASTMerger
 from .ast_process_manager import ASTProcessManager
 from .ast_util_language_helper import (
@@ -417,18 +417,9 @@ class ASTUtil:
                 # Check if file is within any of the include directories
                 for include_dir in include_dirs:
                     include_dir_normalized = include_dir.replace('\\', '/')
-                    
-                    # Check for exact path prefix match first (e.g., "src/main")
-                    if '/' in include_dir_normalized:
-                        if relative_path_str.startswith(include_dir_normalized + '/') or relative_path_str == include_dir_normalized:
-                            initial_files.append(file_path)
-                            break
-                    else:
-                        # Check for partial directory name match (e.g., "Positioning" matches "Daemon/Positioning/")
-                        path_parts = relative_path_str.split('/')
-                        if include_dir_normalized in path_parts:
-                            initial_files.append(file_path)
-                            break
+                    if matches_path_components(relative_path_str, include_dir_normalized):
+                        initial_files.append(file_path)
+                        break
             except ValueError:
                 continue
         

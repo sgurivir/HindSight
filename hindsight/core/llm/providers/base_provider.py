@@ -37,10 +37,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
+from ...constants import ModelLimits, DEFAULT_MAX_TOKENS
+
 # Constants
 INPUT_TOO_LONG_ERROR = "input is too long"
 DEFAULT_MAX_RETRIES = 3
-DEFAULT_RETRY_DELAYS = [30, 60, 90]  # Wait times in seconds for each retry
+DEFAULT_RETRY_DELAYS = [60, 60, 90]  # Wait times in seconds for each retry
 
 
 
@@ -57,8 +59,7 @@ class LLMConfig:
     """
     api_url: str
     model: str
-    max_tokens: int = 64000
-    temperature: float = 0.05
+    max_tokens: int = DEFAULT_MAX_TOKENS
     timeout: int = 300
     
     # Authentication fields (in priority order for Apple endpoints)
@@ -168,8 +169,8 @@ class BaseLLMProvider(ABC):
             bool: True if within limits
         """
         estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
-        # Leave some buffer for response tokens
-        max_input_tokens = self.config.max_tokens - 5000
+        context_window = ModelLimits.get_context_window(self.config.model)
+        max_input_tokens = context_window - self.config.max_tokens
 
         return estimated_tokens <= max_input_tokens
 

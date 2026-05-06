@@ -22,7 +22,6 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 
-# Add the project root to Python path for imports
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -33,7 +32,7 @@ from ..analyzers.analysis_runner_mixins import UnifiedIssueFilterMixin, ReportGe
 from ..issue_filter.unified_issue_filter import create_unified_filter
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
 from ..core.llm.diff_analysis import DiffAnalysis, DiffAnalysisConfig
-from ..core.constants import MAX_CHARACTERS_PER_DIFF_ANALYSIS, DEFAULT_NUM_BLOCKS_TO_ANALYZE, DEFAULT_LLM_MODEL, MAX_FILES_PER_DIFF_CHUNK, DEFAULT_LLM_API_END_POINT, MAX_SUPPORTED_FILE_COUNT, MAX_FUNCTION_BODY_LENGTH
+from ..core.constants import MAX_CHARACTERS_PER_DIFF_ANALYSIS, DEFAULT_NUM_BLOCKS_TO_ANALYZE, DEFAULT_LLM_MODEL, MAX_FILES_PER_DIFF_CHUNK, DEFAULT_LLM_API_END_POINT, MAX_SUPPORTED_FILE_COUNT, MAX_FUNCTION_BODY_LENGTH, DEFAULT_MAX_TOKENS
 from ..core.errors import AnalyzerErrorCode, AnalysisResult
 from ..core.proj_util.file_or_directory_summary_generator import FileOrDirectorySummaryGenerator
 from ..core.prompts.prompt_builder import PromptBuilder
@@ -44,7 +43,6 @@ from ..utils.config_util import get_api_key_from_config, get_llm_provider_type
 from ..utils.output_directory_provider import OutputDirectoryProvider
 from ..core.errors import AnalyzerErrorCode, AnalysisResult
 
-# Import publisher-subscriber classes
 from ..results_store.code_analysis_publisher import CodeAnalysisResultsPublisher
 from ..results_store.code_analysys_results_local_fs_subscriber import CodeAnalysysResultsLocalFSSubscriber
 
@@ -80,28 +78,22 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         self.unified_issue_filter = None
         self.file_diff_stats = {}  # Dictionary to store file -> {lines_changed, chars_changed}
         self.num_blocks_to_analyze = DEFAULT_NUM_BLOCKS_TO_ANALYZE  # Default value, can be overridden in run() - preference for number of chunks (size limits always enforced)
-        
-        # Extract force_in_process_ast parameter from config (similar to CodeAnalyzer)
+
         self.force_in_process_ast = config.get('force_in_process_ast', False)
         if self.force_in_process_ast:
             self.logger.info("AST generation will run in-process (force_in_process_ast=True)")
         else:
             self.logger.info("AST generation will use default behavior (force_in_process_ast=False)")
-        
-        # Initialize publisher-subscriber system
+
         self.results_publisher = None
         self._subscribers = []
-        
-        # Token tracking (similar to CodeAnalysisRunner)
+
         self.token_tracker = None
-        
-        # User-provided prompts (similar to CodeAnalysisRunner)
+
         self.user_provided_prompts = []
-        
-        # Additional context provider for enhanced diff analysis
+
         self.context_provider = None
         
-        # File summary generator for generating file summaries before diff analysis
         # Initialize once and reuse (similar to CodeAnalyzer pattern)
         self.file_summary_generator = None
         
@@ -122,7 +114,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         self.logger.info(f"Generating diff between {self.old_commit_hash} and {self.new_commit_hash}")
 
         try:
-            # Generate unified diff with context
             result = subprocess.run(
                 ['git', 'diff', '--unified=7', self.old_commit_hash, self.new_commit_hash],
                 cwd=self.repo_checkout_dir,
@@ -133,8 +124,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             
             diff_content = result.stdout
             self.logger.info(f"Generated diff with {len(diff_content)} characters")
-            
-            # Also get the list of changed files
+
             files_result = subprocess.run(
                 ['git', 'diff', '--name-only', self.old_commit_hash, self.new_commit_hash],
                 cwd=self.repo_checkout_dir,
@@ -145,16 +135,13 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             
             all_changed_files = files_result.stdout.strip().split('\n') if files_result.stdout.strip() else []
             self.logger.info(f"Found {len(all_changed_files)} changed files")
-            
-            # Filter files by supported extensions
+
             self.changed_files = self._filter_files_by_extensions(all_changed_files)
             self.logger.info(f"After extension filtering: {len(self.changed_files)} files remain")
-            
-            # Apply exclude_directories filtering using base class method
+
             self.changed_files = self._filter_files_by_exclude_directories(self.changed_files)
             self.logger.info(f"After applying exclude_directories filter: {len(self.changed_files)} files remain")
-            
-            # Filter diff content to only include supported files
+
             filtered_diff = self._filter_diff_by_files(diff_content, self.changed_files)
             
             # SAVE ORIGINAL DIFF FOR DEBUGGING
@@ -169,8 +156,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             
             # DISABLED: Expand diff context to include whole functions using AST information
             # expanded_diff = self._expand_diff_context_with_ast(filtered_diff)
-            
-            # Save original diff to file (no expansion)
+
             output_file = Path(output_path)
             output_file.parent.mkdir(parents=True, exist_ok=True)
             
@@ -178,8 +164,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                 f.write(filtered_diff)
             
             self.logger.info(f"Original diff saved to file: {output_path}")
-            
-            # Use original diff content for LLM analysis
+
             self.diff_content = filtered_diff
             
             return self.diff_content
@@ -202,7 +187,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         ignored_count = 0
 
         for file_path in files:
-            # Get file extension
             _, ext = os.path.splitext(file_path)
             ext = ext.lower()
 
@@ -239,9 +223,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         include_current_section = False
 
         for line in lines:
-            # Check for file headers
             if line.startswith('diff --git'):
-                # Extract file path from diff header
                 # Format: diff --git a/path/to/file b/path/to/file
                 parts = line.split()
                 if len(parts) >= 4:
@@ -252,7 +234,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                 else:
                     include_current_section = False
             elif line.startswith('---') or line.startswith('+++'):
-                # File path headers, check if we should include this file
                 if line.startswith('+++'):
                     file_path = line[4:].strip()  # Remove '+++ ' prefix
                     if file_path.startswith('b/'):
@@ -260,7 +241,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                     current_file = file_path
                     include_current_section = current_file in allowed_files
 
-            # Include line if we're in an allowed file section
             if include_current_section:
                 filtered_lines.append(line)
 
@@ -281,27 +261,22 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             return diff_content
             
         try:
-            # Use the fixed diff enhancement utility
             from ..utils.diff_enhancement_util import DiffContextExpander
-            
-            # Get the merged functions file path from context provider
+
             merged_functions_path = self._get_merged_functions_path()
             if not merged_functions_path:
                 self.logger.warning("No merged functions file available - keeping original diff context")
                 return diff_content
-            
-            # Create a temporary diff file
+
             import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.diff', delete=False) as temp_diff:
                 temp_diff.write(diff_content)
                 temp_diff_path = temp_diff.name
             
             try:
-                # Create a temporary output file
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.diff', delete=False) as temp_output:
                     temp_output_path = temp_output.name
-                
-                # Use the fixed diff expansion utility
+
                 success = DiffContextExpander.expand_diff_with_function_context(
                     repo_path=str(self.repo_checkout_dir),
                     file_content_provider=self.get_file_content_provider(),
@@ -311,7 +286,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                 )
                 
                 if success:
-                    # Read the expanded diff
                     with open(temp_output_path, 'r', encoding='utf-8') as f:
                         expanded_diff = f.read()
                     
@@ -322,12 +296,11 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                     return diff_content
                     
             finally:
-                # Clean up temporary files
                 import os
                 try:
                     os.unlink(temp_diff_path)
                     os.unlink(temp_output_path)
-                except:
+                except OSError:
                     pass
             
         except Exception as e:
@@ -344,8 +317,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         try:
             if not self.context_provider:
                 return None
-                
-            # Try to get AST artifacts to find the merged functions file
+
             from pathlib import Path
             target_files = [Path(self.repo_checkout_dir) / f for f in self.changed_files[:1]]  # Use first file to trigger AST generation
             exclude_dirs = self.config.get('exclude_directories', [])
@@ -372,9 +344,8 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             try:
                 llm_provider = get_llm_provider_type(self.config)
                 
-                # Ensure the config has the necessary values for FileOrDirectorySummaryGenerator
                 enhanced_config = self.config.copy()
-                
+
                 # Add exclude_directories if not present (needed for Tools initialization)
                 if 'exclude_directories' not in enhanced_config:
                     enhanced_config['exclude_directories'] = []
@@ -401,7 +372,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         self.logger.info(f"Generating summaries for {len(changed_files)} changed files")
         
         try:
-            # Ensure file summary generator is initialized (done once)
             if not self.file_summary_generator:
                 self._initialize_file_summary_generator()
             
@@ -412,14 +382,12 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             summaries = {}
             
             for file_path in changed_files:
-                # Check cache first
                 if file_path in self.file_summaries_cache:
                     summaries[file_path] = self.file_summaries_cache[file_path]
                     self.logger.debug(f"Using cached summary for {file_path}")
                     continue
                 
                 try:
-                    # Generate summary for this file
                     self.logger.debug(f"Generating summary for {file_path}")
                     summary = self.file_summary_generator.get_summary_of_file(
                         root=str(self.repo_checkout_dir),
@@ -503,7 +471,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         Args:
             api_key: API key for LLM provider
         """
-        # Call the mixin method with config
         super()._initialize_unified_issue_filter(api_key, self.config)
 
     # ==================== FUNCTION-LEVEL DIFF ANALYSIS METHODS ====================
@@ -523,7 +490,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             return {}
             
         try:
-            # Convert changed files to absolute paths
             target_files = [Path(self.repo_checkout_dir) / f for f in self.changed_files if (Path(self.repo_checkout_dir) / f).exists()]
             
             if not target_files:
@@ -531,8 +497,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                 return {}
             
             clang_args = self.config.get('clang_args', [])
-            
-            # Use the context provider to generate AST artifacts
+
             ast_artifacts = self.context_provider._get_or_generate_ast_artifacts(
                 target_files,
                 clang_args,
@@ -570,16 +535,13 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         all_issues = []
         total_functions = len(affected_functions)
         
-        # Get API key
         api_key = get_api_key_from_config(self.config)
         if not api_key:
             self.logger.error("No API key available for function analysis")
             return []
         
-        # Initialize unified issue filter
         self._initialize_unified_issue_filter_for_diff(api_key)
-        
-        # Create diff analysis config
+
         llm_provider_type = get_llm_provider_type(self.config)
         api_url = self.config.get('api_url') or self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT)
         
@@ -589,8 +551,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             model=self.config.get('model', DEFAULT_LLM_MODEL),
             repo_path=str(self.repo_checkout_dir),
             output_file="",  # Not used in two-stage flow
-            max_tokens=self.config.get('max_tokens', 64000),
-            temperature=0.0,
+            max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
             config=self.config,
             file_content_provider=getattr(self, 'file_content_provider', None),
         )
@@ -608,7 +569,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             Claude.start_issue_logging(i)
             
             try:
-                # Build function-specific prompt data
                 prompt_data = self._build_function_diff_prompt(
                     func_info,
                     all_changed_files,
@@ -619,8 +579,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                 if not prompt_data:
                     self.logger.warning(f"Could not build prompt for function {func_name}")
                     continue
-                
-                # Create a new DiffAnalysis instance for each function
+
                 diff_analyzer = DiffAnalysis(diff_config)
                 self._last_analysis = diff_analyzer
 
@@ -632,8 +591,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
 
                 # Stage Db: Analyze from context
                 issues = diff_analyzer.run_diff_analysis_from_context(diff_context_bundle)
-                
-                # Record token usage
+
                 if self.token_tracker and hasattr(diff_analyzer, 'get_token_totals'):
                     try:
                         input_tokens, output_tokens = diff_analyzer.get_token_totals()
@@ -644,7 +602,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                         self.logger.warning(f"Failed to record token usage for {func_name}: {e}")
                 
                 if issues:
-                    # Apply issue filter
                     if self.unified_issue_filter:
                         filtered_issues = self.unified_issue_filter.filter_issues(issues)
                         if len(filtered_issues) != len(issues):
@@ -690,8 +647,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         end_line = func_info.get('end', 0)
         affected_reason = func_info.get('affected_reason', 'modified')
         changed_lines = func_info.get('changed_lines', [])
-        
-        # Get function code with diff markers
+
         function_code = self._get_function_code_with_diff_markers(
             file_path, start_line, end_line, changed_lines_per_file
         )
@@ -699,21 +655,17 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         if not function_code:
             self.logger.warning(f"Could not retrieve code for function {func_name}")
             return None
-        
-        # Check function size limit
+
         code_lines = function_code.count('\n') + 1
         if code_lines > MAX_FUNCTION_BODY_LENGTH:
             self.logger.warning(f"Function {func_name} has {code_lines} lines, exceeds limit of {MAX_FUNCTION_BODY_LENGTH}")
             return None
-        
-        # Get call context from AST
+
         call_context = self._get_function_call_context(func_name, ast_artifacts)
-        
-        # Get data types and constants used
+
         data_types_used = call_context.get('data_types_used', [])
         constants_used = call_context.get('constants_used', {})
-        
-        # Get related functions with their code
+
         invoked_functions = self._get_related_functions_with_code(
             call_context.get('functions_invoked', []),
             changed_lines_per_file,
@@ -761,13 +713,11 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             Formatted code string with line numbers and diff markers
         """
         try:
-            # Get file content using the file content provider
             file_content_provider = self.get_file_content_provider()
             if not file_content_provider:
                 self.logger.warning("No file content provider available")
                 return None
-            
-            # Read the file content
+
             full_path = Path(self.repo_checkout_dir) / file_path
             if not full_path.exists():
                 self.logger.warning(f"File not found: {full_path}")
@@ -775,19 +725,16 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             
             with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
-            
-            # Get changed lines for this file
+
             file_changes = changed_lines_per_file.get(file_path, {})
             added_lines = set(file_changes.get('added', []))
             removed_lines = set(file_changes.get('removed', []))
-            
-            # Build formatted code
+
             formatted_lines = []
             for line_num in range(start_line, min(end_line + 1, len(lines) + 1)):
                 if line_num <= len(lines):
                     line_content = lines[line_num - 1].rstrip('\n\r')
-                    
-                    # Determine marker
+
                     if line_num in added_lines:
                         marker = '+'
                     elif line_num in removed_lines:
@@ -825,9 +772,8 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         if not ast_artifacts:
             return result
         
-        call_graph = ast_artifacts.get('call_graph', {})
-        call_graph_list = call_graph.get('call_graph', [])
-        
+        call_graph_list = ast_artifacts.get('call_graph', [])
+
         for file_entry in call_graph_list:
             functions = file_entry.get('functions', [])
             for func_entry in functions:
@@ -878,19 +824,16 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             locations = function_to_location.get(func_name, [])
             if not locations:
                 continue
-            
-            # Use first location
+
             loc = locations[0] if isinstance(locations, list) else locations
             file_path = loc.get('file_name', '')
             start_line = loc.get('start', 0)
             end_line = loc.get('end', 0)
-            
-            # Check if this function was modified
+
             file_changes = changed_lines_per_file.get(file_path, {})
             added_lines = set(file_changes.get('added', []))
             is_modified = any(start_line <= line <= end_line for line in added_lines)
-            
-            # Get function code with markers
+
             code = self._get_function_code_with_diff_markers(
                 file_path, start_line, end_line, changed_lines_per_file
             )
@@ -914,10 +857,8 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         Args:
             output_base_dir: Base output directory
         """
-        # Extract repository name from directory
         repo_name = self.repo_checkout_dir.name
-        
-        # Initialize publisher
+
         self.results_publisher = CodeAnalysisResultsPublisher()
         self.results_publisher.initialize(output_base_dir)
 
@@ -930,7 +871,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             previously_added_count += 1
             self.logger.info(f"Registered previously added subscriber: {type(subscriber).__name__}")
 
-        # Create and add default file system subscriber
         default_subscriber = CodeAnalysysResultsLocalFSSubscriber(output_base_dir)
         default_subscriber.set_repo_name(repo_name)
         self.results_publisher.subscribe(default_subscriber)
@@ -949,19 +889,15 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         Args:
             output_base_dir: Base output directory
         """
-        # Extract repository name from directory
         repo_name = self.repo_checkout_dir.name
-        
-        # Initialize publisher
+
         self.results_publisher = CodeAnalysisResultsPublisher()
         self.results_publisher.initialize(output_base_dir)
 
-        # Register all previously added subscribers with the publisher
         for subscriber in self._subscribers:
             self.results_publisher.subscribe(subscriber)
             self.logger.info(f"Registered previously added subscriber: {type(subscriber).__name__}")
 
-        # Create and add default file system subscriber
         default_subscriber = CodeAnalysysResultsLocalFSSubscriber(output_base_dir)
         default_subscriber.set_repo_name(repo_name)
         self.results_publisher.subscribe(default_subscriber)
@@ -1042,17 +978,14 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         """
         self.logger.info(f"Saving {len(issues)} analysis results using publisher-subscriber pattern")
 
-        # Deduplicate issues before saving and report generation
         if self.config.get('enable_issue_deduplication', True) and issues:
             try:
                 from ..dedupers.issue_deduper import IssueDeduper
                 from ..utils.output_directory_provider import get_output_directory_provider
                 
-                # Get the repository artifacts directory
                 output_provider = get_output_directory_provider()
                 artifacts_dir = output_provider.get_repo_artifacts_dir()
-                
-                # Initialize deduper with artifacts directory
+
                 deduper = IssueDeduper(
                     artifacts_dir=artifacts_dir,
                     threshold=self.config.get('dedupe_threshold', 0.85)
@@ -1070,29 +1003,24 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                     f"{dedupe_stats['semantic_matches']} semantic)"
                 )
                 self.logger.info(f"Vector DB stored at: {dedupe_stats['db_path']}")
-                
-                # Cleanup deduper resources
+
                 deduper.cleanup()
                 
             except Exception as e:
                 self.logger.warning(f"Issue deduplication failed, continuing with all issues: {e}")
 
-        # Extract repository name from directory
         repo_name = self.repo_checkout_dir.name
 
-        # Publish results using the publisher-subscriber system
         if self.results_publisher:
             # Create a single result entry for the diff analysis
             # We'll treat this as a "function" analysis where the function name represents the commit range
             function_name = f"diff_{self.old_commit_hash[:8]}_to_{self.new_commit_hash[:8]}"
             file_path = "diff_analysis"  # Virtual file path for diff analysis
-            
-            # Create a checksum based on the commit hashes
+
             import hashlib
             checksum_input = f"{self.old_commit_hash}_{self.new_commit_hash}_{len(self.changed_files)}"
             function_checksum = hashlib.md5(checksum_input.encode()).hexdigest()[:16]
 
-            # Use the existing publisher to save results
             result_id = self.results_publisher.add_result(
                 repo_name=repo_name,
                 file_path=file_path,
@@ -1106,11 +1034,9 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             else:
                 self.logger.warning("Failed to publish results")
 
-        # Use the results directory from the new structure
         results_dir = self.results_dir
         results_dir.mkdir(parents=True, exist_ok=True)
 
-        # Generate HTML report
         try:
             project_name = self.config.get('project_name', 'Git Diff Analysis')
             report_title = f"{project_name} - Diff Analysis ({self.old_commit_hash[:8]} → {self.new_commit_hash[:8]})"
@@ -1131,7 +1057,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
 
         except Exception as e:
             self.logger.error(f"Failed to generate HTML report: {e}")
-            # Return a default path if HTML generation fails
             return str(results_dir / "diff_analysis_failed.html")
 
     def generate_report_from_existing_issues(self, config_dict: Dict[str, Any], repo_dir: str, out_dir: str) -> bool:
@@ -1148,39 +1073,32 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         """
         try:
             self.logger.info("Starting report generation from existing diff analysis issues...")
-            
-            # Set up the basic configuration
+
             self.repo_checkout_dir = Path(repo_dir)
             self.config = config_dict
-            
-            # Initialize output directories
+
             from ..utils.output_directory_provider import OutputDirectoryProvider
             output_provider = OutputDirectoryProvider()
             output_provider.configure(repo_dir, out_dir)
-            
-            # Set up analysis and results directories
+
             self.analysis_dir = Path(output_provider.get_repo_artifacts_dir()) / "analysis"
             self.results_dir = Path(output_provider.get_repo_artifacts_dir()) / "results"
             
             self.logger.info(f"Repository directory: {self.repo_checkout_dir}")
             self.logger.info(f"Analysis directory: {self.analysis_dir}")
             self.logger.info(f"Results directory: {self.results_dir}")
-            
-            # Initialize publisher-subscriber system to load existing results for report generation
+
             self._initialize_publisher_subscriber_for_report(str(self.analysis_dir))
-            
-            # Check if we have any existing results
+
             if not self.results_publisher:
                 self.logger.error("Publisher not available - cannot load existing results")
                 return False
-                
-            # Extract repository name for results lookup
+
             repo_name = self.repo_checkout_dir.name
             existing_results = self.results_publisher.get_results(repo_name)
             
             if not existing_results:
                 self.logger.warning("No existing diff analysis results found")
-                # Check if there are any result files in the expected locations
                 diff_results_dir = self.results_dir / "diff_analysis"
                 if diff_results_dir.exists():
                     result_files = list(diff_results_dir.glob("*.json"))
@@ -1191,8 +1109,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                 else:
                     self.logger.info("Diff analysis results directory does not exist")
                 return False
-            
-            # Convert results to issues format
+
             all_issues = []
             for result in existing_results:
                 if 'results' in result and isinstance(result['results'], list):
@@ -1206,19 +1123,16 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             if not all_issues:
                 self.logger.warning("No issues found in existing results")
                 return False
-            
-            # Generate HTML report
+
             try:
                 project_name = self.config.get('project_name', 'Git Diff Analysis')
-                
-                # Create a descriptive report title
+
                 report_title = f"{project_name} - Diff Analysis Report (Existing Results)"
                 
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 html_filename = f"diff_analysis_existing_report_{timestamp}.html"
                 html_path = self.results_dir / html_filename
-                
-                # Ensure results directory exists
+
                 self.results_dir.mkdir(parents=True, exist_ok=True)
                 
                 report_file = generate_html_report(
@@ -1257,7 +1171,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
         Returns:
             Path to the generated analysis report
         """
-        # Set the preference for this analysis run (similar to CodeAnalysisRunner pattern)
         self.num_blocks_to_analyze = num_blocks_to_analyze
         self.logger.info(f"Starting Git Simple Commit Analysis with chunk preference: {num_blocks_to_analyze} (size limits always enforced)")
         
@@ -1301,8 +1214,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
 
             # Step 2.5.1: Run DirectoryClassifier and check file count limit BEFORE diff generation
             self.logger.info("\n\n=== DIRECTORY CLASSIFICATION & FILE COUNT CHECK ===")
-            
-            # Get enhanced exclude directories using analysis_runner's method
+
             from ..analyzers.analysis_runner import AnalysisRunner
             runner = AnalysisRunner()
             
@@ -1320,8 +1232,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                 
                 if enhanced_exclude_dirs:
                     self.logger.info(f"  Directories to exclude: {sorted(enhanced_exclude_dirs)[:10]}{'...' if len(enhanced_exclude_dirs) > 10 else ''}")
-                
-                # Update config with enhanced exclusions for use in diff generation
+
                 self.config['exclude_directories'] = enhanced_exclude_dirs
                 self.logger.info("Updated config with enhanced exclude directories")
                 
@@ -1408,7 +1319,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
 
             if not diff_content.strip():
                 self.logger.warning("No diff content generated - no changes between commits")
-                # Create empty results
                 empty_results = []
                 return self.save_results(empty_results)
 
@@ -1428,7 +1338,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             # Step 6: Identify affected functions using AffectedFunctionDetector
             self.logger.info("Identifying affected functions...")
             detector = AffectedFunctionDetector(
-                call_graph=ast_artifacts.get('call_graph', {}),
+                call_graph=ast_artifacts.get('call_graph', []),
                 functions=ast_artifacts.get('functions', {}),
                 changed_lines_per_file=changed_lines_per_file,
                 repo_path=str(self.repo_checkout_dir)
@@ -1545,16 +1455,13 @@ Examples:
     args = parser.parse_args()
 
     try:
-        # Set up default artifacts directory for main() usage
         import os
         from pathlib import Path
         from ..utils.output_directory_provider import OutputDirectoryProvider
-        
-        # Default artifacts directory is ~/hindsight_diff_artifacts
+
         default_artifacts_dir = Path.home() / "hindsight_diff_artifacts"
         default_artifacts_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Configure OutputDirectoryProvider with default directory
+
         output_provider = OutputDirectoryProvider()
         output_provider.configure(
             repo_path=args.repo,
@@ -1563,19 +1470,16 @@ Examples:
         
         print(f"📁 Using artifacts directory: {default_artifacts_dir}")
 
-        # Load configuration
         from ..utils.config_util import load_and_validate_config, get_llm_provider_type
         from ..analyzers.token_tracker import TokenTracker
         
         config = load_and_validate_config(args.config)
 
-        # Check if user wants to generate report from existing issues only
         if args.generate_report_from_existing_issues:
             if not args.config:
                 print(f"\n❌ Error: --config is required when using --generate-report-from-existing-issues")
                 sys.exit(1)
 
-            # Create analyzer instance for report generation
             analyzer = GitSimpleCommitAnalyzer(
                 repo_dir=args.repo,
                 config=config,
@@ -1596,12 +1500,10 @@ Examples:
             
             sys.exit(0 if success else 1)
 
-        # Use the DiffAnalysisRunner for consistent pattern
         from .diff_analysis_runner import DiffAnalysisRunner
-        
+
         runner = DiffAnalysisRunner()
-        
-        # Auto-create and set TokenTracker (similar to CodeAnalysisRunner)
+
         llm_provider_type = get_llm_provider_type(config)
         token_tracker = TokenTracker(llm_provider_type)
         runner.set_token_tracker(token_tracker)
@@ -1617,7 +1519,6 @@ Examples:
             num_blocks_to_analyze=args.num_chunks_to_analyze
         )
 
-        # Print token usage summary after analysis (similar to CodeAnalysisRunner)
         if runner.get_token_tracker():
             input_tokens, output_tokens = runner.get_token_tracker().get_total_token_usage()
             total_tokens = input_tokens + output_tokens

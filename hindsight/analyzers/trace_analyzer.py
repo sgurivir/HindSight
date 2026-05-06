@@ -21,7 +21,7 @@ from .base_analyzer import BaseAnalyzer
 from .directory_classifier import DirectoryClassifier
 from .token_tracker import TokenTracker
 from ..issue_filter import TraceRelevanceFilter, create_unified_filter
-from ..core.constants import DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, PROCESSED_OUTPUT_DIR, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT
+from ..core.constants import DEFAULT_MAX_TOKENS, PROCESSED_OUTPUT_DIR, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT
 from ..core.lang_util.ast_call_graph_parser import ASTCallGraphParser
 from ..core.llm.llm import Claude
 from ..core.llm.tools import Tools
@@ -39,19 +39,15 @@ from ..core.errors import AnalyzerErrorCode, AnalysisResult
 from ..utils.log_util import setup_default_logging
 from ..utils.output_directory_provider import get_output_directory_provider
 
-# Add the project root to Python path for imports
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-# Import publisher-subscriber classes
 from results_store.trace_analysis_publisher import TraceAnalysisResultsPublisher
 from results_store.trace_analysys_results_local_fs_subscriber import TraceAnalysysResultsLocalFSSubscriber
 from results_store.file_system_results_cache import FileSystemResultsCache
 
-# Constants
 ANALYSIS_FILE_SUFFIX = "_analysis.json"
 
-# Default output directory names
 DEFAULT_TRACE_ANALYSIS_OUT_DIR = "trace_analysis"
 
 
@@ -80,9 +76,6 @@ class TraceAnalyzer(BaseAnalyzer):
             raise RuntimeError("Analyzer not initialized. Call initialize() first.")
 
         try:
-            # Create a temporary file for this analysis
-
-            # For trace analysis, func_record should contain prompt content
             prompt_content = func_record.get('prompt_content', '')
             if not prompt_content:
                 return None
@@ -91,12 +84,10 @@ class TraceAnalyzer(BaseAnalyzer):
                 temp_file.write(prompt_content)
                 temp_input_path = temp_file.name
 
-            # Create output file path
             with tempfile.NamedTemporaryFile(mode='w', suffix='_analysis.json', delete=False) as temp_output:
                 temp_output_path = temp_output.name
 
             try:
-                # Create TraceAnalysisConfig
                 analysis_config = TraceAnalysisConfig(
                     prompt_file_path=temp_input_path,
                     api_key=self.api_key,
@@ -105,16 +96,13 @@ class TraceAnalyzer(BaseAnalyzer):
                     repo_path=self.repo_path,
                     output_file=temp_output_path,
                     max_tokens=DEFAULT_MAX_TOKENS,
-                    temperature=DEFAULT_TEMPERATURE,
                     config=self.config
                 )
 
-                # Run analysis
                 trace_analysis = TraceCodeAnalysis(analysis_config)
                 success = trace_analysis.run_analysis()
 
                 if success:
-                    # Read the result
                     try:
                         with open(temp_output_path, 'r', encoding='utf-8') as f:
                             result = json.load(f)
@@ -125,15 +113,14 @@ class TraceAnalyzer(BaseAnalyzer):
                     return None
 
             finally:
-                # Clean up temporary files
                 try:
                     os.unlink(temp_input_path)
                     os.unlink(temp_output_path)
                 except OSError:
                     pass
 
-        except Exception:
-            # Log error but don't raise to maintain interface contract
+        except Exception as e:
+            self.logger.error(f"Error in analyze_trace: {e}")
             return None
 
     def finalize(self) -> None:
@@ -153,20 +140,16 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
         """Initialize the runner with logging setup."""
         super().__init__()
 
-        # AnalyzedRecordsRegistry for tracking analyzed callstacks
         self.analyzed_records_registry = None
 
-        # Initialize attributes that may be set later
         self.api_key = None
         self.config = None
         self.repo_path = None
         self.num_traces_to_analyze = None
 
-        # Unified issue filter (initialized when needed)
         self.unified_issue_filter = None
 
-        # Publisher-subscriber system for trace analysis results
-        self._subscribers = []  # List to hold multiple subscribers
+        self._subscribers = []
 
     def get_default_trace_analysis_paths(self, repo_path: str, override_base_dir: str = None, custom_base_dir: str = None) -> dict:
         """
@@ -219,22 +202,18 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             bool: True if analysis successful
         """
         try:
-            # Convert callstack to text format for registry tracking
             from ..core.trace_util.trace_analysis_prompt_builder import TraceAnalysisPromptBuilder
             temp_builder = TraceAnalysisPromptBuilder()
             callstack_text = temp_builder._convert_callstack_to_text_format(callstack)
 
-            # Check if this callstack has already been analyzed
             if self.analyzed_records_registry and callstack_text and self.analyzed_records_registry.is_analyzed(callstack_text):
                 trace_id = f"trace_{callstack_index+1:04d}"
                 self.logger.info(f"Skipping {trace_id} as it has already been analyzed")
                 return True  # Return True since it's already been processed
 
-            # Generate trace ID
             trace_id = f"trace_{callstack_index+1:04d}"
 
             if self.results_publisher:
-                # Convert callstack to list for lookup
                 callstack_list = []
                 if callstack_text:
                     callstack_list = [line.strip() for line in callstack_text.split('\n') if line.strip()]
@@ -244,18 +223,15 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                     self.logger.info(f"Skipping {trace_id} - trace already exists in prior result stores")
                     return True
 
-            # Create temporary output file for TraceCodeAnalysis
             output_filename = f"{trace_id}_analysis.json"
             output_file = os.path.join(trace_analysis_out_dir, output_filename)
 
-            # Create temporary prompt file for TraceCodeAnalysis (will be cleaned up)
             import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
                 temp_file.write(prompt_content)
                 temp_prompt_file = temp_file.name
 
             try:
-                # Create TraceAnalysisConfig for trace analysis
                 analysis_config = TraceAnalysisConfig(
                     prompt_file_path=temp_prompt_file,
                     api_key=self.api_key,
@@ -264,25 +240,19 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                     repo_path=self.repo_path,
                     output_file=output_file,
                     max_tokens=DEFAULT_MAX_TOKENS,
-                    temperature=DEFAULT_TEMPERATURE,
                     config=self.config
                 )
 
-                # Start function analysis tracking with callstack
                 if hasattr(self, '_start_function_analysis_tracking'):
                     self._start_function_analysis_tracking(callstack_text or trace_id)
 
-                # Create and run TraceCodeAnalysis
                 trace_analysis = TraceCodeAnalysis(analysis_config)
                 success = trace_analysis.run_analysis()
 
-                # Use centralized token tracking
                 if self.token_tracker:
-                    # Get real token counts from the TraceCodeAnalysis instance
                     input_tokens, output_tokens = trace_analysis.get_token_totals()
                     self.token_tracker.add_token_usage(input_tokens, output_tokens)
 
-                # Record function analysis result
                 if hasattr(self, '_record_function_analysis_result'):
                     self._record_function_analysis_result(
                         functions_analyzed=1,
@@ -291,22 +261,17 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                     )
 
                 if success:
-                    # Use publisher-subscriber system to handle results
                     if self.results_publisher:
                         try:
-                            # Read the analysis result from the output file
                             with open(output_file, 'r', encoding='utf-8') as f:
                                 result_data = json.load(f)
 
-                            # Extract repository name
                             repo_name = os.path.basename(self.repo_path.rstrip('/'))
 
-                            # Convert callstack text to list if available
                             callstack_list = []
                             if callstack_text:
                                 callstack_list = [line.strip() for line in callstack_text.split('\n') if line.strip()]
 
-                            # Apply unified two-level issue filter to issues before publishing
                             result_issues = result_data.get('results', []) or result_data.get('issues', [])
                             if self.unified_issue_filter and result_issues:
                                 self.logger.debug(f"Applying unified two-level issue filter to {len(result_issues)} issues for {trace_id}")
@@ -316,7 +281,6 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                                     dropped_count = len(result_issues) - len(filtered_issues)
                                     self.logger.info(f"Unified issue filter dropped {dropped_count} issues for {trace_id}")
                                     
-                                    # Update result data with filtered issues
                                     if 'results' in result_data:
                                         result_data['results'] = filtered_issues
                                     elif 'issues' in result_data:
@@ -324,7 +288,6 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                             elif not self.unified_issue_filter:
                                 self.logger.debug("Unified issue filter not available - publishing all issues")
 
-                            # Enhance result data with trace-specific information
                             enhanced_result = result_data.copy()
                             enhanced_result['trace_id'] = trace_id
                             enhanced_result['callstack'] = callstack_list
@@ -332,7 +295,6 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                             if callstack_data:
                                 enhanced_result['callstack_data'] = callstack_data
 
-                            # Publish the result using the publisher
                             self.results_publisher.add_trace_result(
                                 repo_name=repo_name,
                                 trace_id=trace_id,
@@ -356,7 +318,6 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                         self.logger.error("Publisher not available - cannot save analysis results")
                         return False
 
-                    # Add the callstack to the registry after successful analysis
                     if self.analyzed_records_registry and callstack_text:
                         self.analyzed_records_registry.add_analyzed(callstack_text)
 
@@ -365,7 +326,6 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                     return False
 
             finally:
-                # Clean up temporary prompt file
                 try:
                     os.unlink(temp_prompt_file)
                 except OSError:
@@ -416,7 +376,6 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             config: Configuration dictionary
             ast_files_config: AST files configuration with file paths
         """
-        # Check if all required AST files exist
         required_files = [
             ast_files_config.get('merged_functions_file'),
             ast_files_config.get('merged_graph_file'),
@@ -429,24 +388,17 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                 missing_files.append(file_path)
 
         if missing_files:
-            # Set up configuration for AST generation (similar to code_analyzer.py)
-            # Use the output directory from the singleton instead of JSON config
             ast_paths = self.get_default_ast_output_paths()
             config['astCallGraphDir'] = ast_paths['code_insights_dir']
 
-            # Ensure path_to_repo is in config (same key as code_analyzer)
             config['path_to_repo'] = self.repo_path
 
-            # Add directory analysis support (reused from code_analyzer.py)
             self._enhance_config_with_directory_analysis(config)
 
-            # Always generate AST files if any are missing
             self.logger.info("Generating AST call graphs...")
 
-            # Generate AST call graph (from base class)
             nested_call_graph_path = self._generate_ast_call_graph(config)
 
-            # Process the generated call graph (similar to code_analyzer.py)
             self._process_ast_call_graph(config, nested_call_graph_path)
 
             self.logger.info("AST files generated successfully!")
@@ -532,32 +484,26 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             config: Configuration dictionary
             nested_call_graph_path: Path to the nested call graph file
         """
-        # Extract configuration values
         ast_call_graph_dir = config['astCallGraphDir']
         repo_path = config['path_to_repo']
 
-        # Set up tracking and output paths
         tracking_file = os.path.join(ast_call_graph_dir, "processed_AST_cache.json")
         # Create analysis_input directory at the same level as code_insights, not inside it
         output_dir = os.path.join(os.path.dirname(ast_call_graph_dir), PROCESSED_OUTPUT_DIR)
 
-        # Ensure output directory exists
         os.makedirs(output_dir, exist_ok=True)
 
-        # Validate call graph file exists
         if not os.path.exists(nested_call_graph_path):
             self.logger.error(f"Call graph file not found: {nested_call_graph_path}")
             return
 
-        # Load and validate call graph structure
         call_graph_data = read_json_file(nested_call_graph_path)
-        if not call_graph_data or 'call_graph' not in call_graph_data:
+        if not call_graph_data or not isinstance(call_graph_data, list):
             self.logger.error(f"Invalid call graph structure in: {nested_call_graph_path}")
             return
 
-        # Count total functions for reporting
         total_functions = 0
-        for file_entry in call_graph_data['call_graph']:
+        for file_entry in call_graph_data:
             functions = file_entry.get('functions', [])
             total_functions += len(functions)
 
@@ -590,16 +536,13 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
         This should be called before starting trace analysis.
         """
         try:
-            # Initialize the publisher
             self.results_publisher = TraceAnalysisResultsPublisher()
             self.logger.info("Initialized TraceAnalysisResultsPublisher")
 
-            # Subscribe all registered subscribers to the publisher
             for subscriber in self._subscribers:
                 self.results_publisher.subscribe(subscriber)
                 self.logger.info(f"Subscribed {type(subscriber).__name__} to publisher")
 
-            # If we have a file system subscriber, load existing results for caching
             repo_name = os.path.basename(self.repo_path.rstrip('/'))
             for subscriber in self._subscribers:
                 if hasattr(subscriber, 'load_existing_results'):
@@ -627,7 +570,6 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
         """
         self.logger.info("Starting trace analysis on callstack data...")
 
-        # Initialize centralized token tracker if not already set
         if not self.token_tracker:
             llm_provider_type = get_llm_provider_type(config)
             self.token_tracker = TokenTracker(llm_provider_type)
@@ -638,23 +580,19 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             self.logger.info("Skipping trace analysis due to missing API key")
             return 0, 0
 
-        # Store API key and config for use in analysis
         self.api_key = api_key
         self.config = config
 
         # Initialize unified issue filter (disable LLM filtering for trace analysis)
         self._initialize_unified_issue_filter(api_key, config, enable_llm_filtering=False)
 
-        # Initialize publisher-subscriber system before analysis
         self._initialize_publisher_subscriber()
 
-        # Create output directory under results/
         output_provider = get_output_directory_provider()
         results_dir = self.get_results_directory()
         trace_analysis_out_dir = f"{results_dir}/trace_analysis"
         os.makedirs(trace_analysis_out_dir, exist_ok=True)
 
-        # Initialize tools for LLM to use
         ignore_dirs = set()
         if config.get('exclude_directories'):
             base_dirs_to_ignore = config.get('exclude_directories', [])
@@ -664,32 +602,26 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                 ignore_dirs.add(dir_pattern.upper())
                 ignore_dirs.add(dir_pattern.lower())
 
-        # Get FileContentProvider instance from AnalysisRunner
         file_content_provider = None
         try:
             file_content_provider = self.get_file_content_provider()
         except RuntimeError:
             self.logger.warning("FileContentProvider not available, continuing without it")
 
-        # Get the artifacts directory path (code_insights subdirectory for file lookups)
         artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
 
         tools = Tools(self.repo_path, None, file_content_provider, artifacts_dir, self.directory_tree_util, ignore_dirs)
 
-        # Create AST files configuration using base class path methods
         ast_files_config = self.get_complete_ast_files_config(
             repo_path=self.repo_path,
             output_base_dir=output_provider.get_custom_base_dir()
         )
 
-        # Ensure AST files exist
         self._ensure_ast_files_exist(config, ast_files_config)
 
-        # Create TraceAnalysisPromptBuilder instance for on-demand prompt generation
         prompt_builder = TraceAnalysisPromptBuilder(file_content_provider, ast_files_config)
         prompt_builder.repo_path = self.repo_path
 
-        # Load and validate configuration
         if not prompt_builder.load_and_validate_configuration(self.config_file, hotspot_file, self.repo_path):
             self.logger.error("Failed to load configuration for prompt builder")
             return 0, 0

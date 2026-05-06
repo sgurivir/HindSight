@@ -18,7 +18,7 @@ project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # Local imports - ordered alphabetically
-from hindsight.core.constants import DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT
+from hindsight.core.constants import DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT, DEFAULT_MAX_TOKENS
 from hindsight.core.llm.llm import Claude, ClaudeConfig
 from hindsight.core.llm.tools import Tools
 from hindsight.utils.config_util import load_and_validate_config, get_llm_provider_type, get_api_key_from_config
@@ -26,6 +26,7 @@ from hindsight.utils.directory_tree_util import DirectoryTreeUtil
 from hindsight.utils.file_content_provider import FileContentProvider
 from hindsight.utils.log_util import get_logger, setup_default_logging
 from hindsight.utils.output_directory_provider import get_output_directory_provider
+from hindsight.core.prompts.fallback_prompts import FALLBACK_FILE_SUMMARY_SYSTEM
 
 # Initialize logging
 setup_default_logging()
@@ -47,7 +48,7 @@ def load_system_prompt() -> str:
         # Use basic logging if logger not available yet
         logger.warning(f"Could not load system prompt from {prompt_file}: {e}")
         # Fallback to a basic prompt
-        return """You are a code analysis expert. Analyze the provided file and generate a 2-3 line summary of what it does, its key components, and its role in the codebase. Use the available tools (readFile, runTerminalCmd, list_files) to understand the file before generating your summary."""
+        return FALLBACK_FILE_SUMMARY_SYSTEM
 
 
 class FileOrDirectorySummaryGenerator:
@@ -168,8 +169,7 @@ class FileOrDirectorySummaryGenerator:
             api_key=self.api_key,
             api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
             model=self.config.get('model', DEFAULT_LLM_MODEL),
-            max_tokens=self.config.get('max_tokens', 64000),
-            temperature=self.config.get('temperature', 0.1),
+            max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
             provider_type=self.llm_provider
         )
         
@@ -208,7 +208,17 @@ class FileOrDirectorySummaryGenerator:
             system_prompt = load_system_prompt()
             
             # Create user prompt requesting file summary
-            user_prompt = f"""Please analyze the file '{relative_path}' and provide a 2-3 line summary of what it does.
+            user_prompt_template = None
+            try:
+                template_path = Path(__file__).parent.parent / "prompts" / "fileSummaryUserPrompt.md"
+                user_prompt_template = template_path.read_text(encoding='utf-8')
+            except Exception:
+                pass
+
+            if user_prompt_template:
+                user_prompt = user_prompt_template.replace("{relative_path}", relative_path)
+            else:
+                user_prompt = f"""Please analyze the file '{relative_path}' and provide a 2-3 line summary of what it does.
 
 Use the available tools to read the file contents and understand its purpose. Focus on:
 1. What the file's primary function or purpose is

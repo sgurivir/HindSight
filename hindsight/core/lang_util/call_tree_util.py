@@ -38,10 +38,6 @@ def extract_implementations(data: Any) -> Dict[str, List[Dict[str, Any]]]:
     # Handle both direct list format and wrapped dict format
     if isinstance(data, list):
         call_graph_data = data
-    elif isinstance(data, dict):
-        call_graph_data = data.get('call_graph', data.get('files', []))
-        if isinstance(call_graph_data, dict):
-            call_graph_data = []
     else:
         call_graph_data = []
     
@@ -261,13 +257,12 @@ def build_call_tree_node(
     sort_by_depth: bool = True
 ) -> Dict[str, Any]:
     """
-    Recursively build a call tree node with its children.
-    
-    Performance optimizations:
-    - Uses pre-computed depths (O(1) lookup) instead of computing on-demand
-    - Sorts using tuple keys for efficient comparison
-    - Uses set operations for visited tracking
-    
+    Build a call tree node with only one level of callees.
+
+    Each node lists its direct children (function signature + location),
+    but children have empty children arrays. An orchestrator can re-lookup
+    any child in the JSON to find its own callees.
+
     Args:
         func: The function name for this node
         dag_edges: The DAG edges
@@ -275,41 +270,38 @@ def build_call_tree_node(
         visited: Set of already visited nodes (to prevent infinite recursion)
         depths: Pre-computed subtree depths for all nodes (from compute_all_subtree_depths)
         sort_by_depth: If True, sort children by subtree depth (longest first)
-        
+
     Returns:
-        Dictionary representing the call tree node
+        Dictionary representing the call tree node with one level of callees
     """
     node = {
         "function": func,
         "location": implementations.get(func, []),
         "children": []
     }
-    
-    # Mark as visited - create new set to avoid mutation
-    visited = visited | {func}
-    
+
     # Get children from DAG
     children = dag_edges.get(func, set())
-    
+
     # Filter out already visited children
-    unvisited_children = [c for c in children if c not in visited]
-    
+    visited_with_self = visited | {func}
+    unvisited_children = [c for c in children if c not in visited_with_self]
+
     # Sort children
     if sort_by_depth and depths:
-        # Sort by depth (descending), then alphabetically for ties
-        # Using tuple comparison is faster than lambda with multiple keys
         unvisited_children.sort(key=lambda c: (-depths.get(c, 0), c))
     else:
         unvisited_children.sort()
-    
-    # Build child nodes
+
+    # Build child nodes with only signature info (no further recursion)
     for child in unvisited_children:
-        child_node = build_call_tree_node(
-            child, dag_edges, implementations, visited,
-            depths, sort_by_depth
-        )
+        child_node = {
+            "function": child,
+            "location": implementations.get(child, []),
+            "children": []
+        }
         node["children"].append(child_node)
-    
+
     return node
 
 
@@ -320,55 +312,48 @@ def generate_call_tree(
     sort_by_depth: bool = True
 ) -> Dict[str, Any]:
     """
-    Generate the complete call tree JSON structure with a synthetic ROOT node.
-    
-    Performance characteristics:
-    - O(N + E) for depth computation (single pass)
-    - O(N log N) for sorting (using Timsort)
-    - O(N) for tree construction
-    - Total: O(N + E + N log N) = O(N log N + E) for typical graphs
-    
+    Generate a flat call tree where each function has only one level of callees.
+
+    Every function in the graph is a direct child of ROOT, each listing only
+    its immediate callees (one level deep). An orchestrator or client can
+    re-lookup any callee by name to find its own callees.
+
     Args:
         graph: The CallGraph instance
         dag_edges: The DAG edges after cycle breaking
         implementations: Implementation locations for each function
-        sort_by_depth: If True, sort branches by depth (longest first, default: True)
-        
+        sort_by_depth: If True, sort entries by depth (longest first, default: True)
+
     Returns:
         Dictionary containing the call tree structure with ROOT at top
     """
-    # Find root nodes in the DAG
     root_nodes = get_dag_root_nodes(graph, dag_edges)
-    
-    # Pre-compute ALL depths in a single O(N+E) pass
-    # This is the key optimization - we compute once and reuse everywhere
+
     depths: Dict[str, int] = {}
     if sort_by_depth:
         depths = compute_all_subtree_depths(dag_edges, graph.nodes)
-    
-    # Sort root nodes
+
+    # Build one entry per function, each with only direct callees
+    all_functions = list(graph.nodes)
     if sort_by_depth and depths:
-        # Sort by depth (descending), then alphabetically for ties
-        sorted_roots = sorted(root_nodes, key=lambda r: (-depths.get(r, 0), r))
+        all_functions.sort(key=lambda f: (-depths.get(f, 0), f))
     else:
-        sorted_roots = sorted(root_nodes)
-    
-    # Build call tree starting from each root
+        all_functions.sort()
+
     children = []
-    for root in sorted_roots:
-        tree_node = build_call_tree_node(
-            root, dag_edges, implementations, set(),
+    for func in all_functions:
+        node = build_call_tree_node(
+            func, dag_edges, implementations, set(),
             depths, sort_by_depth
         )
-        children.append(tree_node)
-    
-    # Create synthetic ROOT node with all entry points as children
+        children.append(node)
+
     call_tree = {
         "function": "ROOT",
         "location": [],
         "children": children
     }
-    
+
     return {
         "call_tree": call_tree,
         "metadata": {

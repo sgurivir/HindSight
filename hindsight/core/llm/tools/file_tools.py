@@ -49,17 +49,14 @@ class FileToolsMixin:
         # keep existing accounting
         try:
             self.tool_usage_stats['readFile']['count'] += 1
-        except Exception:
+        except (KeyError, TypeError):
             pass
 
         resolved_path, original_string = self._resolve_file_path(file_path)
 
         if not resolved_path:
             msg = f"File '{original_string}' cannot be found"
-            try:
-                logger.error(f"[TOOL] readFile - {msg}")
-            except Exception:
-                pass
+            logger.error(f"[TOOL] readFile - {msg}")
             return msg
 
         # Read file (keep tolerant behavior)
@@ -86,18 +83,11 @@ class FileToolsMixin:
                     comment_header = f"// File is too large. Here is pruned context for file {relative_path}\n"
                     final_text = comment_header + pruned_text
 
-                    try:
-                        logger.info(f"[TOOL] readFile - Read and pruned large file: {resolved_path} "
-                                    f"({len(text)} chars -> {len(final_text)} chars after pruning) in {time.time()-start_time:.3f}s")
-                    except Exception:
-                        pass
+                    logger.info(f"[TOOL] readFile - Read and pruned large file: {resolved_path} "
+                                f"({len(text)} chars -> {len(final_text)} chars after pruning) in {time.time()-start_time:.3f}s")
                     return final_text
                 except Exception as e:
-                    # If pruning fails, fall back to regular processing with truncation warning
-                    try:
-                        logger.warning(f"[TOOL] readFile - Pruning failed for large file {resolved_path}: {e}, using regular processing")
-                    except Exception:
-                        pass
+                    logger.warning(f"[TOOL] readFile - Pruning failed for large file {resolved_path}: {e}, using regular processing")
 
             # Apply CodeContextPruner to add line numbers and prune code for normal-sized files
             try:
@@ -106,30 +96,17 @@ class FileToolsMixin:
                 # Then prune code (keep signatures and comments, remove implementations) while preserving line numbers
                 processed_text = CodeContextPruner.prune_code(numbered_text)
 
-                try:
-                    logger.info(f"[TOOL] readFile - Read OK: {resolved_path} "
-                                f"({len(text)} bytes -> {len(processed_text)} bytes after processing) in {time.time()-start_time:.3f}s")
-                except Exception:
-                    pass
+                logger.info(f"[TOOL] readFile - Read OK: {resolved_path} "
+                            f"({len(text)} bytes -> {len(processed_text)} bytes after processing) in {time.time()-start_time:.3f}s")
                 return processed_text
             except Exception as e:
-                # If CodeContextPruner fails, fall back to original text
-                try:
-                    logger.warning(f"[TOOL] readFile - CodeContextPruner failed for {resolved_path}: {e}, returning original text")
-                except Exception:
-                    pass
-                try:
-                    logger.info(f"[TOOL] readFile - Read OK: {resolved_path} "
-                                f"({len(text)} bytes) in {time.time()-start_time:.3f}s")
-                except Exception:
-                    pass
+                logger.warning(f"[TOOL] readFile - CodeContextPruner failed for {resolved_path}: {e}, returning original text")
+                logger.info(f"[TOOL] readFile - Read OK: {resolved_path} "
+                            f"({len(text)} bytes) in {time.time()-start_time:.3f}s")
                 return text
         except Exception as e:
             err = f"Error: Failed to read file '{resolved_path}': {e}"
-            try:
-                logger.error(f"[TOOL] readFile - {err}")
-            except Exception:
-                pass
+            logger.error(f"[TOOL] readFile - {err}")
             return err
 
     def execute_get_file_content_by_lines_tool(
@@ -359,7 +336,8 @@ class FileToolsMixin:
                             content = f.read()
                             char_count = len(content)
                             line_count = len(content.splitlines())
-                    except Exception:
+                    except (OSError, UnicodeDecodeError) as e:
+                        logger.debug(f"[TOOL] checkFileSize - Could not read {resolved_path} as text: {e}")
                         # If we can't read as text, just use byte count
                         char_count = file_size_bytes
                         line_count = -1

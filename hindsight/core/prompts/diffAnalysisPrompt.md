@@ -127,7 +127,6 @@ Use tools when you need additional context beyond the diff:
 
 **Exploration:**
 - `readFile`: File contents (check size with `checkFileSize` first)
-- `findSpecificFilesWithSearchString`: Locate files with text
 - `list_files`: List files and directories within a specified directory
 
 **Analysis:**
@@ -235,7 +234,7 @@ Need to understand code?
 │   │   └── Small file → Use readFile
 │   └── NO → Continue to next question
 ├── Need to search/explore/find
-│   └── YES → Use runTerminalCmd with grep, findSpecificFilesWithSearchString, or list_files
+│   └── YES → Use runTerminalCmd with grep or list_files
 ├── Need to list directory contents
 │   └── YES → Use list_files
 └── If unsure → Use list_files first, then getSummaryOfFile, then checkFileSize + readFile as needed

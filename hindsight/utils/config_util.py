@@ -10,6 +10,7 @@ import sys
 from typing import Dict, Any, List, Union, Optional, Tuple
 from .file_util import read_json_file
 from .log_util import get_logger
+from ..core.exceptions import ConfigurationError
 
 logger = get_logger(__name__)
 
@@ -70,7 +71,7 @@ def validate_llm_provider_type(provider_type: str) -> None:
         raise ValueError(f"Unsupported provider type: {provider_type}. Supported types: {', '.join(SUPPORTED_LLM_PROVIDER_TYPES)}")
 
 
-class ConfigValidationError(Exception):
+class ConfigValidationError(ConfigurationError):
     """Custom exception for configuration validation errors."""
     pass
 

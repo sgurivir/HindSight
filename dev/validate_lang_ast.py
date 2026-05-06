@@ -138,7 +138,7 @@ class ASTValidator:
                 # Check for classes file first (most specific pattern)
                 if 'data_type_to_location_and_checksum' in content:
                     return {'type': 'classes', 'valid_start': True}
-                elif 'call_graph' in content:
+                elif 'functions_invoked' in content or 'invoked_by' in content:
                     return {'type': 'call_graph', 'valid_start': True}
                 elif 'checksum' in content and 'code' in content:
                     return {'type': 'functions', 'valid_start': True}
@@ -243,7 +243,7 @@ class ASTValidator:
             if structure_info.get('type') != 'call_graph':
                 self.results.add_error(
                     'invalid_json_schema',
-                    "Call graph file does not contain expected 'call_graph' key"
+                    "Call graph file does not contain expected call graph structure"
                 )
                 return False
             
@@ -286,16 +286,13 @@ class ASTValidator:
             
             with open(self.call_graph_file, 'rb') as f:
                 data = orjson.loads(f.read())
-                
-                if 'call_graph' not in data:
-                    self.results.add_error('invalid_json_schema', "Missing 'call_graph' key in call graph file")
+
+                if not isinstance(data, list):
+                    self.results.add_error('invalid_json_schema', "Call graph file should be a list")
                     return
-                
-                call_graph = data['call_graph']
-                if not isinstance(call_graph, list):
-                    self.results.add_error('invalid_json_schema', "'call_graph' should be a list")
-                    return
-                
+
+                call_graph = data
+
                 for file_entry in call_graph:
                     if isinstance(file_entry, dict) and 'file' in file_entry:
                         file_path = file_entry['file']
@@ -404,16 +401,13 @@ class ASTValidator:
             
             with open(self.call_graph_file, 'rb') as f:
                 data = orjson.loads(f.read())
-                
-                if 'call_graph' not in data:
-                    self.results.add_error('invalid_json_schema', "Missing 'call_graph' key in call graph file")
+
+                if not isinstance(data, list):
+                    self.results.add_error('invalid_json_schema', "Call graph file should be a list")
                     return
-                
-                call_graph = data['call_graph']
-                if not isinstance(call_graph, list):
-                    self.results.add_error('invalid_json_schema', "'call_graph' should be a list")
-                    return
-                
+
+                call_graph = data
+
                 # Extract functions_invoked from call graph entries
                 for file_entry in call_graph:
                     if isinstance(file_entry, dict) and 'functions' in file_entry:
@@ -551,16 +545,13 @@ class ASTValidator:
             
             with open(self.call_graph_file, 'rb') as f:
                 data = orjson.loads(f.read())
-                
-                if 'call_graph' not in data:
-                    self.results.add_error('invalid_json_schema', "Missing 'call_graph' key in call graph file")
+
+                if not isinstance(data, list):
+                    self.results.add_error('invalid_json_schema', "Call graph file should be a list")
                     return
-                
-                call_graph = data['call_graph']
-                if not isinstance(call_graph, list):
-                    self.results.add_error('invalid_json_schema', "'call_graph' should be a list")
-                    return
-                
+
+                call_graph = data
+
                 for file_entry in call_graph:
                     if isinstance(file_entry, dict) and 'functions' in file_entry:
                         functions = file_entry['functions']

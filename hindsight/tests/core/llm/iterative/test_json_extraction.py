@@ -248,13 +248,10 @@ class TestCrossAnalyzerIsolation:
         analyzer = ContextCollectionAnalyzer(claude=self.mock_claude)
         
         result = analyzer.extract_json(issue_array_response)
-        # Arrays are rejected - ContextCollectionAnalyzer expects dicts
-        # However, the array contains a dict, so the fallback extracts it
-        # The analyzer extracts dicts from arrays as a fallback (see lines 81-93)
-        # Since the array contains a dict (issue object), it extracts that dict
-        assert result is not None, "Should extract dict from array as fallback"
-        parsed = json.loads(result)
-        assert isinstance(parsed, dict), "Should extract the dict from the array"
+        # Arrays without a dict containing 'primary_function' are rejected.
+        # The array contains an issue dict (no 'primary_function'), so
+        # extract_json returns None to trigger the retry loop.
+        assert result is None, "Should return None for array without primary_function dict"
 
     def test_code_analysis_rejects_context_bundle(self):
         """CodeAnalysisAnalyzer should reject context bundle dicts."""

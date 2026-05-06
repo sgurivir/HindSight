@@ -28,10 +28,8 @@ class DirectoryTreeUtil:
             joined.relative_to(repo_root)
             if joined.exists():
                 return joined
-        except Exception:
+        except ValueError:
             pass
-
-        # 3) recursive tail match
         want_parts = Path(rel).parts
         matches = []
         for p in repo_root.rglob('*'):
@@ -42,7 +40,7 @@ class DirectoryTreeUtil:
                 # If that fails, try with resolved paths
                 try:
                     rp = p.resolve().relative_to(repo_root.resolve())
-                except Exception:
+                except ValueError:
                     continue
             if rp.parts[-len(want_parts):] == want_parts:
                 matches.append(p)

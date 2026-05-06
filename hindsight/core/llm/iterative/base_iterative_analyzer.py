@@ -238,12 +238,9 @@ class BaseIterativeAnalyzer(ABC):
                 self.conversation_state.add_user_message(soft_reminder_guidance)
                 logger.info(f"[{stage_name}] Soft reminder at iteration {iteration} - encouraging output generation")
 
-            # Check if we need to send system prompt based on TTL logic
-            should_send_system = ttl_manager.should_resend_system_prompt(system_prompt)
-            
             # Send complete conversation history to maintain context across iterations
             full_conversation = self.conversation_state.get_full_conversation()
-            
+
             # Add contextual guidance for tool results if this is not the first iteration
             if iteration > 1 and context_guidance_template:
                 contextual_message = context_guidance_template.format(
@@ -251,28 +248,22 @@ class BaseIterativeAnalyzer(ABC):
                 )
                 self.conversation_state.add_user_message(contextual_message)
                 full_conversation = self.conversation_state.get_full_conversation()
-            
-            if should_send_system or not system_prompt_sent:
-                # Send with system prompt (first time or TTL expired)
-                response = self.claude.send_message_with_system(
-                    system_prompt=system_prompt,
-                    messages=full_conversation,
-                    enable_system_cache=True,
-                    cache_ttl="1h"
-                )
 
-                # Record that system prompt was sent
+            # Always send system prompt — the API is stateless, each request is
+            # independent. The enable_system_cache flag lets the server avoid
+            # re-tokenizing the same content, but the prompt must still be present.
+            response = self.claude.send_message_with_system(
+                system_prompt=system_prompt,
+                messages=full_conversation,
+                enable_system_cache=True,
+                cache_ttl="1h"
+            )
+
+            # Record that system prompt was sent for TTL-based cache optimization
+            if not system_prompt_sent:
                 ttl_manager.record_system_prompt_sent(system_prompt)
                 system_prompt_sent = True
-                logger.info(f"[{stage_name}] System prompt sent in iteration {iteration} with {len(full_conversation)} messages")
-            else:
-                # Send without system prompt (use cached version)
-                response = self.claude.send_message(
-                    messages=full_conversation,
-                    enable_system_cache=True,
-                    cache_ttl="1h"
-                )
-                logger.info(f"[{stage_name}] Using cached system prompt in iteration {iteration} with {len(full_conversation)} messages")
+            logger.info(f"[{stage_name}] Iteration {iteration} sent with system prompt and {len(full_conversation)} messages")
 
             if not response or "error" in response:
                 logger.error(f"[{stage_name}] API error in iteration {iteration}")
@@ -497,59 +488,94 @@ class BaseIterativeAnalyzer(ABC):
     def _find_all_json_objects(self, content: str) -> List[str]:
         """
         Find all valid JSON objects in content, sorted by size (largest first).
-        
+
+        Uses string-aware brace matching: braces inside JSON string values
+        (delimited by unescaped double quotes) are ignored so that embedded
+        source code does not corrupt the extraction boundary.
+
         Args:
             content: Content to search for JSON objects
-            
+
         Returns:
             List of valid JSON object strings, sorted by size (largest first)
         """
         candidates = []
+        content_len = len(content)
         for i, char in enumerate(content):
             if char == '{':
                 brace_count = 1
-                for j in range(i + 1, len(content)):
-                    if content[j] == '{':
-                        brace_count += 1
-                    elif content[j] == '}':
-                        brace_count -= 1
-                        if brace_count == 0:
-                            potential = content[i:j + 1]
-                            try:
-                                json.loads(potential)
-                                candidates.append(potential)
-                            except json.JSONDecodeError:
-                                pass
-                            break
+                in_string = False
+                j = i + 1
+                while j < content_len:
+                    c = content[j]
+                    if in_string:
+                        if c == '\\':
+                            j += 2
+                            continue
+                        if c == '"':
+                            in_string = False
+                    else:
+                        if c == '"':
+                            in_string = True
+                        elif c == '{':
+                            brace_count += 1
+                        elif c == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                potential = content[i:j + 1]
+                                try:
+                                    json.loads(potential)
+                                    candidates.append(potential)
+                                except json.JSONDecodeError:
+                                    pass
+                                break
+                    j += 1
         candidates.sort(key=len, reverse=True)
         return candidates
-    
+
     def _find_all_json_arrays(self, content: str) -> List[str]:
         """
         Find all valid JSON arrays in content, sorted by size (largest first).
-        
+
+        Uses string-aware bracket matching: brackets inside JSON string values
+        are ignored.
+
         Args:
             content: Content to search for JSON arrays
-            
+
         Returns:
             List of valid JSON array strings, sorted by size (largest first)
         """
         candidates = []
+        content_len = len(content)
         for i, char in enumerate(content):
             if char == '[':
                 bracket_count = 1
-                for j in range(i + 1, len(content)):
-                    if content[j] == '[':
-                        bracket_count += 1
-                    elif content[j] == ']':
-                        bracket_count -= 1
-                        if bracket_count == 0:
-                            potential = content[i:j + 1]
-                            try:
-                                json.loads(potential)
-                                candidates.append(potential)
-                            except json.JSONDecodeError:
-                                pass
-                            break
+                in_string = False
+                j = i + 1
+                while j < content_len:
+                    c = content[j]
+                    if in_string:
+                        if c == '\\':
+                            j += 2
+                            continue
+                        if c == '"':
+                            in_string = False
+                    else:
+                        if c == '"':
+                            in_string = True
+                        elif c == '[':
+                            bracket_count += 1
+                        elif c == ']':
+                            bracket_count -= 1
+                            if bracket_count == 0:
+                                potential = content[i:j + 1]
+                                try:
+                                    json.loads(potential)
+                                    candidates.append(potential)
+                                except json.JSONDecodeError:
+                                    pass
+                                break
+                    j += 1
         candidates.sort(key=len, reverse=True)
         return candidates

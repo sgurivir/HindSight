@@ -438,3 +438,89 @@ class TestFilteredFileFinderDirectoryExclusion:
         """Test non-excluded directory."""
         assert finder_with_excludes._is_directory_excluded("src") is False
         assert finder_with_excludes._is_directory_excluded("Daemon/Other") is False
+
+
+class TestPartialPathMatching:
+    """Tests for multi-component partial path matching."""
+
+    def test_multi_component_include_prefix(self):
+        """B/C pattern matches B/C/file.txt (prefix)."""
+        result = FilteredFileFinder.should_analyze_by_directory_filters(
+            "B/C/file.txt", include_directories=["B/C"])
+        assert result is True
+
+    def test_multi_component_include_partial(self):
+        """B/C pattern matches A/B/C/file.txt (partial)."""
+        result = FilteredFileFinder.should_analyze_by_directory_filters(
+            "A/B/C/file.txt", include_directories=["B/C"])
+        assert result is True
+
+    def test_multi_component_include_deep(self):
+        """B/C pattern matches X/Y/B/C/Z/file.txt (deep)."""
+        result = FilteredFileFinder.should_analyze_by_directory_filters(
+            "X/Y/B/C/Z/file.txt", include_directories=["B/C"])
+        assert result is True
+
+    def test_multi_component_include_no_match(self):
+        """B/C pattern does NOT match A/B/D/file.txt."""
+        result = FilteredFileFinder.should_analyze_by_directory_filters(
+            "A/B/D/file.txt", include_directories=["B/C"])
+        assert result is False
+
+    def test_multi_component_exclude_prefix(self):
+        """B/C exclude matches B/C/file.txt."""
+        result = FilteredFileFinder.should_analyze_by_directory_filters(
+            "B/C/file.txt", exclude_directories=["B/C"])
+        assert result is False
+
+    def test_multi_component_exclude_partial(self):
+        """B/C exclude matches A/B/C/file.txt (partial)."""
+        result = FilteredFileFinder.should_analyze_by_directory_filters(
+            "A/B/C/file.txt", exclude_directories=["B/C"])
+        assert result is False
+
+    def test_single_name_include_matches_nested(self):
+        """Single name 'Orange' matches apps/Orange/file.txt."""
+        result = FilteredFileFinder.should_analyze_by_directory_filters(
+            "apps/Orange/file.txt", include_directories=["Orange"])
+        assert result is True
+
+    def test_single_name_exclude_matches_nested(self):
+        """Single name 'tests' excludes src/tests/file.txt."""
+        result = FilteredFileFinder.should_analyze_by_directory_filters(
+            "src/tests/file.txt", exclude_directories=["tests"])
+        assert result is False
+
+    def test_include_child_exclude_parent_partial(self):
+        """Include 'src/main' + exclude 'src' → child included."""
+        result = FilteredFileFinder.should_analyze_by_directory_filters(
+            "apps/src/main/app.py",
+            include_directories=["src/main"],
+            exclude_directories=["src"])
+        assert result is True
+
+    def test_include_parent_exclude_child_partial(self):
+        """Include 'src' + exclude 'src/tests' → child excluded."""
+        result = FilteredFileFinder.should_analyze_by_directory_filters(
+            "apps/src/tests/test.py",
+            include_directories=["src"],
+            exclude_directories=["src/tests"])
+        assert result is False
+
+    def test_matches_directory_component_multi(self):
+        """_matches_directory_component handles multi-component patterns."""
+        assert FilteredFileFinder._matches_directory_component("A/B/C/file.txt", "B/C") is True
+        assert FilteredFileFinder._matches_directory_component("A/B/D/file.txt", "B/C") is False
+
+    def test_is_file_in_directory_partial(self):
+        """_is_file_in_directory handles partial path matching."""
+        assert FilteredFileFinder._is_file_in_directory("apps/Orange/file.txt", "Orange") is True
+        assert FilteredFileFinder._is_file_in_directory("A/B/C/file.txt", "B/C") is True
+
+    def test_is_directory_excluded_partial(self):
+        """_is_directory_excluded handles partial path matching."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            finder = FilteredFileFinder(tmpdir, exclude_directories=["B/C"])
+            assert finder._is_directory_excluded("A/B/C") is True
+            assert finder._is_directory_excluded("A/B/C/D") is True
+            assert finder._is_directory_excluded("A/B/D") is False

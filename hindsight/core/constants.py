@@ -6,9 +6,8 @@ Core constants used across the Hindsight analysis system
 
 # Common constants for analysis
 DEFAULT_MAX_TOKENS = 64000
-DEFAULT_TEMPERATURE = 0.1
-DEFAULT_API_RATE_LIMIT = 80  # requests per 4 minutes 10 seconds
-DEFAULT_RATE_LIMIT_WINDOW = 250  # seconds (4 minutes 10 seconds)
+DEFAULT_API_RATE_LIMIT = 160  # requests per 4 minutes (40/min)
+DEFAULT_RATE_LIMIT_WINDOW = 240  # seconds (4 minutes)
 DEFAULT_LOGS_DIR = "logs"
 DEFAULT_DIFF_DAYS = 21  # Default number of days to look back for recently modified files
 MAX_TOOL_ITERATIONS = 20  # Maximum iterations for LLM tool usage
@@ -28,6 +27,14 @@ DEFAULT_NUM_BLOCKS_TO_ANALYZE = 10  # Default number of blocks to analyze for di
 MAX_FILES_PER_DIFF_CHUNK = 8  # Maximum number of files per diff analysis chunk
 MAX_SUPPORTED_FILE_COUNT = 14000  # Maximum number of files with supported extensions to analyze
 CANCELLATION_CHECK_INTERVAL = 1  # Check for cancellation every N functions during analysis
+
+# External input analysis constants
+EXTERNAL_INPUT_RATE_LIMIT = 40  # Maximum LLM requests per minute (160 per 4min quota)
+EXTERNAL_INPUT_DEFAULT_WORKERS = 3  # Default parallel workers for external input analysis
+EXTERNAL_INPUT_MAX_TOOL_ITERATIONS = 10  # Max tool iterations per function analysis
+EXTERNAL_INPUT_BATCH_SIZE = 8  # Functions per batch in batched analysis mode
+EXTERNAL_INPUT_TOKEN_BUDGET_RATIO = 0.5  # Use at most 50% of context window for input (leaves room for output)
+EXTERNAL_INPUT_CHARS_PER_TOKEN = 4  # Approximate chars per token for budget estimation
 
 # AST generation constants
 AST_GENERATION_TIMEOUT_SECS = 3600  # Timeout for AST generation subprocess (1 hour)
@@ -104,6 +111,130 @@ DEFAULT_LLM_PROVIDER_TYPE = "aws_bedrock"
 
 DEFAULT_ISSUE_FILTERING_MODEL = ""
 DEFAULT_RESPONSE_CHALLENGE_MODEL = ""
+
+# Model identifiers
+MODEL_CLAUDE_OPUS_4_7 = "anthropic.claude-opus-4-7"
+MODEL_CLAUDE_OPUS_4_5 = "anthropic.claude-opus-4-5-20251101-v1:0"
+MODEL_CLAUDE_SONNET_4_5 = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+MODEL_CLAUDE_SONNET_3_5_V2 = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+MODEL_CLAUDE_SONNET_3_5 = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+MODEL_CLAUDE_HAIKU_3_5 = "anthropic.claude-3-5-haiku-20241022-v1:0"
+MODEL_CLAUDE_OPUS_3 = "anthropic.claude-3-opus-20240229-v1:0"
+MODEL_CLAUDE_SONNET_3 = "anthropic.claude-3-sonnet-20240229-v1:0"
+MODEL_CLAUDE_HAIKU_3 = "anthropic.claude-3-haiku-20240307-v1:0"
+
+# Data flow analyzer defaults
+DATA_FLOW_ANALYZER_MODEL = MODEL_CLAUDE_OPUS_4_7
+DATA_FLOW_ANALYZER_MAX_TOKENS = 84_000
+
+
+class ModelLimits:
+    """Provides context window length limits per model.
+
+    Context window is the total token budget (input + output) for a single request.
+    Max output tokens is the maximum response length the API will accept.
+    Use get_context_window() and get_max_output_tokens() to look up limits.
+    """
+
+    _CONTEXT_WINDOWS = {
+        # Claude 4.7 family — 1M context
+        MODEL_CLAUDE_OPUS_4_7: 1_000_000,
+        # Claude 4.5 family — 1M context
+        MODEL_CLAUDE_OPUS_4_5: 1_000_000,
+        MODEL_CLAUDE_SONNET_4_5: 1_000_000,
+        # Claude 3.5 family — 200K context
+        MODEL_CLAUDE_SONNET_3_5_V2: 200_000,
+        MODEL_CLAUDE_SONNET_3_5: 200_000,
+        MODEL_CLAUDE_HAIKU_3_5: 200_000,
+        # Claude 3 family — 200K context
+        MODEL_CLAUDE_OPUS_3: 200_000,
+        MODEL_CLAUDE_SONNET_3: 200_000,
+        MODEL_CLAUDE_HAIKU_3: 200_000,
+    }
+
+    _MAX_OUTPUT_TOKENS = {
+        # Claude 4.7 family
+        MODEL_CLAUDE_OPUS_4_7: 128_000,
+        # Claude 4.5 family
+        MODEL_CLAUDE_OPUS_4_5: 128_000,
+        MODEL_CLAUDE_SONNET_4_5: 128_000,
+        # Claude 3.5 family
+        MODEL_CLAUDE_SONNET_3_5_V2: 8_192,
+        MODEL_CLAUDE_SONNET_3_5: 8_192,
+        MODEL_CLAUDE_HAIKU_3_5: 8_192,
+        # Claude 3 family
+        MODEL_CLAUDE_OPUS_3: 4_096,
+        MODEL_CLAUDE_SONNET_3: 4_096,
+        MODEL_CLAUDE_HAIKU_3: 4_096,
+    }
+
+    # Keyword-based fallback mapping for partial model string matching
+    _FAMILY_CONTEXT_WINDOWS = {
+        "opus-4": 1_000_000,
+        "sonnet-4": 1_000_000,
+        "claude-4": 1_000_000,
+        "opus-3": 200_000,
+        "sonnet-3": 200_000,
+        "haiku-3": 200_000,
+    }
+
+    _FAMILY_MAX_OUTPUT_TOKENS = {
+        "opus-4": 128_000,
+        "sonnet-4": 128_000,
+        "claude-4": 128_000,
+        "opus-3": 4_096,
+        "sonnet-3": 4_096,
+        "haiku-3": 4_096,
+    }
+
+    DEFAULT_CONTEXT_WINDOW = 200_000
+    DEFAULT_MAX_OUTPUT_TOKENS = 8_192
+
+    @classmethod
+    def _normalize_model(cls, model: str) -> str:
+        """Normalize model string for lookup."""
+        normalized = model.lower()
+        if ":" in normalized and not normalized.startswith("anthropic"):
+            normalized = normalized.split(":", 1)[1]
+        return normalized
+
+    @classmethod
+    def get_context_window(cls, model: str) -> int:
+        """Return the context window size in tokens for the given model string.
+
+        Handles both full model IDs (e.g. 'anthropic.claude-opus-4-5-20251101-v1:0')
+        and prefixed variants (e.g. 'aws:anthropic.claude-opus-4-5-20251101-v1:0').
+        """
+        normalized = cls._normalize_model(model)
+
+        for model_id, limit in cls._CONTEXT_WINDOWS.items():
+            if model_id.lower() in normalized:
+                return limit
+
+        for family_key, limit in cls._FAMILY_CONTEXT_WINDOWS.items():
+            if family_key in normalized:
+                return limit
+
+        return cls.DEFAULT_CONTEXT_WINDOW
+
+    @classmethod
+    def get_max_output_tokens(cls, model: str) -> int:
+        """Return the maximum output tokens the API accepts for the given model.
+
+        This is the cap for the 'max_tokens' parameter in API requests.
+        """
+        normalized = cls._normalize_model(model)
+
+        for model_id, limit in cls._MAX_OUTPUT_TOKENS.items():
+            if model_id.lower() in normalized:
+                return limit
+
+        for family_key, limit in cls._FAMILY_MAX_OUTPUT_TOKENS.items():
+            if family_key in normalized:
+                return limit
+
+        return cls.DEFAULT_MAX_OUTPUT_TOKENS
+
 
 DEFAULT_EXCLUDE_DIRECTORY_NAMES = [
     "Tests", "Test", "bin", "third_party", "protobuf", "protobufs", ".git", "docs"

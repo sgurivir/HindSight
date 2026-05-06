@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hindsight.core.constants import MODEL_CLAUDE_SONNET_3_5_V2
+
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
@@ -115,7 +117,7 @@ def sample_config(temp_dir) -> Dict[str, Any]:
     return {
         'project_name': 'test-project',
         'api_end_point': 'https://api.anthropic.com/v1/messages',
-        'model': 'claude-3-5-sonnet-20241022',
+        'model': MODEL_CLAUDE_SONNET_3_5_V2,
         'llm_provider_type': 'aws_bedrock',
         'path_to_repo': temp_dir,  # Use actual temp directory that exists
         'exclude_directories': ['node_modules', '.git', 'build'],
@@ -260,7 +262,7 @@ def valid_config_dict():
     return {
         'project_name': 'test-project',
         'api_end_point': 'https://api.anthropic.com/v1/messages',
-        'model': 'claude-3-5-sonnet-20241022',
+        'model': MODEL_CLAUDE_SONNET_3_5_V2,
         'llm_provider_type': 'aws_bedrock'
     }
 

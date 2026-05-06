@@ -417,7 +417,7 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
     try:
         with open(callstack_index_file, 'r', encoding='utf-8') as f:
             callstack_index_data = json.load(f)
-    except:
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
         callstack_index_data = {}
 
     html_content = f'''<!DOCTYPE html>

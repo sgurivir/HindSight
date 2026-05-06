@@ -116,7 +116,6 @@ You have access to codebase exploration tools. Use them when you need additional
 
 **Exploration:**
 - `readFile`: File contents (check size with `checkFileSize` first)
-- `findSpecificFilesWithSearchString`: Locate files with text
 
 **Analysis:**
 - `getSummaryOfFile`: File purpose and context

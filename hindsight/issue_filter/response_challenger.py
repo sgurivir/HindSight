@@ -13,9 +13,19 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from ..core.constants import DEFAULT_LLM_API_END_POINT, RESPONSE_CHALLENGER_MAX_ITERATIONS
+from ..core.constants import DEFAULT_LLM_API_END_POINT, RESPONSE_CHALLENGER_MAX_ITERATIONS, DEFAULT_LLM_MODEL, DEFAULT_MAX_TOKENS
 from ..utils.log_util import get_logger
 from ..utils.output_directory_provider import get_output_directory_provider
+
+_PROMPTS_DIR = Path(__file__).parent.parent / "core" / "prompts"
+
+
+def _load_prompt_template(filename: str) -> Optional[str]:
+    try:
+        return (_PROMPTS_DIR / filename).read_text(encoding='utf-8')
+    except Exception:
+        return None
+
 
 # Add the project root to Python path for imports
 project_root = Path(__file__).parent.parent.parent
@@ -335,9 +345,8 @@ class LLMResponseChallenger:
             claude_config = ClaudeConfig(
                 api_key=self.api_key,
                 api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-                model=self.config.get('model', 'claude-3-5-sonnet-20241022'),
-                max_tokens=self.config.get('max_tokens', 64000),
-                temperature=self.config.get('temperature', 0.1),
+                model=self.config.get('model', DEFAULT_LLM_MODEL),
+                max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
                 provider_type=llm_provider_type
             )
             
@@ -529,7 +538,22 @@ class LLMResponseChallenger:
                 context_section = "\n\n".join(context_parts) if context_parts else ""
                 
                 # Create user message with issue data and pre-fetched code context
+                issue_details_json = json.dumps(issue_data, indent=2)
+                file_path_str = issue_data.get('file_path', 'Unknown')
+                line_number_str = str(issue_data.get('line_number', 'Unknown'))
+
                 if file_content_provided:
+                    template = _load_prompt_template("responseChallengerUserPrompt.md")
+                else:
+                    template = _load_prompt_template("responseChallengerUserPromptNoContent.md")
+
+                if template:
+                    user_message = (template
+                        .replace("{context_section}", context_section)
+                        .replace("{issue_details_json}", issue_details_json)
+                        .replace("{file_path}", file_path_str)
+                        .replace("{line_number}", line_number_str))
+                elif file_content_provided:
                     user_message = f"""Please analyze this code issue and determine if it's worth pursuing.
 
 The source code has been provided below for your analysis. You do NOT need to use tools to read the file - the relevant code is already included.

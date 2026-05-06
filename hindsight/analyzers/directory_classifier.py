@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
 from ..core.constants import DEFAULT_EXCLUDE_DIRECTORY_NAMES
+from ..utils.file_filter_util import matches_directory_components
 
 
 class DirectoryClassifier:
@@ -43,34 +44,27 @@ class DirectoryClassifier:
                 - include_directories: set of relative paths from repo_path
                 - exclude_directories: set of relative paths from repo_path to ignore
         """
-        # Treat empty lists as None for graceful handling
         if user_provided_include_list is not None and len(user_provided_include_list) == 0:
             user_provided_include_list = None
         if user_provided_exclude_list is not None and len(user_provided_exclude_list) == 0:
             user_provided_exclude_list = None
-        
-        # Initialize directory names to ignore (case-insensitive)
-        # Combine default exclude names with user-provided exclude list if provided
+
         if user_provided_exclude_list is not None:
             exclude_names = list(DEFAULT_EXCLUDE_DIRECTORY_NAMES) + list(user_provided_exclude_list)
         else:
             exclude_names = DEFAULT_EXCLUDE_DIRECTORY_NAMES
         exclude_names_lower = [name.lower() for name in exclude_names]
-        
-        # Initialize sets
+
         include_directories = set()
         exclude_directories = set()
-        
-        # Convert repo_path to Path object and resolve it
+
         repo_root = Path(repo_path).expanduser().resolve()
         
         if not repo_root.exists() or not repo_root.is_dir():
             raise ValueError(f"Repository path does not exist or is not a directory: {repo_path}")
-        
-        # Get supported extensions for comparison
+
         supported_extensions = set(DirectoryClassifier.DEFAULT_EXTS)
-        
-        # Process user_provided_include_list to support both directory names and relative paths
+
         user_include_paths = set()
         user_include_names = set()
         user_provided_include_set = set()  # Normalized set of all user-provided include items
@@ -82,126 +76,97 @@ class DirectoryClassifier:
                 user_provided_include_set.add(normalized_item)
                 
                 if '/' in item or '\\' in item:
-                    # This is a relative path
                     user_include_paths.add(normalized_item)
                 else:
-                    # This is just a directory name
                     user_include_names.add(item.lower())
-        
-        # Walk through all directories in the repository
+
         for root, dirs, files in os.walk(repo_root):
             current_dir = Path(root)
-            
-            # Get relative path from repo_root
+
             try:
                 relative_path = current_dir.relative_to(repo_root)
                 relative_path_str = str(relative_path) if relative_path != Path('.') else '.'
             except ValueError:
-                # Skip if we can't get relative path
                 continue
-            
-            # Count files with supported extensions in current directory
+
             supported_file_count = 0
             for file in files:
                 file_path = Path(file)
                 if file_path.suffix.lower() in supported_extensions:
                     supported_file_count += 1
-            
-            # Count subdirectories in current directory
+
             subdirectory_count = len(dirs)
-            
-            # Get directory name for checking against default ignore list
+
             dir_name = current_dir.name
-            
-            # Determine if directory should be excluded
+
             should_exclude = False
-            
-            # Check if this directory is in the user_provided_include_list
-            # If it is, it should NEVER be excluded, regardless of other rules
+
+            # If it is in the user_provided_include_list, it should NEVER be excluded, regardless of other rules
             is_user_included = False
             if user_provided_include_list is not None:
-                # Check if directory matches by name
                 if dir_name.lower() in user_include_names:
                     is_user_included = True
-                # Check if directory matches by relative path
                 elif relative_path_str in user_provided_include_set:
                     is_user_included = True
-                # Check if this directory is a child of any user-included path
                 else:
                     for include_item in user_provided_include_set:
-                        if relative_path_str.startswith(include_item + '/') or relative_path_str == include_item:
+                        if matches_directory_components(relative_path_str, include_item):
                             is_user_included = True
                             break
-            
-            # Only apply exclusion rules if the directory is NOT in user_provided_include_list
+
             if not is_user_included:
-                # Check if directory name matches exclude names (case-insensitive)
                 if dir_name.lower() in exclude_names_lower:
                     should_exclude = True
                     exclude_directories.add(relative_path_str)
-                # Check if directory has no supported files AND no subdirectories
                 elif supported_file_count == 0 and subdirectory_count == 0:
                     should_exclude = True
                     exclude_directories.add(relative_path_str)
-            
-            # If not excluded, add to include set ONLY if it has supported files
-            # But first check if any parent directory is in the exclude list
+
             if not should_exclude and supported_file_count > 0:
-                # Check if any parent of this directory is excluded
                 is_child_of_excluded = False
                 if relative_path_str != '.':
                     path_parts = relative_path_str.split('/')
                     for i in range(1, len(path_parts)):
                         parent_path = '/'.join(path_parts[:i])
-                        # Check if parent directory name matches exclude patterns
                         parent_dir_name = Path(parent_path).name
                         if parent_dir_name.lower() in exclude_names_lower:
                             is_child_of_excluded = True
                             break
-                
-                # Check if user provided include list and if so, filter by it
+
                 should_include = True
                 if user_provided_include_list is not None:
                     should_include = False
-                    # Check if directory matches by name
                     if dir_name.lower() in user_include_names:
                         should_include = True
-                    # Check if directory matches by relative path
                     elif relative_path_str in user_include_paths:
                         should_include = True
-                    # Check if any parent path matches the include paths
                     else:
                         for include_path in user_include_paths:
-                            if relative_path_str.startswith(include_path + '/') or relative_path_str == include_path:
+                            if matches_directory_components(relative_path_str, include_path):
                                 should_include = True
                                 break
                 
                 if not is_child_of_excluded and should_include:
                     include_directories.add(relative_path_str)
-        
-        # Ensure ALL user_provided_include_list items are in include_directories
+
         # This guarantees that user-specified directories are always included
         if user_provided_include_list is not None:
             for item in user_provided_include_list:
                 normalized_item = item.replace('\\', '/')
                 include_directories.add(normalized_item)
-        
-        # Remove any user_provided_include_list items from exclude_directories
+
         # This ensures user-specified directories are never excluded
         if user_provided_include_list is not None:
             for item in user_provided_include_list:
                 normalized_item = item.replace('\\', '/')
                 exclude_directories.discard(normalized_item)
-                
-                # Also remove any child directories of user-included directories from excludes
+
                 exclude_directories_to_remove = set()
                 for exclude_path in exclude_directories:
-                    if exclude_path.startswith(normalized_item + '/'):
+                    if matches_directory_components(exclude_path, normalized_item):
                         exclude_directories_to_remove.add(exclude_path)
                 exclude_directories -= exclude_directories_to_remove
-        
-        # Apply sophisticated exclusion logic: exclude parent directories when all children should be excluded
-        # and parent has no supported files
+
         exclude_directories = DirectoryClassifier._optimize_exclusions(exclude_directories, repo_root, supported_extensions, user_provided_include_set)
         
         return include_directories, exclude_directories
@@ -217,23 +182,19 @@ class DirectoryClassifier:
         Returns:
             Set of relative paths with redundant children removed
         """
-        # Convert to sorted list for processing (shorter paths first)
         sorted_excludes = sorted(exclude_directories)
         result = set()
-        
+
         for path in sorted_excludes:
-            # Check if any parent of this path is already in the result
             is_child_of_excluded = False
             path_parts = path.split('/')
-            
-            # Check all possible parent paths
+
             for i in range(1, len(path_parts)):
                 parent_path = '/'.join(path_parts[:i])
                 if parent_path in result:
                     is_child_of_excluded = True
                     break
-            
-            # Only add if it's not a child of an already excluded directory
+
             if not is_child_of_excluded:
                 result.add(path)
         
@@ -259,10 +220,8 @@ class DirectoryClassifier:
         Returns:
             Set of optimized relative paths to exclude
         """
-        # First, remove redundant children (existing logic)
         optimized_exclusions = DirectoryClassifier._remove_redundant_children(exclude_directories)
-        
-        # Get all directories in the repository and check which have supported files
+
         all_directories = set()
         directories_with_supported_files = set()
         
@@ -278,8 +237,7 @@ class DirectoryClassifier:
                 continue
                 
             all_directories.add(relative_path_str)
-            
-            # Check if directory has supported files
+
             has_supported_files = False
             for file in files:
                 file_path = Path(file)
@@ -290,33 +248,27 @@ class DirectoryClassifier:
             if has_supported_files:
                 directories_with_supported_files.add(relative_path_str)
         
-        # Process directories by depth (shallowest first) to find optimization opportunities
-        # This ensures we check parents before children
+        # Process shallowest first to check parents before children
         sorted_dirs = sorted(all_directories, key=lambda x: x.count('/'))
         
         for parent_dir in sorted_dirs:
             # Skip if parent is already excluded (would be redundant)
             if parent_dir in optimized_exclusions:
                 continue
-                
-            # Skip if parent is user-included
+
             if DirectoryClassifier._is_directory_or_parent_included(parent_dir, user_provided_include_set):
                 continue
-                
-            # Skip if parent has supported files
+
             if parent_dir in directories_with_supported_files:
                 continue
-            
-            # Find all descendant directories of this parent
+
             descendant_dirs = [d for d in all_directories if d.startswith(parent_dir + '/')]
             
             if not descendant_dirs:
-                # No descendants, this directory should be excluded if it has no supported files
                 if parent_dir not in directories_with_supported_files:
                     optimized_exclusions.add(parent_dir)
                 continue
-            
-            # Check if all descendants should be excluded
+
             all_descendants_should_be_excluded = True
             for desc_dir in descendant_dirs:
                 # Descendant should be excluded if:
@@ -331,47 +283,43 @@ class DirectoryClassifier:
                 if not desc_should_be_excluded:
                     all_descendants_should_be_excluded = False
                     break
-            
-            # If all descendants should be excluded, exclude the parent instead
+
             if all_descendants_should_be_excluded:
                 optimized_exclusions.add(parent_dir)
                 # Remove all descendants from exclusions since parent is now excluded
                 descendants_to_remove = [d for d in optimized_exclusions if d.startswith(parent_dir + '/')]
                 for desc_to_remove in descendants_to_remove:
                     optimized_exclusions.discard(desc_to_remove)
-        
-        # Apply redundant children removal one more time after optimization
+
         return DirectoryClassifier._remove_redundant_children(optimized_exclusions)
     
     @staticmethod
     def _is_directory_or_parent_included(directory_path: str, user_provided_include_set: Set[str]) -> bool:
         """
         Check if a directory or any of its parent directories is in the included set.
-        
+        Supports partial path matching.
+
         Args:
             directory_path: Directory path to check
             user_provided_include_set: Set of user-provided include directories
-            
+
         Returns:
             bool: True if directory or any parent is included
         """
         if not user_provided_include_set:
             return False
-            
-        # Check exact match
+
         if directory_path in user_provided_include_set:
             return True
-            
-        # Check if any included directory is a parent of this directory
+
         for included_dir in user_provided_include_set:
-            if directory_path.startswith(included_dir):
+            if matches_directory_components(directory_path, included_dir):
                 return True
-                
-        # Check if this directory is a parent of any included directory
+
         for included_dir in user_provided_include_set:
-            if included_dir.startswith(directory_path):
+            if matches_directory_components(included_dir, directory_path):
                 return True
-                
+
         return False
 
     @staticmethod
@@ -481,30 +429,25 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
             provider_type: LLM provider type ("aws_bedrock")
         """
         from ..core.llm.llm import Claude, ClaudeConfig, create_llm_provider
-        from ..core.constants import DEFAULT_LLM_API_END_POINT, DEFAULT_LLM_MODEL
-        
-        # Set defaults if not provided
+        from ..core.constants import DEFAULT_LLM_API_END_POINT, DEFAULT_LLM_MODEL, DEFAULT_MAX_TOKENS
+
         self.api_url = api_url or DEFAULT_LLM_API_END_POINT
         self.model = model or DEFAULT_LLM_MODEL
         self.provider_type = provider_type
-        
-        # Create Claude configuration
+
         self.claude_config = ClaudeConfig(
             api_key=api_key,
             api_url=self.api_url,
             model=self.model,
-            max_tokens=64000,
-            temperature=0.1,
+            max_tokens=DEFAULT_MAX_TOKENS,
             timeout=120,
             provider_type=provider_type
         )
-        
-        # Use centralized factory to create provider
+
         provider = create_llm_provider(self.claude_config)
-        
-        # Initialize Claude client with factory-created provider
+
         self.claude = Claude(self.claude_config)
-        self.claude.provider = provider  # Use the factory-created provider
+        self.claude.provider = provider
     
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> 'LLMBasedDirectoryClassifier':
@@ -540,13 +483,11 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
         Returns:
             str: System prompt for LLM, or empty string if prompt file not found
         """
-        # Load prompt from markdown file
         prompt_file = Path(__file__).parent.parent / "core" / "prompts" / "directoryAnalysis.md"
         with open(prompt_file, 'r', encoding='utf-8') as f:
             content = f.read()
             # Extract content after the header (skip the "# Directory Analysis System Prompt" line)
             lines = content.split('\n')
-            # Find the first non-empty line after the header
             start_idx = 0
             for i, line in enumerate(lines):
                 if line.strip() and not line.startswith('#'):
@@ -626,48 +567,40 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
         logger = get_logger(__name__)
         
         try:
-            # Validate connection first
             if not self.claude.validate_connection():
                 logger.error("Failed to validate LLM connection")
                 return []
-            
-            # Build complete directory tree structure
+
             logger.info("Building complete directory tree structure...")
             tree_structure, all_directory_paths = self._build_directory_tree(repo_path, max_depth=12)
-            
-            # Filter out already excluded directories
+
             if already_excluded_directories:
                 already_excluded_set = set(already_excluded_directories)
                 logger.info(f"Excluding {len(already_excluded_directories)} already excluded directories from analysis")
             else:
                 already_excluded_set = set()
-            
-            # Create prompts with tree structure
+
             system_prompt = self._create_system_prompt()
             user_prompt = self._create_tree_based_user_prompt(tree_structure, already_excluded_directories, user_provided_include_list)
-            
-            # Check token limits and truncate if necessary
+
             if not self.claude.check_token_limit(system_prompt, user_prompt):
                 logger.warning("Prompt exceeds token limits, using shallower tree structure")
                 # Try with shallower tree
                 tree_structure, all_directory_paths = self._build_directory_tree(repo_path, max_depth=8)
                 user_prompt = self._create_tree_based_user_prompt(tree_structure, already_excluded_directories, user_provided_include_list)
-                
-                # If still too long, chunk the analysis
+
                 if not self.claude.check_token_limit(system_prompt, user_prompt):
                     logger.warning("Tree structure still too large, chunking analysis")
                     return self._analyze_directories_in_chunks(repo_path, already_excluded_set, user_provided_include_list)
-            
-            # Start conversation
+
             self.claude.start_conversation("directory_tree_analysis", f"Analyzing complete directory tree structure")
-            
-            # Create payload manually to exclude tools (directory classifier doesn't need tools)
+
+            # Create payload without tools — directory classifier doesn't need them
             messages = [{"role": "user", "content": user_prompt}]
             full_messages = [
                 {"role": "system", "content": system_prompt}
             ] + messages
-            
-            # Create payload without tools
+
             payload = self.claude.provider.create_payload(
                 full_messages,
                 stream=False,
@@ -678,40 +611,32 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
             # Remove tools from payload to prevent LLM from trying to use them
             if "tools" in payload:
                 del payload["tools"]
-            
-            # Store messages for conversation logging
+
             self.claude.conversation_messages.append(full_messages.copy())
-            
-            # Make request directly
+
             response = self.claude.provider.make_request(payload)
-            
-            # Store response for conversation logging
+
             self.claude.conversation_responses.append(response.copy() if response else {"error": "No response"})
             
             if response is None:
                 logger.error("No response from LLM")
                 return []
-            
-            # Handle error responses
+
             if "error" in response:
                 logger.error(f"LLM API error: {response.get('error')}")
                 return []
             
             # Extract response content - handle both Claude native and AWS Bedrock formats
             content = ""
-            
-            # Check for Claude native format first
+
             if "content" in response and isinstance(response.get("content"), list):
-                # Claude native format
                 content_blocks = response.get("content", [])
                 for block in content_blocks:
                     if isinstance(block, dict) and block.get("type") == "text":
                         content = block.get("text", "")
                         break
-            
-            # Check for AWS Bedrock format
+
             elif "choices" in response:
-                # AWS Bedrock format
                 choices = response.get("choices", [])
                 if choices:
                     assistant_message = choices[0].get("message", {})
@@ -721,8 +646,7 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
                 logger.error("Empty content in LLM response")
                 logger.debug(f"Response format: {list(response.keys())}")
                 return []
-            
-            # Parse JSON response
+
             try:
                 # Clean up markdown formatting if present
                 if "```json" in content:
@@ -741,7 +665,7 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
                 if not isinstance(excluded_dirs, list):
                     logger.error(f"Expected JSON array, got {type(excluded_dirs)}")
                     return []
-                
+
                 # Validate that returned directories exist in the repository
                 valid_excluded_dirs = []
                 logger.debug(f"Total directories collected by tree builder: {len(all_directory_paths)}")
@@ -749,14 +673,12 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
                 
                 for dir_path in excluded_dirs:
                     if isinstance(dir_path, str):
-                        # Normalize path separators
                         normalized_path = dir_path.replace('\\', '/')
                         logger.debug(f"Checking if '{normalized_path}' exists in collected directories")
                         if normalized_path in all_directory_paths:
                             valid_excluded_dirs.append(normalized_path)
                             logger.debug(f"✓ Found: {normalized_path}")
                         else:
-                            # Check if directory actually exists on filesystem as fallback
                             from pathlib import Path
                             repo_root = Path(repo_path).resolve()
                             actual_dir_path = repo_root / normalized_path
@@ -773,8 +695,7 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
                         logger.warning(f"Invalid excluded directory type: {type(dir_path)}")
                 
                 logger.info(f"LLM analysis complete: {len(valid_excluded_dirs)} directories recommended for exclusion")
-                
-                # Log conversation
+
                 self.claude.log_complete_conversation(
                     final_result=json.dumps(valid_excluded_dirs, indent=2)
                 )
@@ -832,35 +753,29 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
                 rel_path = current_path.relative_to(repo_root)
                 rel_path_str = str(rel_path) if rel_path != Path('.') else '.'
                 
-                # Only include directories that have supported files (recursively)
                 if not has_supported_files_recursive(current_path):
                     return lines
-                
+
                 all_directory_paths.add(rel_path_str)
-                
-                # Debug logging for specific problematic directories
+
                 if any(problem_dir in rel_path_str for problem_dir in ['src/test', 'src/main', 'protowire']):
                     from ..utils.log_util import get_logger
                     debug_logger = get_logger(__name__)
                     debug_logger.debug(f"Tree builder collected: '{rel_path_str}' at depth {depth}")
-                
-                # Get directory contents
+
                 subdirs = []
                 files = []
-                
+
                 for item in current_path.iterdir():
                     if item.is_dir():
-                        # Only include subdirectories that have supported files
                         if has_supported_files_recursive(item):
                             subdirs.append(item)
                     elif item.is_file():
                         files.append(item)
-                
-                # Sort for consistent output
+
                 subdirs.sort(key=lambda x: x.name.lower())
                 files.sort(key=lambda x: x.name.lower())
-                
-                # Add current directory
+
                 if depth == 0:
                     lines.append(f"{current_path.name}/")
                 else:
@@ -972,8 +887,7 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
         import json
         
         logger = get_logger(__name__)
-        
-        # Get first-level directories for chunking
+
         repo_root = Path(repo_path).resolve()
         first_level_dirs = []
         supported_extensions = set(DirectoryClassifier.DEFAULT_EXTS)
@@ -997,7 +911,6 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
                 if item.is_dir() and not item.name.startswith('.'):
                     rel_path = str(item.relative_to(repo_root))
                     if rel_path not in already_excluded_set:
-                        # Only include directories that have supported files
                         if has_supported_files_recursive(item):
                             first_level_dirs.append(rel_path)
         except (PermissionError, OSError):

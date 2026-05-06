@@ -21,7 +21,7 @@ from typing import Optional, Dict, Any, Tuple, List
 from .llm import Claude, ClaudeConfig
 from .tools import Tools
 from .iterative import DiffContextAnalyzer, DiffAnalysisAnalyzer
-from ..constants import MAX_TOOL_ITERATIONS
+from ..constants import MAX_TOOL_ITERATIONS, DEFAULT_MAX_TOKENS
 from ...utils.file_util import write_file
 from ...utils.json_util import validate_and_format_json, clean_json_response
 from ...utils.log_util import get_logger
@@ -38,8 +38,7 @@ class DiffAnalysisConfig:
     model: str
     repo_path: str
     output_file: str
-    max_tokens: int = 64000
-    temperature: float = 0.1
+    max_tokens: int = DEFAULT_MAX_TOKENS
     config: Dict[str, Any] = None  # Store the full configuration dict
     file_content_provider: Any = None  # FileContentProvider instance for file resolution
 
@@ -59,18 +58,15 @@ class DiffAnalysis:
         """
         self.config = config
 
-        # Initialize Claude client
         claude_config = ClaudeConfig(
             api_key=config.api_key,
             api_url=config.api_url,
             model=config.model,
             max_tokens=config.max_tokens,
-            temperature=config.temperature,
             provider_type=config.config.get('llm_provider_type', 'aws_bedrock') if config.config else 'aws_bedrock'
         )
         self.claude = Claude(claude_config)
 
-        # Initialize tools similar to CodeAnalysis
         try:
             output_provider = get_output_directory_provider()
             output_base_dir = output_provider.get_custom_base_dir()
@@ -78,11 +74,9 @@ class DiffAnalysis:
             # Fallback if singleton not configured
             output_base_dir = None
 
-        # Get the artifacts directory path
         output_provider = get_output_directory_provider()
         artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
 
-        # Extract ignored directories from config for LLM-based directory filtering
         ignore_dirs = set()
         if config.config:
             exclude_directories = config.config.get('exclude_directories', [])
@@ -94,7 +88,6 @@ class DiffAnalysis:
         else:
             logger.info("No config provided for diff analysis - no directories will be ignored")
 
-        # Initialize DirectoryTreeUtil if available
         directory_tree_util = None
         try:
             from ...utils.directory_tree_util import DirectoryTreeUtil
@@ -105,7 +98,6 @@ class DiffAnalysis:
 
         self.tools = Tools(config.repo_path, output_base_dir, config.file_content_provider, artifacts_dir, directory_tree_util, ignore_dirs)
 
-        # Token tracking
         self.total_input_tokens = 0
         self.total_output_tokens = 0
 
@@ -120,7 +112,6 @@ class DiffAnalysis:
             iteration: Current iteration number
         """
         try:
-            # Extract token usage from response
             usage = response.get("usage", {})
 
             input_tokens = (
@@ -133,14 +124,11 @@ class DiffAnalysis:
             )
 
             if input_tokens > 0 or output_tokens > 0:
-                # Log current API call token usage
                 logger.info(f"Iteration {iteration} - Input tokens: {input_tokens:,}, Output tokens: {output_tokens:,}")
 
-                # Update totals
                 self.total_input_tokens += input_tokens
                 self.total_output_tokens += output_tokens
 
-                # Log running totals
                 logger.info(f"Running totals - Input tokens: {self.total_input_tokens:,}, Output tokens: {self.total_output_tokens:,}")
             else:
                 logger.warning(f"Iteration {iteration} - No token usage information found in API response")
@@ -191,28 +179,23 @@ class DiffAnalysis:
         """
         if not response:
             return None
-        
-        # Check if response is string-like
+
         if hasattr(response, 'strip'):
             return response
-            
-        # Check if response is dict-like
+
         if not hasattr(response, 'get'):
             return None
-            
-        # Detect format based on structure
+
         has_content_blocks = "content" in response and response.get("content") and hasattr(response.get("content"), '__iter__') and not hasattr(response.get("content"), 'strip')
         has_choices = "choices" in response
-        
-        # Handle Claude native format
+
         if has_content_blocks:
             content_blocks = response.get("content", [])
             for block in content_blocks:
                 block_type = block.get("type") if hasattr(block, 'get') else None
                 if block_type == "text":
                     return block.get("text", "")
-        
-        # Handle AWS Bedrock format
+
         elif has_choices:
             choices = response.get("choices", [])
             if choices:
@@ -237,7 +220,6 @@ class DiffAnalysis:
 
             cleaned_result = clean_json_response(result)
 
-            # Validate and format JSON
             is_valid, final_output = validate_and_format_json(cleaned_result)
 
             if is_valid:
@@ -285,12 +267,10 @@ class DiffAnalysis:
         logger.info("Starting diff analysis with tool support...")
         start_time = time.time()
 
-        # Start conversation tracking
         context_info = f"Git diff analysis: {self.config.repo_path}"
         self.claude.start_conversation("diff_analysis", context_info)
 
         try:
-            # Check token limits
             if not self.claude.check_token_limit(system_prompt, user_message):
                 total_chars = len(system_prompt + user_message)
                 estimated_tokens = self.claude.estimate_tokens(system_prompt + user_message)
@@ -309,10 +289,8 @@ class DiffAnalysis:
 
             logger.info(f"Token limit check passed - estimated tokens: {self.claude.estimate_tokens(system_prompt + user_message):,}")
 
-            # Run iterative analysis with tool usage
             analysis_result = self._run_iterative_diff_analysis(system_prompt, user_message)
 
-            # Calculate execution time
             end_time = time.time()
             execution_time = end_time - start_time
 
@@ -321,13 +299,12 @@ class DiffAnalysis:
                 try:
                     # Use the shared _process_analysis_result method for consistent JSON handling
                     success, processed_result = self._process_analysis_result(analysis_result)
-                    
+
                     if not success:
                         logger.error("Failed to process LLM response")
                         self._log_final_token_summary()
                         return None
-                    
-                    # Parse the processed result
+
                     issues = json.loads(processed_result)
                     
                     if not isinstance(issues, list):
@@ -561,7 +538,6 @@ YOUR ENTIRE RESPONSE MUST BE VALID JSON - START WITH [ AND END WITH ]
         self.claude.start_conversation("function_diff_analysis", context_info)
         
         try:
-            # Check token limits
             if not self.claude.check_token_limit(system_prompt, user_message):
                 total_chars = len(system_prompt + user_message)
                 estimated_tokens = self.claude.estimate_tokens(system_prompt + user_message)
@@ -860,7 +836,7 @@ YOUR ENTIRE RESPONSE MUST BE VALID JSON - START WITH [ AND END WITH ]
 
         # Build user message from prompt_data
         user_message = self._build_function_analysis_user_message(prompt_data)
-        user_message += "\n\nCollect all context needed for this function diff and return a JSON diff context bundle as described in the system prompt."
+        user_message += "\n\nCollect all context needed for this function diff and return a JSON diff code collection as described in the system prompt."
 
         # Start conversation tracking
         self.claude.start_conversation("diff_context_collection", f"{func_name} in {file_path}")
@@ -953,10 +929,10 @@ YOUR ENTIRE RESPONSE MUST BE VALID JSON - START WITH [ AND END WITH ]
             logger.error(f"Diff Analysis: Failed to load prompt: {e}")
             return None
 
-        # Build user message: context bundle + output schema
-        user_message = f"## Diff Context Bundle for Analysis\n\n"
+        # Build user message: collected diff code + output schema
+        user_message = f"## Diff Code for Analysis\n\n"
         user_message += f"**Function**: `{func_name}` in `{file_path}`\n\n"
-        user_message += "The following diff context bundle contains all code needed for your analysis.\n\n"
+        user_message += "The following diff code contains everything needed for your analysis.\n\n"
         user_message += "```json\n"
         user_message += json.dumps(diff_context_bundle, indent=2, ensure_ascii=False)
         user_message += "\n```\n\n"

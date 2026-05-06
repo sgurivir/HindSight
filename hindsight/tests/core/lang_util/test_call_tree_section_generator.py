@@ -494,10 +494,9 @@ class TestCallTreeSectionGeneratorEdgeCases:
         assert section is not None
         assert text is not None
     
-    def test_dict_format_call_graph(self):
-        """Test with dict-wrapped call graph format."""
-        dict_format_data = {
-            "call_graph": [
+    def test_list_format_call_graph(self):
+        """Test with list format call graph."""
+        list_format_data = [
                 {
                     "file": "src/main.c",
                     "functions": [
@@ -508,10 +507,9 @@ class TestCallTreeSectionGeneratorEdgeCases:
                         }
                     ]
                 }
-            ]
-        }
-        
-        generator = CallTreeSectionGenerator(dict_format_data)
+        ]
+
+        generator = CallTreeSectionGenerator(list_format_data)
         section = generator.generate_section("main")
         
         assert section["target_function"]["name"] == "main"

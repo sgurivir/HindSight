@@ -3,6 +3,8 @@ import pytest
 from unittest.mock import Mock, patch
 import os
 
+from hindsight.core.constants import MODEL_CLAUDE_SONNET_4_5
+
 
 @pytest.fixture
 def mock_apple_connect():
@@ -59,7 +61,7 @@ def sample_floodgate_config(floodgate_api_url):
     return {
         "llm_provider_type": "aws_bedrock",
         "api_end_point": floodgate_api_url,
-        "model": "aws:anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "model": MODEL_CLAUDE_SONNET_4_5,
         "project-credentials": "test-floodgate-token"
     }
 
@@ -70,7 +72,7 @@ def sample_oidc_config(floodgate_api_url):
     return {
         "llm_provider_type": "aws_bedrock",
         "api_end_point": floodgate_api_url,
-        "model": "aws:anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "model": MODEL_CLAUDE_SONNET_4_5,
         "credentials": "test-oidc-token"
     }
 
@@ -81,7 +83,7 @@ def sample_both_config(floodgate_api_url):
     return {
         "llm_provider_type": "aws_bedrock",
         "api_end_point": floodgate_api_url,
-        "model": "aws:anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "model": MODEL_CLAUDE_SONNET_4_5,
         "credentials": "test-oidc-token",
         "project-credentials": "test-floodgate-token"
     }
@@ -93,5 +95,5 @@ def sample_no_creds_config(floodgate_api_url):
     return {
         "llm_provider_type": "aws_bedrock",
         "api_end_point": floodgate_api_url,
-        "model": "aws:anthropic.claude-sonnet-4-5-20250929-v1:0"
+        "model": MODEL_CLAUDE_SONNET_4_5
     }

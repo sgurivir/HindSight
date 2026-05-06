@@ -94,7 +94,8 @@ class FileContentProvider:
             else:
                 # Fallback to repo-relative path
                 index_path = f"{repo_path}/file_mapping.pkl"
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Could not get output directory for index path: {e}")
             # Fallback to repo-relative path
             index_path = f"{repo_path}/file_mapping.pkl"
         
@@ -186,7 +187,8 @@ class FileContentProvider:
             if not p.exists() or not p.is_file():
                 return None
             return p.read_text(encoding=encoding, errors="ignore")
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to read text from {relative_or_abs_path}: {e}")
             return None
 
     def _resolve_file_path_impl(self, filename: str, hint_path: Optional[str]) -> Optional[str]:
@@ -273,10 +275,8 @@ class FileContentProvider:
                 rel = p.relative_to(self.repo_root)
                 if any(part in self.ignore_dirs for part in rel.parts):
                     continue
-            except Exception:
+            except ValueError:
                 pass
-
-            # extension filter (if provided)
             if self.include_extensions:
                 ext = p.suffix.lower()
                 if ext not in self.include_extensions:
@@ -327,12 +327,11 @@ class FileContentProvider:
         try:
             rel = candidate_abs.relative_to(base)
             return len(rel.parts)
-        except Exception:
-            # try common parent distance
+        except ValueError:
             try:
                 common = os.path.commonpath([str(base), str(candidate_abs)])
                 return len(Path(candidate_abs).relative_to(common).parts)
-            except Exception:
+            except (ValueError, Exception):
                 return 1_000_000
 
 

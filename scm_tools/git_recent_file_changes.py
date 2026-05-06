@@ -10,6 +10,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from hindsight.core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
 from hindsight.core.constants import DEFAULT_DIFF_DAYS
+from hindsight.utils.file_filter_util import matches_path_components
 
 
 class GitModifiedFilesListGenerator:
@@ -150,7 +151,7 @@ class GitModifiedFilesListGenerator:
             # Check if file is in any excluded directory
             is_excluded = False
             for exclude_dir in self.exclude_directories:
-                if file_path.startswith(exclude_dir + '/') or file_path.startswith(exclude_dir + os.sep):
+                if matches_path_components(file_path, exclude_dir):
                     is_excluded = True
                     break
 

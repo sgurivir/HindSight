@@ -131,10 +131,9 @@ class TestAffectedFunctionDetector:
     """Tests for the AffectedFunctionDetector class."""
     
     @pytest.fixture
-    def sample_call_graph(self) -> Dict[str, Any]:
+    def sample_call_graph(self):
         """Create a sample call graph for testing."""
-        return {
-            'call_graph': [
+        return [
                 {
                     'file': 'src/main.py',
                     'functions': [
@@ -178,7 +177,6 @@ class TestAffectedFunctionDetector:
                     ]
                 }
             ]
-        }
     
     @pytest.fixture
     def sample_functions(self) -> Dict[str, Any]:
@@ -495,8 +493,7 @@ class TestAffectedFunctionDetectorEdgeCases:
     
     def test_max_depth_zero(self):
         """Test with max_depth=0 (only directly modified)."""
-        call_graph = {
-            'call_graph': [{
+        call_graph = [{
                 'file': 'src/main.py',
                 'functions': [{
                     'function': 'caller',
@@ -504,8 +501,7 @@ class TestAffectedFunctionDetectorEdgeCases:
                     'invoked_by': [],
                     'context': {'start': 1, 'end': 10}
                 }]
-            }]
-        }
+        }]
         
         functions = {
             'caller': {

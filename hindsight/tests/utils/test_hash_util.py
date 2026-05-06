@@ -296,78 +296,37 @@ class TestHashForFunctionAnalysisSHA256:
         assert len(result) == 32
 
 
-class TestHashForDummyChecksumMD5:
-    """Tests for HashUtil.hash_for_dummy_checksum_md5()"""
+class TestChecksumForFunctionSource:
+    """Tests for HashUtil.checksum_for_function_source()"""
 
-    def test_hash_for_dummy_checksum_md5_basic(self):
-        """Test MD5 hash for dummy checksum."""
-        identifier = "test_identifier"
-        result = HashUtil.hash_for_dummy_checksum_md5(identifier)
-        
+    def test_computes_checksum_from_source(self, tmp_path):
+        src = tmp_path / "file.swift"
+        src.write_text("line1\nline2\nline3\nline4\nline5\n")
+        result = HashUtil.checksum_for_function_source(str(tmp_path), "file.swift", 2, 4)
         assert len(result) == 32
         assert all(c in '0123456789abcdef' for c in result)
 
-    def test_hash_for_dummy_checksum_md5_consistency(self):
-        """Test that same identifier produces same dummy checksum."""
-        identifier = "test_identifier"
-        hash1 = HashUtil.hash_for_dummy_checksum_md5(identifier)
-        hash2 = HashUtil.hash_for_dummy_checksum_md5(identifier)
-        assert hash1 == hash2
+    def test_returns_same_hash_for_same_content(self, tmp_path):
+        src = tmp_path / "file.swift"
+        src.write_text("line1\nline2\nline3\n")
+        h1 = HashUtil.checksum_for_function_source(str(tmp_path), "file.swift", 1, 3)
+        h2 = HashUtil.checksum_for_function_source(str(tmp_path), "file.swift", 1, 3)
+        assert h1 == h2
 
+    def test_changes_when_source_changes(self, tmp_path):
+        src = tmp_path / "file.swift"
+        src.write_text("line1\nline2\nline3\n")
+        h1 = HashUtil.checksum_for_function_source(str(tmp_path), "file.swift", 1, 3)
+        src.write_text("line1\nMODIFIED\nline3\n")
+        h2 = HashUtil.checksum_for_function_source(str(tmp_path), "file.swift", 1, 3)
+        assert h1 != h2
 
-class TestHashForCombinedComponentsMD5:
-    """Tests for HashUtil.hash_for_combined_components_md5()"""
+    def test_falls_back_for_missing_file(self, tmp_path):
+        result = HashUtil.checksum_for_function_source(str(tmp_path), "nonexistent.swift", 1, 5)
+        assert len(result) == 8  # file identifier hash is truncated
 
-    def test_hash_for_combined_components_md5_basic(self):
-        """Test MD5 hash for combined components."""
-        components = ["component1", "component2", "component3"]
-        result = HashUtil.hash_for_combined_components_md5(components)
-        
-        assert len(result) == 32
-        assert all(c in '0123456789abcdef' for c in result)
-
-    def test_hash_for_combined_components_md5_empty_list(self):
-        """Test combined components hash for empty list returns 'None'."""
-        result = HashUtil.hash_for_combined_components_md5([])
-        assert result == "None"
-
-    def test_hash_for_combined_components_md5_single_component(self):
-        """Test combined components hash with single component."""
-        components = ["single_component"]
-        result = HashUtil.hash_for_combined_components_md5(components)
-        
-        assert len(result) == 32
-
-
-class TestHashForDataTypesMD5:
-    """Tests for HashUtil.hash_for_data_types_md5()"""
-
-    def test_hash_for_data_types_md5_basic(self):
-        """Test MD5 hash for data type checksums."""
-        data_type_checksums = ["checksum1", "checksum2", "checksum3"]
-        result = HashUtil.hash_for_data_types_md5(data_type_checksums)
-        
-        assert len(result) == 32
-        assert all(c in '0123456789abcdef' for c in result)
-
-    def test_hash_for_data_types_md5_empty_list(self):
-        """Test data types hash for empty list returns 'None'."""
-        result = HashUtil.hash_for_data_types_md5([])
-        assert result == "None"
-
-
-class TestHashForFunctionsMD5:
-    """Tests for HashUtil.hash_for_functions_md5()"""
-
-    def test_hash_for_functions_md5_basic(self):
-        """Test MD5 hash for function checksums."""
-        function_checksums = ["func_checksum1", "func_checksum2"]
-        result = HashUtil.hash_for_functions_md5(function_checksums)
-        
-        assert len(result) == 32
-        assert all(c in '0123456789abcdef' for c in result)
-
-    def test_hash_for_functions_md5_empty_list(self):
-        """Test functions hash for empty list returns 'None'."""
-        result = HashUtil.hash_for_functions_md5([])
-        assert result == "None"
+    def test_falls_back_for_bad_line_bounds(self, tmp_path):
+        src = tmp_path / "file.swift"
+        src.write_text("one line\n")
+        result = HashUtil.checksum_for_function_source(str(tmp_path), "file.swift", 100, 200)
+        assert len(result) == 8  # file identifier hash is truncated

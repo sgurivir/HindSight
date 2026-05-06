@@ -26,6 +26,7 @@ from hindsight.core.llm.llm import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_DELAYS,
 )
+from hindsight.core.constants import DEFAULT_MAX_TOKENS, MODEL_CLAUDE_SONNET_3_5_V2, MODEL_CLAUDE_SONNET_3
 
 
 # ============================================================================
@@ -177,14 +178,13 @@ class TestClaudeConfig:
         config = ClaudeConfig(
             api_key="test-key",
             api_url="https://api.anthropic.com/v1/messages",
-            model="claude-3-5-sonnet-20241022"
+            model=MODEL_CLAUDE_SONNET_3_5_V2
         )
-        
+
         assert config.api_key == "test-key"
         assert config.api_url == "https://api.anthropic.com/v1/messages"
-        assert config.model == "claude-3-5-sonnet-20241022"
-        assert config.max_tokens == 64000
-        assert config.temperature == 0.05
+        assert config.model == MODEL_CLAUDE_SONNET_3_5_V2
+        assert config.max_tokens == DEFAULT_MAX_TOKENS
         assert config.timeout == 300
         assert config.provider_type == "aws_bedrock"
 
@@ -195,13 +195,11 @@ class TestClaudeConfig:
             api_url="https://custom.api.com",
             model="custom-model",
             max_tokens=32000,
-            temperature=0.7,
             timeout=600,
             provider_type="aws_bedrock"
         )
-        
+
         assert config.max_tokens == 32000
-        assert config.temperature == 0.7
         assert config.timeout == 600
         assert config.provider_type == "aws_bedrock"
 
@@ -219,7 +217,7 @@ class TestCreateLLMProvider:
         config = ClaudeConfig(
             api_key="test-key",
             api_url="https://bedrock.amazonaws.com",
-            model="anthropic.claude-3-sonnet-20240229-v1:0",
+            model=MODEL_CLAUDE_SONNET_3,
             provider_type="aws_bedrock"
         )
 
@@ -270,7 +268,7 @@ class TestClaude:
         return ClaudeConfig(
             api_key="test-key",
             api_url="https://bedrock.amazonaws.com",
-            model="anthropic.claude-3-sonnet-20240229-v1:0",
+            model=MODEL_CLAUDE_SONNET_3,
             provider_type="aws_bedrock"
         )
 
@@ -316,12 +314,14 @@ class TestClaude:
 
     def test_check_token_limit_exceeds_limit(self, claude_instance):
         """Test token limit check when exceeding limits."""
-        # Create a very large prompt that exceeds limits
-        system_prompt = "x" * 200000
-        user_prompt = "y" * 200000
-        
+        # Create a very large prompt that exceeds the model's context window
+        # Model claude-3-sonnet has 200K context, minus 64K max_tokens = 136K max input
+        # Need >136K estimated tokens = >408K characters (at 3 chars/token)
+        system_prompt = "x" * 250000
+        user_prompt = "y" * 250000
+
         result = claude_instance.check_token_limit(system_prompt, user_prompt)
-        
+
         assert result is False
 
     def test_validate_connection(self, claude_instance, mock_provider):
@@ -560,7 +560,7 @@ class TestClaudeToolExecution:
         return ClaudeConfig(
             api_key="test-key",
             api_url="https://api.anthropic.com/v1/messages",
-            model="claude-3-5-sonnet-20241022",
+            model=MODEL_CLAUDE_SONNET_3_5_V2,
             provider_type="aws_bedrock"
         )
 

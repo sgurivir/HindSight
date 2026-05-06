@@ -232,7 +232,7 @@ class DiffAnalysisLocalFSSubscriber(DiffAnalysisSubscriber):
                 # Parse ISO timestamp and convert to filename-safe format
                 timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
                 timestamp_formatted = timestamp.strftime('%Y%m%d_%H%M%S')
-            except:
+            except (ValueError, TypeError):
                 timestamp_formatted = datetime.now().strftime('%Y%m%d_%H%M%S')
         else:
             timestamp_formatted = datetime.now().strftime('%Y%m%d_%H%M%S')

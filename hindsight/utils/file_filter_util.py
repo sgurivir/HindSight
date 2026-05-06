@@ -4,7 +4,7 @@
 # Centralized file filtering utilities for ignore directory patterns
 
 from pathlib import Path
-from typing import Set
+from typing import List, Set
 
 
 def should_ignore_file(file_path: Path, repo_root: Path, ignored_dirs: Set[str]) -> bool:
@@ -27,24 +27,10 @@ def should_ignore_file(file_path: Path, repo_root: Path, ignored_dirs: Set[str])
         rel = file_path.relative_to(repo_root)
         rel_str = str(rel)
         
-        # Check for exact relative path matches first
+        normalized_rel = rel_str.replace('\\', '/')
         for ignore_pattern in ignored_dirs:
-            if '/' in ignore_pattern or '\\' in ignore_pattern:
-                # This is a path pattern - normalize separators and check if the file path starts with it
-                ignore_path = ignore_pattern.replace('\\', '/')
-                normalized_rel = rel_str.replace('\\', '/')
-                
-                # Check if file is exactly the ignored path or is within the ignored directory
-                if normalized_rel == ignore_path or normalized_rel.startswith(ignore_path + '/'):
-                    return True
-            else:
-                # This is a simple directory name - check if it appears anywhere in the path
-                normalized_rel = rel_str.replace('\\', '/')
-                path_parts = normalized_rel.split('/')
-                
-                # Check if the ignore pattern matches any directory in the path
-                if ignore_pattern in path_parts:
-                    return True
+            if matches_path_components(normalized_rel, ignore_pattern):
+                return True
         
         return False
     except Exception:
@@ -81,3 +67,58 @@ def find_files_with_extensions(repo_root: Path, ignored_dirs: Set[str], extensio
     
     collected_files.sort()
     return collected_files
+
+
+def _consecutive_component_match(haystack_parts: List[str], needle_parts: List[str]) -> int:
+    """
+    Find where needle_parts appears as consecutive components in haystack_parts.
+    Returns the starting index of the match, or -1 if not found.
+    """
+    needle_len = len(needle_parts)
+    for i in range(len(haystack_parts) - needle_len + 1):
+        if haystack_parts[i:i + needle_len] == needle_parts:
+            return i
+    return -1
+
+
+def matches_path_components(file_path: str, pattern: str) -> bool:
+    """
+    Check if pattern appears as consecutive directory components in file_path.
+    The filename (last component) of file_path is excluded from matching.
+
+    Examples:
+        matches_path_components("A/B/C/file.txt", "B/C") -> True
+        matches_path_components("B/C/file.txt", "B/C") -> True
+        matches_path_components("A/B/D/file.txt", "B/C") -> False
+        matches_path_components("A/B/C/file.txt", "C") -> True
+    """
+    normalized_path = file_path.replace('\\', '/').lstrip('./')
+    normalized_pattern = pattern.replace('\\', '/').lstrip('./')
+    if not normalized_pattern:
+        return False
+    file_parts = normalized_path.split('/')
+    if len(file_parts) <= 1:
+        return False
+    dir_parts = file_parts[:-1]
+    pattern_parts = normalized_pattern.split('/')
+    return _consecutive_component_match(dir_parts, pattern_parts) >= 0
+
+
+def matches_directory_components(dir_path: str, pattern: str) -> bool:
+    """
+    Check if pattern appears as consecutive directory components in dir_path.
+    Unlike matches_path_components, all components of dir_path are considered
+    (no filename to skip).
+
+    Examples:
+        matches_directory_components("A/B/C", "B/C") -> True
+        matches_directory_components("A/B/C/D", "B/C") -> True
+        matches_directory_components("A/B/D", "B/C") -> False
+    """
+    normalized_path = dir_path.replace('\\', '/').lstrip('./')
+    normalized_pattern = pattern.replace('\\', '/').lstrip('./')
+    if not normalized_pattern:
+        return False
+    dir_parts = normalized_path.split('/')
+    pattern_parts = normalized_pattern.split('/')
+    return _consecutive_component_match(dir_parts, pattern_parts) >= 0

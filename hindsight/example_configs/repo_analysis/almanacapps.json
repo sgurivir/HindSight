@@ -3,7 +3,7 @@
     "description": "Almanac Apps",
     
     "api_end_point": "https://floodgate.g.apple.com/api/openai/v1/chat/completions",
-    "model": "aws:anthropic.claude-opus-4-5-20251101-v1:0",
+    "model": "anthropic.claude-opus-4-7",
     "llm_provider_type": "aws_bedrock",
     "credentials": "",
     
@@ -11,7 +11,7 @@
 
     "exclude_directories": ["AlmanacProxy"
     ],
-    "include_directories": ["Orange"],
+    "include_directories": [],
     "exclude_files": [],
     
     "min_function_body_length": 7,

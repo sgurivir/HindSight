@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any, Tuple, List
 from .llm import Claude, ClaudeConfig
 from .tools import Tools
 from .iterative import ContextCollectionAnalyzer, CodeAnalysisAnalyzer
-from ..constants import MAX_TOOL_ITERATIONS
+from ..constants import MAX_TOOL_ITERATIONS, DEFAULT_MAX_TOKENS
 from ..prompts.prompt_builder import PromptBuilder
 from ..ast_index import RepoAstIndex
 from ...utils.directory_tree_util import DirectoryTreeUtil
@@ -35,8 +35,7 @@ class AnalysisConfig:
     model: str
     repo_path: str
     output_file: str
-    max_tokens: int = 64000
-    temperature: float = 0.1
+    max_tokens: int = DEFAULT_MAX_TOKENS
     processed_cache_file: Optional[str] = None  # Legacy cache system removed
     config: Dict[str, Any] = None  # Store the full configuration dict
     file_content_provider: Any = None  # FileContentProvider instance for file resolution
@@ -58,30 +57,20 @@ class CodeAnalysis:
             config: Analysis configuration
         """
         self.config = config
-
-        # Store file filter for use in analysis
         self.file_filter = config.file_filter or []
-
-        # Publisher for result checking and publishing (set by runner)
         self.publisher = None
-
-        # Initialize centralized AST index for lazy loading
         self.ast_index = RepoAstIndex()
         self._load_merged_data()
 
-        # Initialize Claude client
         claude_config = ClaudeConfig(
             api_key=config.api_key,
             api_url=config.api_url,
             model=config.model,
             max_tokens=config.max_tokens,
-            temperature=config.temperature,
             provider_type=config.config.get('llm_provider_type', 'aws_bedrock') if config.config else 'aws_bedrock'
         )
         self.claude = Claude(claude_config)
 
-        # Initialize tools with temp directory configuration and ignore directories
-        # Use the output directory from the singleton instead of JSON config
         try:
             output_provider = get_output_directory_provider()
             output_base_dir = output_provider.get_custom_base_dir()
@@ -94,21 +83,15 @@ class CodeAnalysis:
         if config.config and config.config.get('exclude_directories'):
             base_dirs_to_ignore = config.config.get('exclude_directories', [])
             for dir_name in base_dirs_to_ignore:
-                # Add original case (given case)
                 ignore_dirs.add(dir_name)
-                # Add uppercase variant
                 ignore_dirs.add(dir_name.upper())
-                # Add lowercase variant
                 ignore_dirs.add(dir_name.lower())
 
-        # Pass FileContentProvider to Tools if available
         file_content_provider = config.file_content_provider if hasattr(config, 'file_content_provider') else None
 
-        # Get the artifacts directory path (code_insights subdirectory)
         output_provider = get_output_directory_provider()
         artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
 
-        # Get DirectoryTreeUtil instance from AnalysisRunner if available
         directory_tree_util = None
         try:
             # Lazy import to avoid circular dependency
@@ -125,10 +108,8 @@ class CodeAnalysis:
 
         self.tools = Tools(config.repo_path, output_base_dir, file_content_provider, artifacts_dir, directory_tree_util, ignore_dirs)
 
-        # Cache for processed files
         self.processed_cache_file = config.processed_cache_file
 
-        # Token tracking
         self.total_input_tokens = 0
         self.total_output_tokens = 0
 
@@ -193,7 +174,6 @@ class CodeAnalysis:
         if not self.file_filter:
             return True
 
-        # Extract file path from the function data
         file_path = None
 
         # Check different possible structures in the function data
@@ -209,7 +189,6 @@ class CodeAnalysis:
         # Normalize file paths for comparison (remove leading ./ and handle relative paths)
         normalized_file_path = file_path.lstrip('./')
 
-        # Check if the file is in our filter list
         for filter_file in self.file_filter:
             normalized_filter_file = filter_file.lstrip('./')
             if normalized_file_path == normalized_filter_file or normalized_file_path.endswith('/' + normalized_filter_file):
@@ -232,20 +211,15 @@ class CodeAnalysis:
             return json_content
 
         try:
-            # Parse the JSON content
             data = json.loads(json_content)
 
-            # Handle different JSON structures
             if isinstance(data, dict):
-                # Check if this is a single function/file entry
                 if self._should_analyze_function_data(data):
                     return json_content
                 else:
-                    # This function/file should be filtered out
                     logger.info(f"Filtering out function/file due to file filter")
                     return json.dumps({"filtered": True, "reason": "File not in filter list"})
             elif isinstance(data, list):
-                # Filter the list of functions/files
                 filtered_data = []
                 for item in data:
                     if self._should_analyze_function_data(item):
@@ -279,11 +253,9 @@ class CodeAnalysis:
             Tuple[str, str]: (system_prompt, user_prompt)
         """
         try:
-            # Determine analysis type
             analysis_type = PromptBuilder.determine_analysis_type(json_content)
             logger.info(f"Determined analysis type: {analysis_type}")
 
-            # Build complete prompts with AST index data and user-provided prompts
             system_prompt, user_prompt = PromptBuilder.build_complete_prompt(
                 json_content,
                 analysis_type=analysis_type,
@@ -317,7 +289,6 @@ class CodeAnalysis:
             iteration: Current iteration number
         """
         try:
-            # Extract token usage from response
             usage = response.get("usage", {})
 
             input_tokens = (
@@ -330,14 +301,11 @@ class CodeAnalysis:
             )
 
             if input_tokens > 0 or output_tokens > 0:
-                # Log current API call token usage
                 logger.info(f"Iteration {iteration} - Input tokens: {input_tokens:,}, Output tokens: {output_tokens:,}")
 
-                # Update totals
                 self.total_input_tokens += input_tokens
                 self.total_output_tokens += output_tokens
 
-                # Log running totals
                 logger.info(f"Running totals - Input tokens: {self.total_input_tokens:,}, Output tokens: {self.total_output_tokens:,}")
             else:
                 logger.warning(f"Iteration {iteration} - No token usage information found in API response")
@@ -373,9 +341,7 @@ class CodeAnalysis:
         try:
             full_prompt = f"# SYSTEM PROMPT\n\n{system_prompt}\n\n# USER PROMPT\n\n{user_prompt}"
 
-            # Write to temp directory instead of current working directory
             repo_path = self.config.repo_path
-            # Use the output directory from the singleton instead of JSON config
 
             try:
                 output_provider = get_output_directory_provider()
@@ -406,7 +372,6 @@ class CodeAnalysis:
 
             cleaned_result = clean_json_response(result)
 
-            # Validate and format JSON
             is_valid, final_output = validate_and_format_json(cleaned_result)
 
             if is_valid:
@@ -429,7 +394,6 @@ class CodeAnalysis:
             str: Original context as JSON string
         """
         try:
-            # Read the original JSON file that was analyzed
             with open(self.config.json_file_path, 'r', encoding='utf-8') as f:
                 original_data = f.read()
             return original_data
@@ -495,16 +459,13 @@ class CodeAnalysis:
                 logger.debug("Processed cache file is None (legacy cache system removed), skipping cache update")
                 return
 
-            # Load existing cache
             cache = self._load_processed_cache()
 
-            # Get file info
             file_name = os.path.basename(self.config.json_file_path)
             output_size = 0
             if success and os.path.exists(self.config.output_file):
                 output_size = os.path.getsize(self.config.output_file)
 
-            # Update cache entry
             cache[file_name] = {
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'input_file': self.config.json_file_path,
@@ -518,7 +479,6 @@ class CodeAnalysis:
                 'total_tokens': self.total_input_tokens + self.total_output_tokens
             }
 
-            # Save cache immediately using utility function
             success_write = write_json_file(self.processed_cache_file, cache)
 
             if success_write:
@@ -572,14 +532,12 @@ class CodeAnalysis:
             bundle_path = None
             context_bundles_dir = None
 
-        # Start conversation tracking
         context_info = os.path.basename(self.config.json_file_path)
         self.claude.start_conversation("context_collection", context_info)
 
         try:
             json_content = json.dumps(json_data, ensure_ascii=False)
 
-            # Build context collection prompts
             user_provided_prompts = None
             if self.config.config and isinstance(self.config.config, dict):
                 user_provided_prompts = self.config.config.get('user_provided_prompts')
@@ -593,7 +551,6 @@ class CodeAnalysis:
                 user_provided_prompts=user_provided_prompts
             )
 
-            # Check token limits
             if not self.claude.check_token_limit(system_prompt, user_prompt):
                 logger.error("Context Collection: Input exceeds token limits - aborting")
                 return None
@@ -606,7 +563,6 @@ class CodeAnalysis:
                 "getFileContent", "checkFileSize"
             ]
 
-            # Use ContextCollectionAnalyzer for stage-specific JSON extraction
             analyzer = ContextCollectionAnalyzer(self.claude)
             raw_result = analyzer.run_iterative_analysis(
                 system_prompt=system_prompt,
@@ -667,7 +623,6 @@ Based on the tool results above, continue gathering context. Remember:
                 logger.error(f"Context Collection: Expected dict context bundle, got {type(context_bundle)}")
                 return None
 
-            # Save context bundle to disk
             if context_bundles_dir and bundle_path:
                 try:
                     os.makedirs(context_bundles_dir, exist_ok=True)
@@ -699,12 +654,10 @@ Based on the tool results above, continue gathering context. Remember:
         logger.info("Analysis: Starting from context bundle...")
         start_time = time.time()
 
-        # Start conversation tracking
         func_name = context_bundle.get("primary_function", {}).get("name", "unknown")
         self.claude.start_conversation("analysis", func_name)
 
         try:
-            # Build analysis prompts
             system_prompt, user_prompt = PromptBuilder.build_analysis_from_context_prompt(
                 context_bundle=context_bundle,
                 config=self.config.config

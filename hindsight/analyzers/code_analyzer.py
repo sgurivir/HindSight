@@ -70,7 +70,7 @@ from .dummy_analyzer import DummyCodeAnalyzer
 from .llm_based_analyzer import LLMBasedAnalyzer
 from .token_tracker import TokenTracker
 from ..analysys_strategy.diff_strategy import DiffStrategy
-from ..core.constants import (DEFAULT_LOGS_DIR, DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE,
+from ..core.constants import (DEFAULT_LOGS_DIR, DEFAULT_MAX_TOKENS,
                               MIN_FUNCTION_BODY_LENGTH, MAX_FUNCTION_BODY_LENGTH,
                               DEFAULT_NUM_FUNCTIONS_TO_ANALYZE,
                               MERGED_DEFINED_CLASSES_FILE,
@@ -180,7 +180,6 @@ class CodeAnalyzer(LLMBasedAnalyzer):
                     repo_path=self.repo_path,
                     output_file="",
                     max_tokens=DEFAULT_MAX_TOKENS,
-                    temperature=DEFAULT_TEMPERATURE,
                     processed_cache_file=None,  # Using new publisher-subscriber caching system
                     config=self.config,
                     file_content_provider=self.file_content_provider,
@@ -387,9 +386,9 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 for location in [json_data, json_data.get('context', {}), json_data.get('function', {})]:
                     if isinstance(location, dict):
                         if start_line is None:
-                            start_line = location.get('start_line') or location.get('startLine')
+                            start_line = location.get('start_line') or location.get('startLine') or location.get('start')
                         if end_line is None:
-                            end_line = location.get('end_line') or location.get('endLine')
+                            end_line = location.get('end_line') or location.get('endLine') or location.get('end')
 
                         if start_line is not None and end_line is not None:
                             break
@@ -802,15 +801,15 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             self.logger.error(f"Call graph file not found: {nested_call_graph_path}")
             return [], {}
 
-        # Load and validate call graph structure
+        # Load and validate call graph structure (flat list of file entries)
         call_graph_data = read_json_file(nested_call_graph_path)
-        if not call_graph_data or 'call_graph' not in call_graph_data:
+        if not call_graph_data or not isinstance(call_graph_data, list):
             self.logger.error(f"Invalid call graph structure in: {nested_call_graph_path}")
             return [], {}
 
         # Count total functions for reporting
         total_functions = 0
-        for file_entry in call_graph_data['call_graph']:
+        for file_entry in call_graph_data:
             functions = file_entry.get('functions', [])
             total_functions += len(functions)
 
@@ -955,6 +954,28 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
 
     # _initialize_unified_issue_filter is now provided by UnifiedIssueFilterMixin
 
+    def _build_current_checksum_map(self, repo_path: str = None) -> dict:
+        """Build a mapping of (file_path, function_name) -> current checksum by reading source files from disk."""
+        checksums = {}
+        if not hasattr(self, 'call_graph_data') or not self.call_graph_data:
+            return checksums
+        if not repo_path:
+            repo_path = getattr(self, '_current_repo_path', None)
+        if not repo_path:
+            return checksums
+        for file_entry in self.call_graph_data:
+            for func_entry in file_entry.get('functions', []):
+                func_name = func_entry.get('function', '')
+                context = func_entry.get('context', {})
+                file_path = context.get('file', '') or file_entry.get('file', '')
+                start_line = context.get('start', 0)
+                end_line = context.get('end', 0)
+                if func_name and file_path and start_line and end_line:
+                    checksums[(file_path, func_name)] = HashUtil.checksum_for_function_source(
+                        repo_path, file_path, start_line, end_line
+                    )
+        return checksums
+
     def _initialize_publisher_subscriber(self, config: dict, output_base_dir: str) -> None:
         """
         Initialize the publisher-subscriber system for code analysis results.
@@ -984,15 +1005,20 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         # If we have a file system subscriber, load existing results for caching
         # Note: Category filtering is applied later during the analysis loop when results are republished
         # This ensures consistent filtering behavior for both cached and newly analyzed results
+        current_checksums = self._build_current_checksum_map(repo_path)
         for subscriber in self._subscribers:
             if hasattr(subscriber, 'load_existing_results'):
-                loaded_count = subscriber.load_existing_results(repo_name, self.results_publisher)
+                loaded_count = subscriber.load_existing_results(
+                    repo_name, self.results_publisher,
+                    current_checksums=current_checksums if current_checksums else None
+                )
                 if loaded_count > 0:
                     self.logger.info(f"Loaded {loaded_count} existing analysis results for checksum-based caching via {type(subscriber).__name__}")
 
         self.logger.info(f"Initialized publisher-subscriber system for repository: {repo_name}")
 
-    def _initialize_publisher_subscriber_for_report(self, config: dict, output_base_dir: str) -> None:
+    def _initialize_publisher_subscriber_for_report(self, config: dict, output_base_dir: str,
+                                                     current_checksums: dict = None) -> None:
         """
         Initialize the publisher-subscriber system for report generation from existing issues.
         Unlike _initialize_publisher_subscriber(), this method loads results directly into
@@ -1001,6 +1027,8 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         Args:
             config: Configuration dictionary
             output_base_dir: Base output directory
+            current_checksums: Optional dict mapping (file_path, function_name) -> current checksum.
+                             When provided, stale results are deleted during loading.
         """
         # Extract repository name from path
         repo_path = config['path_to_repo']
@@ -1023,7 +1051,10 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         # This is different from _initialize_publisher_subscriber which only indexes for cache lookups
         for subscriber in self._subscribers:
             if hasattr(subscriber, 'load_existing_results_for_report'):
-                loaded_count = subscriber.load_existing_results_for_report(repo_name, self.results_publisher)
+                loaded_count = subscriber.load_existing_results_for_report(
+                    repo_name, self.results_publisher,
+                    current_checksums=current_checksums if current_checksums else None
+                )
                 if loaded_count > 0:
                     self.logger.info(f"Loaded {loaded_count} existing analysis results for report generation via {type(subscriber).__name__}")
 
@@ -1060,6 +1091,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
 
         # Extract configuration values
         repo_path = config['path_to_repo']
+        self._current_repo_path = repo_path
         num_functions_to_analyze = config.get('num_functions_to_analyze', DEFAULT_NUM_FUNCTIONS_TO_ANALYZE)
 
         # Create LLM analysis output directory under results/
@@ -1074,7 +1106,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         self.logger.info("Pre-filtering and sorting functions by length...")
         filtered_functions = []
 
-        for file_entry in self.call_graph_data['call_graph']:
+        for file_entry in self.call_graph_data:
             functions = file_entry.get('functions', [])
 
             for func_entry in functions:
@@ -1180,33 +1212,26 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             function_name = func_entry.get('function', 'unknown')
             primary_file = func_entry.get('context', {}).get('file', 'unknown')
 
-            # Get function checksum directly from the func_entry (from call graph data)
-            function_checksum = func_entry.get('checksum', None)
-            if function_checksum and function_checksum != "None":
-                # Use first 8 characters of content checksum
-                checksum_hash = function_checksum[:8]
-            else:
-                # Fallback to file path hash if checksum not available
-                checksum_hash = HashUtil.hash_for_file_identifier_md5(primary_file, truncate_length=8)
+            # Compute function checksum on-the-fly from the actual source file on disk
+            func_context = func_entry.get('context', {})
+            function_checksum = HashUtil.checksum_for_function_source(
+                repo_path, primary_file, func_context.get('start', 0), func_context.get('end', 0)
+            )
 
             # Check if already processed using publisher with concurrent lookup across all prior result stores
             if self.results_publisher:
-                current_checksum = function_checksum if function_checksum and function_checksum != "None" else checksum_hash
-                self.logger.debug(f"[{i}/{total_functions}] Checking cache for function='{function_name}', file='{primary_file}', checksum='{current_checksum}'")
+                self.logger.debug(f"[{i}/{total_functions}] Checking cache for function='{function_name}', file='{primary_file}', checksum='{function_checksum}'")
 
                 existing_result = self.results_publisher.check_existing_result(
                     primary_file,
                     function_name,
-                    current_checksum
+                    function_checksum
                 )
 
                 if existing_result:
                     self.logger.info(f"[{i}/{total_functions}] ⏭️  ANALYSIS SKIPPED - Same checksum found for {function_name}")
-                    self.logger.info(f"[{i}/{total_functions}] 🔍 Function: {function_name} | File: {primary_file} | Checksum: {current_checksum}")
-                    if function_checksum and function_checksum != "None":
-                        self.logger.info(f"[{i}/{total_functions}] ✅ Content unchanged ({function_length} lines) - reusing existing analysis result")
-                    else:
-                        self.logger.info(f"[{i}/{total_functions}] ✅ Already processed ({function_length} lines) - reusing existing analysis result")
+                    self.logger.info(f"[{i}/{total_functions}] 🔍 Function: {function_name} | File: {primary_file} | Checksum: {function_checksum}")
+                    self.logger.info(f"[{i}/{total_functions}] ✅ Content unchanged ({function_length} lines) - reusing existing analysis result")
 
                     # Republish the existing result to the current analysis session
                     repo_name = os.path.basename(repo_path.rstrip('/'))
@@ -1217,7 +1242,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                                 existing_result,
                                 file_path=primary_file,
                                 function=function_name,
-                                checksum=current_checksum
+                                checksum=function_checksum
                             )
 
                             # Validate the normalized result
@@ -1244,7 +1269,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                                 repo_name=repo_name,
                                 file_path=primary_file,
                                 function=function_name,
-                                function_checksum=current_checksum,
+                                function_checksum=function_checksum,
                                 results=existing_results
                             )
                             self.logger.info(f"[{i}/{total_functions}] 📤 Republished existing result with {len(existing_results)} issues to current analysis")
@@ -1288,7 +1313,6 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 if result is not None:
                     # Use centralized schema to create standardized result
                     try:
-                        final_checksum = function_checksum if function_checksum and function_checksum != "None" else checksum_hash
 
                         # Normalize the result to ensure it's in the correct format
                         if isinstance(result, list):
@@ -1329,7 +1353,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                         standardized_result = create_result(
                             file_path=primary_file,
                             function=function_name,
-                            checksum=final_checksum,
+                            checksum=function_checksum,
                             issues=issues_list
                         )
 
@@ -1379,7 +1403,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                                     repo_name=repo_name,
                                     file_path=primary_file,
                                     function=function_name,
-                                    function_checksum=final_checksum,
+                                    function_checksum=function_checksum,
                                     results=result_issues
                                 )
                                 success = True
@@ -2090,9 +2114,25 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             repo_path_obj = Path(config["path_to_repo"])
             self.create_file_content_provider(repo_path_obj)
 
+            # Load call graph to build current checksum map for stale result detection
+            current_checksums = None
+            repo_path = config['path_to_repo']
+            ast_call_graph_dir = config.get('astCallGraphDir', '')
+            if ast_call_graph_dir:
+                nested_call_graph_path = os.path.join(ast_call_graph_dir, NESTED_CALL_GRAPH_FILE)
+                if os.path.exists(nested_call_graph_path):
+                    call_graph_data = read_json_file(nested_call_graph_path)
+                    if call_graph_data and isinstance(call_graph_data, list):
+                        self.call_graph_data = call_graph_data
+                        current_checksums = self._build_current_checksum_map(repo_path)
+                        self.logger.info(f"Built checksum map with {len(current_checksums)} entries for stale result detection")
+                else:
+                    self.logger.warning(f"Call graph not found at {nested_call_graph_path} - cannot detect stale results")
+
             # Initialize publisher-subscriber system to load existing results
             self.logger.info("Initializing publisher-subscriber system for existing results...")
-            self._initialize_publisher_subscriber_for_report(config, output_base_dir)
+            self._initialize_publisher_subscriber_for_report(config, output_base_dir,
+                                                             current_checksums=current_checksums)
 
             # For report regeneration:
             # 1. Apply Level 1 (Category) filter only - no LLM calls

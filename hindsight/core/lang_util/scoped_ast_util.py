@@ -18,7 +18,6 @@ sys.path.insert(0, str(project_root))
 
 from hindsight.utils.log_util import setup_default_logging
 from hindsight.utils.file_util import read_json_file, write_json_file
-from hindsight.core.lang_util.ast_function_signature_util import ASTFunctionSignatureGenerator
 from hindsight.core.lang_util.ast_merger import ASTMerger
 from hindsight.core.lang_util.ast_util_language_helper import ClangAnalysisHelper
 from hindsight.core.constants import (
@@ -572,10 +571,8 @@ class ScopedASTUtil:
             "function_to_location": merged_functions_dict
         }
 
-        # Add checksums to the merged functions and write to file
-        ASTFunctionSignatureGenerator.process_functions_with_checksums_and_write(
-            repo_root, merged_output, merged_symbols_out
-        )
+        # Write merged functions to file
+        write_json_file(str(merged_symbols_out), merged_output)
 
         # Write merged call graph
         logger.info(f"[+] Writing scoped merged call graph to {merged_graph_out}")
@@ -588,14 +585,6 @@ class ScopedASTUtil:
                 clang_data_types_out, swift_data_types_out, kotlin_data_types_out,
                 java_data_types_out, go_data_types_out, merged_data_types_out, repo_root
             )
-
-        # Add checksums to the merged call graph
-        ASTFunctionSignatureGenerator.process_call_graph_file(
-            repo_path=repo_root,
-            input_file=merged_graph_out,
-            data_types_file=merged_data_types_out,
-            functions_file=merged_symbols_out
-        )
 
         # Log summary
         logger.info("Scoped AST Analysis Complete!")
@@ -666,18 +655,6 @@ class ScopedASTUtil:
             use_parallel=use_parallel,
             max_workers=max_workers
         )
-        
-        # Add checksums to Clang data types if file exists
-        if clang_classes_out and clang_classes_out.exists():
-            try:
-                logger.info("[+] Adding checksums to scoped Clang data types...")
-                ASTFunctionSignatureGenerator.process_data_types_file(
-                    repo_path=repo_root,
-                    input_file=clang_classes_out,
-                    output_file=clang_classes_out
-                )
-            except Exception as e:
-                logger.warning(f"Failed to add checksums to scoped Clang data types: {e}")
         
         # Build data type usage mapping
         custom_types = set(data_types_registry.keys()) if data_types_registry else None
@@ -773,19 +750,7 @@ class ScopedASTUtil:
             only_repo_defined=True,
             registry_names=symbols_set
         )
-        
-        # Add checksums to Swift data types if file exists
-        if swift_classes_out and swift_classes_out.exists():
-            try:
-                logger.info("[+] Adding checksums to scoped Swift data types...")
-                ASTFunctionSignatureGenerator.process_data_types_file(
-                    repo_path=repo_root,
-                    input_file=swift_classes_out,
-                    output_file=swift_classes_out
-                )
-            except Exception as e:
-                logger.warning(f"Failed to add checksums to scoped Swift data types: {e}")
-        
+
         # Build data type usage
         custom_types = set(class_registry.keys()) if class_registry else None
         data_type_usage = SwiftASTUtil.build_data_type_use(
@@ -871,19 +836,7 @@ class ScopedASTUtil:
             source_files=source_files,
             function_registry=function_names
         )
-        
-        # Add checksums to Kotlin data types if file exists
-        if kotlin_classes_out and kotlin_classes_out.exists():
-            try:
-                logger.info("[+] Adding checksums to scoped Kotlin data types...")
-                ASTFunctionSignatureGenerator.process_data_types_file(
-                    repo_path=repo_root,
-                    input_file=kotlin_classes_out,
-                    output_file=kotlin_classes_out
-                )
-            except Exception as e:
-                logger.warning(f"Failed to add checksums to scoped Kotlin data types: {e}")
-        
+
         # Build constants usage mapping
         logger.info("[+] Building constants usage mapping for scoped Kotlin analysis...")
         constants_usage = kotlin_util.build_constants_usage(
@@ -954,19 +907,7 @@ class ScopedASTUtil:
             source_files=source_files,
             function_registry=function_names
         )
-        
-        # Add checksums to Java data types if file exists
-        if java_classes_out and java_classes_out.exists():
-            try:
-                logger.info("[+] Adding checksums to scoped Java data types...")
-                ASTFunctionSignatureGenerator.process_data_types_file(
-                    repo_path=repo_root,
-                    input_file=java_classes_out,
-                    output_file=java_classes_out
-                )
-            except Exception as e:
-                logger.warning(f"Failed to add checksums to scoped Java data types: {e}")
-        
+
         # Build data type usage
         class_registry = {}
         if java_classes_out:
@@ -1075,19 +1016,7 @@ class ScopedASTUtil:
             only_repo_defined=True,
             registry_names=function_names
         )
-        
-        # Add checksums to Go data types if file exists
-        if go_classes_out and go_classes_out.exists():
-            try:
-                logger.info("[+] Adding checksums to scoped Go data types...")
-                ASTFunctionSignatureGenerator.process_data_types_file(
-                    repo_path=repo_root,
-                    input_file=go_classes_out,
-                    output_file=go_classes_out
-                )
-            except Exception as e:
-                logger.warning(f"Failed to add checksums to scoped Go data types: {e}")
-        
+
         # Build data type usage mapping
         custom_types = set(class_registry.keys()) if class_registry else None
         data_type_usage = GoASTUtil.build_data_type_use(

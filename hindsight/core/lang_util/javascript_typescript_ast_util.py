@@ -438,19 +438,6 @@ class JavaScriptTypeScriptASTUtil:
         
         logging.info(f"[+] Wrote {len(json_output)} class definitions to {out_path}")
         
-        # Add checksums to the generated file for consistency with other languages
-        try:
-            from .ast_function_signature_util import ASTFunctionSignatureGenerator
-            
-            ASTFunctionSignatureGenerator.process_data_types_file(
-                repo_path=repo_root,
-                input_file=Path(out_path),
-                output_file=Path(out_path)
-            )
-            logging.info(f"[+] Added checksums to JS/TS class definitions: {out_path}")
-        except Exception as e:
-            logging.warning(f"Failed to add checksums to JS/TS class definitions: {e}")
-        
         return class_registry
 
     def _extract_classes_from_node(self, node: Node, source_code: str, file_path: str, registry: Dict[str, List[Dict[str, Any]]]):

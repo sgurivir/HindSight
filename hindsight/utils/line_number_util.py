@@ -186,6 +186,11 @@ def add_line_numbers(content: str, start_line: int = 1) -> str:
     return '\n'.join(numbered_lines)
 
 
+def has_line_number_prefix(line: str) -> bool:
+    """Check if a single line has a line-number prefix (e.g. '  123 | ...')."""
+    return bool(re.match(LINE_NUMBER_FORMAT_REGEX, line))
+
+
 def has_line_numbers(content: str) -> bool:
     """
     Check if content already has line numbers.

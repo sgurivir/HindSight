@@ -6,6 +6,8 @@ OutputDirectoryProvider - Singleton for managing output directory configuration
 from typing import Optional
 from threading import Lock
 
+from ..core.exceptions import ConfigurationError
+
 from .artifacts import get_repo_artifacts_dir
 
 
@@ -61,7 +63,7 @@ class OutputDirectoryProvider:
         """
         effective_repo_path = repo_path or self._repo_path
         if not effective_repo_path:
-            raise RuntimeError("OutputDirectoryProvider not configured and no repo_path provided")
+            raise ConfigurationError("OutputDirectoryProvider not configured and no repo_path provided")
 
         return get_repo_artifacts_dir(effective_repo_path, self._custom_base_dir)
 

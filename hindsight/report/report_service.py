@@ -9,6 +9,7 @@ from datetime import datetime
 from ..db.repositories import AnalysisRepository, ResultsRepository, RepositoryRepository
 from .report_generator import generate_html_report
 from ..utils.log_util import get_logger
+from ..core.exceptions import ReportError
 
 logger = get_logger(__name__)
 
@@ -82,11 +83,10 @@ async def generate_report_for_analysis(
         return html_content
         
     except ValueError:
-        # Re-raise validation errors
         raise
     except Exception as e:
         logger.error(f"Error generating report for analysis {analysis_id}: {e}", exc_info=True)
-        raise Exception(f"Failed to generate report: {str(e)}")
+        raise ReportError(str(e))
 
 
 async def _fetch_all_results(analysis_id: UUID) -> list:

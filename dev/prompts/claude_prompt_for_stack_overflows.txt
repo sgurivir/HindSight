@@ -1,0 +1,163 @@
+Go through each function in Daemon/ directory and identify potential cases where stack overflows can happen. 
+
+
+Also check if there are any potential heap/stack overflows/underflows which can happen in locationd, but triggered by an app using public iOS SDK
+
+Dont report the candidates where data is sourced internally. 
+
+This is a long running task. First write down list of functions in a stack_overflow_progress.md file you can track your own progress and go through one at a time. If i restart the task, pick up where you left off.
+
+At the end create a HTML report of your findings. Report should have a have a table of issues where each issue has "title", "description" and "potential fix". Make sure to include file path and line numbers where the code is located.
+
+You can find examples of where stack overflow problems below
+===========
+# Stack Overflow Anti-Patterns in C++
+
+A comprehensive guide to coding patterns and design decisions that can lead to stack overflow errors.
+
+---
+
+## 🔁 Recursion-Based Anti-Patterns
+
+### 1. Missing Base Case
+```cpp
+void recurse() {
+    recurse(); // no termination condition
+}
+```
+
+### 2. Unreachable Base Case
+```cpp
+void recurse(int n) {
+    if (n == -1) return;  // n is always positive, never hits -1
+    recurse(n + 1);       // wrong direction!
+}
+```
+
+### 3. Mutual / Indirect Recursion
+```cpp
+void funcA();
+void funcB() { funcA(); }  // A calls B, B calls A
+void funcA() { funcB(); }  // infinite loop across two functions
+```
+
+### 4. Accidental Recursion (Self-call)
+```cpp
+int getValue() {
+    return getValue(); // meant to call a different function
+}
+```
+
+### 5. Deep Valid Recursion on Large Input
+```cpp
+int fibonacci(int n) {
+    if (n <= 1) return n;
+    return fibonacci(n - 1) + fibonacci(n - 2); // O(2^n) depth
+}
+fibonacci(100000); // valid logic, but too deep
+```
+
+---
+
+## 📦 Stack Allocation Anti-Patterns
+
+### 6. Huge Local Arrays on the Stack
+```cpp
+void foo() {
+    int buffer[10000000]; // ~40MB on stack — instant overflow
+}
+```
+
+### 7. Large Stack-Allocated Structs/Objects
+```cpp
+struct Huge { char data[1024 * 1024]; }; // 1MB struct
+
+void foo() {
+    Huge obj; // stack can't hold this
+}
+```
+
+### 8. Deeply Nested Function Calls with Large Locals
+```cpp
+void a() { int buf[10000]; b(); }
+void b() { int buf[10000]; c(); }
+void c() { int buf[10000]; /* ... */ } // each frame eats stack space
+```
+
+---
+
+## 🔄 Design / Architectural Anti-Patterns
+
+### 9. Recursive Data Structure Traversal Without Depth Limit
+```cpp
+void traverse(Node* node) {
+    traverse(node->left);  // no depth guard on a very deep tree
+    traverse(node->right);
+}
+```
+
+### 10. Observer / Event Pattern Triggering Itself
+```cpp
+// Event handler modifies state → triggers same event → handler fires again...
+void onValueChanged() {
+    setValue(newValue); // setValue emits onValueChanged → infinite loop
+}
+```
+
+### 11. Recursive Serialization / Deserialization
+```cpp
+// Circular object references cause recursive serializers to loop forever
+// e.g., A → B → A → B → ...
+```
+
+### 12. Copy Constructors / Assignment Operators Calling Themselves
+```cpp
+MyClass(const MyClass& other) {
+    *this = other;        // calls operator=
+}
+MyClass& operator=(const MyClass& other) {
+    MyClass temp(other);  // calls copy constructor → infinite loop
+}
+```
+
+---
+
+## ⚙️ Threading Anti-Patterns
+
+### 13. Signal Handler Calling Non-Reentrant Functions
+```cpp
+// Signal fires during stack-heavy execution,
+// handler itself uses more stack → overflow
+```
+
+### 14. Stack Size Too Small for Thread
+```cpp
+// Creating threads with minimal stack size
+// then calling deeply nested or recursive functions within them
+pthread_attr_setstacksize(&attr, 1024); // dangerously small
+```
+
+---
+
+## 🧵 Quick Reference Summary
+
+| Category | Anti-Pattern | Root Cause |
+|---|---|---|
+| Recursion | Missing/unreachable base case | Infinite frames |
+| Recursion | Mutual recursion | Circular call chain |
+| Recursion | Deep recursion on large input | Too many valid frames |
+| Allocation | Large local arrays/structs | Single frame too big |
+| Design | Event triggering itself | Indirect infinite recursion |
+| Design | Circular object traversal | No depth/cycle guard |
+| Design | Bad copy constructor | Self-referencing construction |
+| Threading | Tiny thread stack size | Not enough space for frames |
+
+---
+
+## ✅ General Prevention Tips
+
+- **Prefer iteration over recursion** for large inputs
+- **Allocate large data on the heap** (`new` / `std::vector`) not the stack
+- **Add depth guards** to recursive traversals
+- **Use tail recursion** where the compiler can optimize it away
+- **Break circular dependencies** in event/observer systems

@@ -40,6 +40,7 @@ from .base_provider import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_DELAYS
 )
+from ...constants import ModelLimits
 from ....utils.log_util import get_logger
 
 logger = get_logger(__name__)
@@ -88,11 +89,9 @@ class AWSBedrockProvider(BaseLLMProvider):
                     "Authorization": f"Bearer {bearer_token}",
                     "X-Floodgate-Project-Token": bearer_token
                 }
-                # Note: X-Apple-OIDC-Token is NOT added when using FloodGate token
-                logger.info("Using project_credentials for Authorization and X-Floodgate-Project-Token headers")
-                logger.info("X-Apple-OIDC-Token header skipped (FloodGate mode)")
+                logger.debug("Using project_credentials for FloodGate authentication")
                 self._use_apple_connect_auto_refresh = False
-                    
+
             elif creds_provided:
                 # Case 2: credentials provided - use OAuth/OIDC token
                 bearer_token = config.credentials.strip()
@@ -101,26 +100,26 @@ class AWSBedrockProvider(BaseLLMProvider):
                     "Authorization": f"Bearer {bearer_token}",
                     "X-Apple-OIDC-Token": bearer_token
                 }
-                logger.info("Using credentials for Authorization and X-Apple-OIDC-Token headers")
+                logger.debug("Using credentials for OIDC authentication")
                 self._use_apple_connect_auto_refresh = False
-                
+
             elif api_key_provided:
                 # Case 3: Legacy api_key provided - use as OIDC token
-                # Check if this token was obtained via AppleConnect (needs refresh)
-                # or is a static token (no refresh needed)
                 bearer_token = config.api_key.strip()
                 self.headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {bearer_token}",
                     "X-Apple-OIDC-Token": bearer_token
                 }
-                # AppleConnect tokens expire in ~30 minutes and need refresh
-                # Static tokens (like service account tokens) don't expire
-                # Since we can't easily distinguish, always enable auto-refresh
-                # when using Apple GenAI endpoints without FloodGate token
                 self._use_apple_connect_auto_refresh = True
-                logger.info("Using legacy api_key for Authorization and X-Apple-OIDC-Token headers")
-                logger.info("AppleConnect auto-refresh enabled (tokens expire in ~30 minutes)")
+                logger.debug("Using AppleConnect auto-refresh for token management")
+                # Seed the token manager with the initial token to avoid redundant fetch
+                from ....utils.api_key_util import get_token_manager
+                tm = get_token_manager()
+                if tm._current_token is None:
+                    tm._current_token = bearer_token
+                    tm._token_acquired_at = time.time()
+                    tm._is_apple_connect_token = True
                 
             else:
                 # Case 4: Neither provided - use AppleConnect auto-refresh
@@ -129,7 +128,7 @@ class AWSBedrockProvider(BaseLLMProvider):
                 self.headers = {
                     "Content-Type": "application/json",
                 }
-                logger.info("No credentials provided - will use AppleConnect auto-refresh")
+                logger.debug("No credentials provided - will use AppleConnect auto-refresh")
             
             logger.debug(f"project_credentials provided: {project_creds_provided}")
             logger.debug(f"credentials provided: {creds_provided}")
@@ -156,21 +155,18 @@ class AWSBedrockProvider(BaseLLMProvider):
         if self._is_apple_genai_endpoint(config.api_url):
             # For Apple internal endpoints, check for custom certificate bundle
             custom_ca_bundle = os.getenv("REQUESTS_CA_BUNDLE") or os.getenv("CURL_CA_BUNDLE")
-            # Allow disabling SSL verification only when explicitly requested
-            disable_ssl = os.getenv("DISABLE_SSL_VERIFICATION", "false").lower() == "true"
+            enable_ssl = os.getenv("ENABLE_SSL_VERIFICATION", "false").lower() == "true"
 
             if custom_ca_bundle and os.path.exists(custom_ca_bundle):
                 self.session.verify = custom_ca_bundle
-                logger.info(f"Using custom CA bundle for Apple internal endpoint: {custom_ca_bundle}")
-            elif disable_ssl:
-                self.session.verify = False
-                # Suppress InsecureRequestWarning when SSL verification is intentionally disabled
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                logger.warning("SSL verification disabled for Apple internal endpoint (DISABLE_SSL_VERIFICATION=true)")
-            else:
-                # Default: Enable SSL verification
+                logger.debug(f"Using custom CA bundle for Apple internal endpoint: {custom_ca_bundle}")
+            elif enable_ssl:
                 self.session.verify = True
-                logger.info("SSL verification enabled for Apple internal endpoint (default)")
+                logger.warning("SSL verification enabled for Apple internal endpoint - may fail with self-signed certificates")
+            else:
+                self.session.verify = False
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                logger.debug("SSL verification disabled for Apple internal endpoint (default)")
         else:
             # For external endpoints, always verify certificates
             self.session.verify = True
@@ -209,21 +205,22 @@ class AWSBedrockProvider(BaseLLMProvider):
         if not getattr(self, '_use_apple_connect_auto_refresh', False):
             logger.debug("Token refresh skipped - using static credentials (not auto-refresh mode)")
             return
-        
-        logger.info("Attempting AppleConnect token refresh...")
-        
+
         try:
             from ....utils.api_key_util import get_token_manager
             token_manager = get_token_manager()
+
+            if not token_manager.needs_refresh():
+                return
+
+            logger.info("Refreshing AppleConnect token...")
             token = token_manager.get_token()
-            
+
             if token:
                 self.headers["Authorization"] = f"Bearer {token}"
                 self.headers["X-Apple-OIDC-Token"] = token
-                # Log token refresh at INFO level for visibility
-                # Only show first/last 4 chars of token for security
                 token_preview = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "****"
-                logger.info(f"AppleConnect token refreshed successfully (token: {token_preview})")
+                logger.info(f"AppleConnect token refreshed (token: {token_preview})")
             else:
                 logger.warning("Failed to get AppleConnect token - headers not updated")
         except ImportError as e:
@@ -372,7 +369,8 @@ class AWSBedrockProvider(BaseLLMProvider):
 
         # Final safety check: validate token limits before creating payload
         estimated_tokens = total_content_length // 3  # Conservative estimate
-        max_input_tokens = self.config.max_tokens - 5000  # Leave buffer for response
+        context_window = ModelLimits.get_context_window(self.config.model)
+        max_input_tokens = context_window - self.config.max_tokens  # Reserve space for response
 
         if estimated_tokens > max_input_tokens:
             error_msg = (
@@ -380,18 +378,19 @@ class AWSBedrockProvider(BaseLLMProvider):
                 f"Total content: {total_content_length:,} characters\n"
                 f"Estimated tokens: {estimated_tokens:,}\n"
                 f"Max input tokens: {max_input_tokens:,}\n"
-                f"Model limit: {self.config.max_tokens:,}"
+                f"Context window: {context_window:,}\n"
+                f"Max response tokens: {self.config.max_tokens:,}"
             )
             logger.error(error_msg)
             raise ValueError(error_msg)
 
         # AWS Bedrock payload format with tool support
+        max_output = ModelLimits.get_max_output_tokens(self.config.model)
         payload = {
             "model": self.config.model,
-            "max_tokens": self.config.max_tokens,
+            "max_tokens": min(self.config.max_tokens, max_output),
             "messages": processed_messages,
-            "stream": stream,
-            "temperature": self.config.temperature
+            "stream": stream
         }
 
         return payload

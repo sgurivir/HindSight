@@ -31,6 +31,8 @@ sys.path.insert(0, str(project_root))
 from ..utils.file_util import clear_directory_contents
 from ..utils.log_util import setup_default_logging, get_logger
 from ..utils.file_content_provider import FileContentProvider
+from ..utils.file_filter_util import matches_path_components
+from ..core.exceptions import RepositoryNotFoundError, RepositoryError, GitOperationError
 
 
 class BaseDiffAnalyzer(ABC):
@@ -85,10 +87,10 @@ class BaseDiffAnalyzer(ABC):
 
         # Verify that the repository directory exists and is a git repository
         if not self.repo_checkout_dir.exists():
-            raise ValueError(f"Repository directory does not exist: {self.repo_checkout_dir}")
-        
+            raise RepositoryNotFoundError(str(self.repo_checkout_dir))
+
         if not (self.repo_checkout_dir / '.git').exists():
-            raise ValueError(f"Directory is not a git repository: {self.repo_checkout_dir}")
+            raise RepositoryError(f"Directory is not a git repository: {self.repo_checkout_dir}")
 
         # Initialize GitPython repo object if available
         if HAS_GITPYTHON:
@@ -251,7 +253,7 @@ class BaseDiffAnalyzer(ABC):
         # Resolve branches to commits if branches are provided
         if self.branch1 or self.branch2:
             if not self.branch1 or not self.branch2:
-                raise ValueError("Both branch1 and branch2 must be provided when using branch-based diffing")
+                raise RepositoryError("Both branch1 and branch2 must be provided when using branch-based diffing")
             
             self.logger.info(f"Using branch-based diffing: {self.branch1} vs {self.branch2}")
             self.c1 = self.resolve_branch_to_commit(self.branch1)
@@ -262,7 +264,7 @@ class BaseDiffAnalyzer(ABC):
                 self.c2 = self.find_parent_commit(self.c1)
                 self.logger.info(f"No second commit provided, using parent commit: {self.c2}")
         else:
-            raise ValueError("Either commits (c1, c2) or branches (branch1, branch2) must be provided")
+            raise RepositoryError("Either commits (c1, c2) or branches (branch1, branch2) must be provided")
 
         # Get timestamps to determine which is newer
         c1_timestamp = self.get_commit_timestamp(self.c1)
@@ -361,16 +363,8 @@ class BaseDiffAnalyzer(ABC):
         file_dir = '/'.join(file_path.split('/')[:-1]) if '/' in file_path else ''
 
         for exclude_pattern in exclude_patterns:
-            # Case 1: Direct match with relative path (e.g., "Daemon/Shared")
-            if file_dir == exclude_pattern or file_dir.startswith(exclude_pattern + '/'):
+            if matches_path_components(file_path, exclude_pattern):
                 return True
-
-            # Case 2: Directory name matches (legacy behavior)
-            # Split the file path and check if any directory component matches
-            path_parts = file_path.split('/')[:-1]  # Exclude the filename itself
-            for part in path_parts:
-                if part.lower() == exclude_pattern.lower():
-                    return True
 
         return False
 
@@ -397,7 +391,7 @@ class BaseDiffAnalyzer(ABC):
         success = clear_directory_contents(str(self.out_dir))
         if not success:
             self.logger.error(f"Failed to clear diff output directory: {self.out_dir}")
-            raise RuntimeError(f"Could not clear diff output directory: {self.out_dir}")
+            raise RepositoryError(f"Could not clear diff output directory: {self.out_dir}")
 
     def _initialize_file_content_provider(self) -> None:
         """

@@ -130,13 +130,10 @@ class TestContextCollectionAnalyzerExtractJson:
         '''
         
         result = self.analyzer.extract_json(response)
-        
-        # Fallback behavior: returns the dict even without 'primary_function'
-        # This improves robustness when LLMs return partial/malformed responses
-        assert result is not None
-        parsed = json.loads(result)
-        assert isinstance(parsed, dict)
-        assert "some_other_key" in parsed
+
+        # Dict without 'primary_function' is no longer returned as fallback —
+        # extract_json returns None so the retry loop can send corrective guidance
+        assert result is None
 
     def test_extract_json_handles_nested_json(self):
         """Test extraction with deeply nested JSON structures."""

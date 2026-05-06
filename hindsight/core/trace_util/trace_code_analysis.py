@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
 
-from ..constants import MAX_TOOL_ITERATIONS
+from ..constants import MAX_TOOL_ITERATIONS, DEFAULT_MAX_TOKENS
 from ..llm.llm import Claude, ClaudeConfig
 from ..llm.tools import Tools
 from .trace_prompt_builder import TracePromptBuilder
@@ -36,8 +36,7 @@ class TraceAnalysisConfig:
     model: str
     repo_path: str
     output_file: str
-    max_tokens: int = 64000
-    temperature: float = 0.1
+    max_tokens: int = DEFAULT_MAX_TOKENS
     config: Dict[str, Any] = None  # Store the full configuration dict
 
 class TraceCodeAnalysis:
@@ -61,7 +60,6 @@ class TraceCodeAnalysis:
             api_url=config.api_url,
             model=config.model,
             max_tokens=config.max_tokens,
-            temperature=config.temperature,
             provider_type=config.config.get('llm_provider_type', 'aws_bedrock') if config.config else 'aws_bedrock'
         )
         self.claude = Claude(claude_config)

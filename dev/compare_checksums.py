@@ -28,7 +28,7 @@ def extract_function_checksums(data):
     """Extract function checksums from the call graph data."""
     checksums = {}
 
-    for file_entry in data.get('call_graph', []):
+    for file_entry in (data if isinstance(data, list) else []):
         file_name = file_entry.get('file', '')
 
         for function_entry in file_entry.get('functions', []):

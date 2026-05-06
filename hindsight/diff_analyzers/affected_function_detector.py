@@ -37,7 +37,7 @@ class AffectedFunctionDetector:
         
         Args:
             call_graph: Merged call graph with functions_invoked and invoked_by.
-                       Expected format: {'call_graph': [{'file': str, 'functions': [...]}]}
+                       Expected format: [{'file': str, 'functions': [...]}]
             functions: Function to location mapping.
                       Expected format: {'function_to_location': {func_name: [{'file_name': str, 'start': int, 'end': int}]}}
             changed_lines_per_file: Output from _extract_changed_lines_per_file().
@@ -104,7 +104,7 @@ class AffectedFunctionDetector:
         if not self.call_graph:
             return lookup
             
-        call_graph_list = self.call_graph.get('call_graph', [])
+        call_graph_list = self.call_graph if isinstance(self.call_graph, list) else []
         
         for file_entry in call_graph_list:
             file_name = file_entry.get('file', '')

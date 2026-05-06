@@ -10,6 +10,7 @@ from typing import Tuple
 
 from ..lang_util.code_context_pruner import CodeContextPruner
 from ...utils.log_util import get_logger
+from ..prompts.fallback_prompts import FALLBACK_TRACE_SYSTEM
 
 logger = get_logger(__name__)
 
@@ -51,7 +52,7 @@ class TracePromptBuilder:
                 raise FileNotFoundError("systemPromptTrace.md not found in package")
         except Exception as e:
             logger.error(f"Error loading trace system prompt: {e}")
-            return "You are a senior software engineer analyzing callstack traces for performance optimization opportunities."
+            return FALLBACK_TRACE_SYSTEM
 
     @staticmethod
     def build_user_prompt(prompt_content: str) -> str:
@@ -85,7 +86,7 @@ class TracePromptBuilder:
             try:
                 pruned_content = CodeContextPruner.prune_comments_simple(prompt_content)
                 return f"Analyze this callstack trace:\n\n{pruned_content}"
-            except:
+            except Exception:
                 return f"Analyze this callstack trace:\n\n{prompt_content}"
 
     @staticmethod

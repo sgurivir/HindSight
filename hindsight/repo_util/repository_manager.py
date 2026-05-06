@@ -12,6 +12,8 @@ import sys
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
+from ..core.exceptions import RepositoryNotFoundError, GitOperationError, RepositoryError
+
 
 class RepositoryVendor(ABC):
     """Abstract interface for repository vendor implementations."""
@@ -71,9 +73,9 @@ class RepositoryVendorGit(RepositoryVendor):
             return files
 
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Git command failed: {e.stderr}")
+            raise GitOperationError("git diff --name-only", e.stderr)
         except Exception as e:
-            raise RuntimeError(f"Error getting Git file changes: {str(e)}")
+            raise GitOperationError("git diff", str(e))
 
 
 class RepositoryVendorPerforce(RepositoryVendor):
@@ -129,9 +131,9 @@ class RepositoryVendorPerforce(RepositoryVendor):
             return files
 
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Perforce command failed: {e.stderr}")
+            raise GitOperationError("p4 files", e.stderr)
         except Exception as e:
-            raise RuntimeError(f"Error getting Perforce file changes: {str(e)}")
+            raise GitOperationError("p4 files", str(e))
 
 
 class RepositoryManager:
@@ -165,7 +167,7 @@ class RepositoryManager:
             if vendor.is_repo_of_type(self.path_to_repo):
                 return vendor
 
-        raise RuntimeError(f"Could not detect repository type for: {self.path_to_repo}")
+        raise RepositoryNotFoundError(self.path_to_repo)
 
     def get_files_changed(self) -> List[str]:
         """

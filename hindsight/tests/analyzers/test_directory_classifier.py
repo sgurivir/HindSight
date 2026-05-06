@@ -297,8 +297,55 @@ class TestOptimizeExclusions:
         include_dirs, exclude_dirs = DirectoryClassifier.get_include_and_exclude_directories(
             repo_with_structure
         )
-        
+
         # parent should be excluded since it has no supported files
         # and all its children have no supported files
         # The exact behavior depends on the implementation
         assert isinstance(exclude_dirs, set)
+
+
+class TestPartialPathMatchingInClassifier:
+    """Tests for partial path matching in DirectoryClassifier."""
+
+    def test_is_directory_or_parent_included_no_false_positive(self):
+        """'srcutil' should NOT match include pattern 'src'."""
+        include_set = {"src"}
+        assert DirectoryClassifier._is_directory_or_parent_included("srcutil", include_set) is False
+
+    def test_is_directory_or_parent_included_multi_component(self):
+        """Multi-component include pattern matches nested path."""
+        include_set = {"B/C"}
+        assert DirectoryClassifier._is_directory_or_parent_included("A/B/C", include_set) is True
+        assert DirectoryClassifier._is_directory_or_parent_included("A/B/C/D", include_set) is True
+
+    def test_is_directory_or_parent_included_single_component_nested(self):
+        """Single component 'Orange' matches 'apps/Orange'."""
+        include_set = {"Orange"}
+        assert DirectoryClassifier._is_directory_or_parent_included("apps/Orange", include_set) is True
+        assert DirectoryClassifier._is_directory_or_parent_included("apps/Orange/Sub", include_set) is True
+
+    def test_is_directory_or_parent_included_parent_of_include(self):
+        """Parent of included directory should match."""
+        include_set = {"B/C"}
+        assert DirectoryClassifier._is_directory_or_parent_included("B", include_set) is True
+
+    def test_is_directory_or_parent_included_unrelated(self):
+        """Unrelated directory should not match."""
+        include_set = {"B/C"}
+        assert DirectoryClassifier._is_directory_or_parent_included("X/Y", include_set) is False
+
+    def test_included_dir_not_excluded_partial(self):
+        """User include 'Orange' prevents 'apps/Orange' from being excluded."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            apps_orange = Path(tmpdir) / "apps" / "Orange"
+            apps_orange.mkdir(parents=True)
+            (apps_orange / "file.swift").write_text("// swift")
+
+            include_dirs, exclude_dirs = DirectoryClassifier.get_include_and_exclude_directories(
+                tmpdir,
+                user_provided_include_list=["Orange"]
+            )
+
+            assert "apps/Orange" not in exclude_dirs
+            for exc in exclude_dirs:
+                assert not exc.startswith("apps/Orange")

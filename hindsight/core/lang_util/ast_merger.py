@@ -8,7 +8,6 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Any
 
-from .ast_function_signature_util import ASTFunctionSignatureGenerator
 from ...utils.file_util import read_json_file, write_json_file
 
 logger = logging.getLogger(__name__)
@@ -308,19 +307,7 @@ class ASTMerger:
             "data_type_to_location": merged_data_types
         }
 
-        # Add checksums to the merged data types
-        try:
-            final_output_with_checksums = ASTFunctionSignatureGenerator.add_checksums_to_data_types(
-                repo_path, final_output
-            )
-
-            # Write merged output with checksums
-            logger.info(f"[+] Writing merged data type definitions with checksums to {merged_data_types_out}")
-            write_json_file(str(merged_data_types_out), final_output_with_checksums)
-            logger.info(f"Merged {len(merged_data_types)} total data type entries with checksums")
-        except Exception as e:
-            logger.warning(f"Failed to add checksums to merged data types, writing without checksums: {e}")
-            # Write merged output without checksums
-            logger.info(f"[+] Writing merged data type definitions to {merged_data_types_out}")
-            write_json_file(str(merged_data_types_out), final_output)
-            logger.info(f"Merged {len(merged_data_types)} total data type entries")
+        # Write merged output
+        logger.info(f"[+] Writing merged data type definitions to {merged_data_types_out}")
+        write_json_file(str(merged_data_types_out), final_output)
+        logger.info(f"Merged {len(merged_data_types)} total data type entries")

@@ -41,7 +41,6 @@ def _ensure_base_index(function_lookup: Dict[str, Dict]) -> Dict[str, list[str]]
     return idx
 
 # Constants
-CALL_GRAPH_KEY = 'call_graph'
 CONTEXT_KEY = 'context'
 FUNCTION_CONTEXT_KEY = 'function_context'
 FUNCTIONS_INVOKED_KEY = 'functions_invoked'
@@ -211,8 +210,8 @@ class CallGraphUtilities:
         # Build a map of function names to their call graph entries
         function_map = {}
 
-        if "call_graph" in call_graph_data:
-            call_graph = call_graph_data["call_graph"]
+        if isinstance(call_graph_data, list):
+            call_graph = call_graph_data
 
             # Process file-grouped format
             for file_entry in call_graph:

@@ -45,15 +45,14 @@
 
 **CRITICAL**: You MUST ONLY use these exact tool names - no variations, abbreviations, or similar names are allowed:
 
-1. `findSpecificFilesWithSearchString`: find files containing specific text patterns with extension filtering.
-2. `checkFileSize`: check if file exists and get size information to determine if readFile can be used. Only use readFile for small files < 16000 characters.
-3. `readFile`: inspect specific files.
-4. `runTerminalCmd`: run safe commands for exploration and searching (including grep for file searches).
-5. `getSummaryOfFile`: retrieve summary of file's functionality
-6. `list_files`: list files and directories within a specified directory.
-7. `getFileContentByLines`: retrieve content from a file between specific line numbers
-8. `getFileContent`: alias for `getFileContentByLines` - retrieve content from a file between specific line numbers
-9. `inspectDirectoryHierarchy`: get detailed directory structure information including file counts and sizes
+1. `checkFileSize`: check if file exists and get size information to determine if readFile can be used. Only use readFile for small files < 16000 characters.
+2. `readFile`: inspect specific files.
+3. `runTerminalCmd`: run safe commands for exploration and searching (including grep for file searches).
+4. `getSummaryOfFile`: retrieve summary of file's functionality
+5. `list_files`: list files and directories within a specified directory.
+6. `getFileContentByLines`: retrieve content from a file between specific line numbers
+7. `getFileContent`: alias for `getFileContentByLines` - retrieve content from a file between specific line numbers
+8. `inspectDirectoryHierarchy`: get detailed directory structure information including file counts and sizes
 
 **CRITICAL TOOL USAGE PRIORITY:**
 1. **ALWAYS use `checkFileSize` BEFORE `readFile` or `getFileContentByLines`** to determine if file is within size limits and get the total line count (prevents out-of-bounds errors)
@@ -215,16 +214,15 @@ find . -name '*.swift' -path '*Orange*' | head -10
 
 **IMPORTANT**: Always wrap search patterns in single quotes to prevent shell interpretation of special characters.
 
-### findSpecificFilesWithSearchString Tool
-**Purpose**: Find files containing a specific string, searching only files with given extensions recursively.
-**Advantages**: More efficient than terminal commands, built-in filtering by file extensions
+### runTerminalCmd Tool (Search & Exploration)
+**Purpose**: Run safe commands for exploration and searching, including grep for finding files containing specific text patterns.
+**Advantages**: Flexible searching with grep flags, filtering by file extensions
 
 **Example Usage**:
 ```json
 {
-  "tool": "findSpecificFilesWithSearchString",
-  "search_string": "TMTimeSynthesizer",
-  "extensions": [".h", ".m", ".mm"],
+  "tool": "runTerminalCmd",
+  "command": "grep -rn 'TMTimeSynthesizer' --include='*.h' --include='*.m' --include='*.mm' .",
   "reason": "Need to find all files that reference TMTimeSynthesizer to understand its usage patterns"
 }
 ```
@@ -260,7 +258,7 @@ Need to understand a function or type?
 │   │   └── Small file → Use readFile
 │   └── NO → Continue to next question
 ├── Need to search/explore/find
-│   └── YES → Use runTerminalCmd with grep, findSpecificFilesWithSearchString, or list_files
+│   └── YES → Use runTerminalCmd with grep or list_files
 ├── Need to list directory contents
 │   └── YES → Use list_files
 └── If unsure → list_files, then getSummaryOfFile, then checkFileSize + readFile as needed
@@ -274,8 +272,8 @@ Need to understand a function or type?
 2. **REJECT INVALID TOOLS**: If you find yourself about to use any other tool name (like `searchCode`, `findCode`, `getCode`, etc.), IMMEDIATELY STOP and select the appropriate authorized tool instead.
 
 **COMMON SUBSTITUTIONS**:
-- Want `searchCode`? → Use `runTerminalCmd` with grep or `findSpecificFilesWithSearchString`
-- Want `findCode`? → Use `findSpecificFilesWithSearchString` or `runTerminalCmd` with grep
+- Want `searchCode`? → Use `runTerminalCmd` with grep
+- Want `findCode`? → Use `runTerminalCmd` with grep
 - Want `getCode`? → Use `readFile`
 - Want file content? → Use `readFile`
 - Want directory listing? → Use `list_files`

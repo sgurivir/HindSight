@@ -36,6 +36,7 @@ from typing import Optional, Dict, Any, List, Callable
 
 from .providers.base_provider import BaseLLMProvider, LLMConfig
 from .providers.aws_bedrock_provider import AWSBedrockProvider
+from ..constants import ModelLimits, DEFAULT_MAX_TOKENS
 from ...utils.file_util import write_file, ensure_directory_exists
 from ...utils.json_util import clean_json_response
 from ...utils.log_util import get_logger
@@ -123,8 +124,7 @@ class ClaudeConfig:
     api_key: str
     api_url: str
     model: str
-    max_tokens: int = 64000
-    temperature: float = 0.05
+    max_tokens: int = DEFAULT_MAX_TOKENS
     timeout: int = 300
     provider_type: str = "aws_bedrock"
 
@@ -144,7 +144,6 @@ def create_llm_provider(config: ClaudeConfig) -> BaseLLMProvider:
         api_url=config.api_url,
         model=config.model,
         max_tokens=config.max_tokens,
-        temperature=config.temperature,
         timeout=config.timeout
     )
     logger.info(f"Creating AWS Bedrock provider for model: {config.model}")
@@ -301,8 +300,7 @@ class Claude:
             'context_info': context_info,
             'start_time': time.strftime('%Y-%m-%d %H:%M:%S'),
             'model': self.config.model,
-            'max_tokens': self.config.max_tokens,
-            'temperature': self.config.temperature
+            'max_tokens': self.config.max_tokens
         }
         logger.debug(f"Started new conversation for {analysis_type}: {context_info}")
 
@@ -338,7 +336,6 @@ class Claude:
         conversation_content += f"**Start Time:** {self.conversation_metadata.get('start_time', 'unknown')}\n"
         conversation_content += f"**Model:** {self.conversation_metadata.get('model', 'unknown')}\n"
         conversation_content += f"**Max Tokens:** {self.conversation_metadata.get('max_tokens', 'unknown')}\n"
-        conversation_content += f"**Temperature:** {self.conversation_metadata.get('temperature', 'unknown')}\n\n"
 
         conversation_content += "---\n\n"
 
@@ -654,13 +651,13 @@ class Claude:
             bool: True if within limits
         """
         estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
-        # Leave some buffer for response tokens
-        max_input_tokens = self.config.max_tokens - 5000
+        context_window = ModelLimits.get_context_window(self.config.model)
+        max_input_tokens = context_window - self.config.max_tokens
 
         if estimated_tokens > max_input_tokens:
             logger.warning(f"Estimated tokens ({estimated_tokens:,}) exceed limit ({max_input_tokens:,})")
             logger.warning(f"Total characters: {len(system_prompt + user_prompt):,}")
-            logger.warning(f"Model max tokens: {self.config.max_tokens:,}")
+            logger.warning(f"Context window: {context_window:,}, max response tokens: {self.config.max_tokens:,}")
             return False
 
         return True

@@ -22,6 +22,14 @@ from ...utils.file_util import (get_artifacts_temp_file_path,
 from ...utils.json_util import clean_json_response
 from ...utils.log_util import get_logger
 from ...utils.output_directory_provider import get_output_directory_provider
+from ...utils.line_number_util import has_line_number_prefix
+from .fallback_prompts import (
+    FALLBACK_CODE_ANALYSIS_SYSTEM,
+    FALLBACK_CONTEXT_COLLECTION_SYSTEM,
+    FALLBACK_CONTEXT_COLLECTION_SHORT,
+    FALLBACK_ANALYSIS_FROM_CONTEXT_SYSTEM,
+    FALLBACK_ANALYSIS_FROM_CONTEXT_WITH_FORMAT,
+)
 
 def _read_package_file(filename: str) -> Optional[str]:
     """
@@ -284,10 +292,10 @@ class PromptBuilder:
             return system_prompt
 
         except FileNotFoundError:
-            return "# Code Analysis Task\n\nYou are a senior software engineer conducting code analysis."
+            return FALLBACK_CODE_ANALYSIS_SYSTEM
 
     @staticmethod
-    def _convert_json_to_comment_format(json_content: str, merged_functions_data: Optional[Dict[str, Any]] = None, merged_data_types_data: Optional[Dict[str, Any]] = None, merged_call_graph_data: Optional[Dict[str, Any]] = None) -> str:
+    def _convert_json_to_comment_format(json_content: str, merged_functions_data: Optional[Dict[str, Any]] = None, merged_data_types_data: Optional[Dict[str, Any]] = None, merged_call_graph_data: Optional[Dict[str, Any]] = None, repo_path: Optional[str] = None) -> str:
         """
         Convert JSON content to comment-based format.
 
@@ -365,7 +373,7 @@ class PromptBuilder:
                         pruned_code = CodeContextPruner.prune_comments_simple(code_content)
                         pruned_lines = pruned_code.split('\n')
                         pruned_first_line = pruned_lines[0] if pruned_lines else ""
-                        if not re.match(r'^\s*\d+\s*\|', pruned_first_line):
+                        if not has_line_number_prefix(pruned_first_line):
                             # Use the same mechanism as file_util.py to preserve original line numbers
                             if start_line is not None:
                                 numbered_lines = [f"{start_line+i:4d} | {line}"
@@ -426,7 +434,7 @@ class PromptBuilder:
                                 if func_code:
                                     # Apply code context pruning and add line numbers with original line numbers
                                     pruned_code = CodeContextPruner.prune_comments_simple(func_code)
-                                    if not re.match(r'^\s*\d+\s*\|', pruned_code.split('\n')[0]):
+                                    if not has_line_number_prefix(pruned_code.split('\n')[0]):
                                         # Use the same mechanism as file_util.py to preserve original line numbers
                                         lines = pruned_code.split('\n')
                                         if func_start_line is not None:
@@ -494,7 +502,7 @@ class PromptBuilder:
                                 if caller_code:
                                     # Apply code context pruning and add line numbers with original line numbers
                                     pruned_code = CodeContextPruner.prune_comments_simple(caller_code)
-                                    if not re.match(r'^\s*\d+\s*\|', pruned_code.split('\n')[0]):
+                                    if not has_line_number_prefix(pruned_code.split('\n')[0]):
                                         # Use the same mechanism as file_util.py to preserve original line numbers
                                         lines = pruned_code.split('\n')
                                         if caller_start_line is not None:
@@ -555,7 +563,7 @@ class PromptBuilder:
                                 if data_type_code:
                                     # Apply code context pruning and add line numbers with original line numbers
                                     pruned_code = CodeContextPruner.prune_comments_simple(data_type_code)
-                                    if not re.match(r'^\s*\d+\s*\|', pruned_code.split('\n')[0]):
+                                    if not has_line_number_prefix(pruned_code.split('\n')[0]):
                                         # Use the same mechanism as file_util.py to preserve original line numbers
                                         lines = pruned_code.split('\n')
                                         if data_type_start_line is not None:
@@ -600,7 +608,8 @@ class PromptBuilder:
                             max_ancestor_depth=CALL_TREE_MAX_ANCESTOR_DEPTH,
                             max_descendant_depth=CALL_TREE_MAX_DESCENDANT_DEPTH,
                             max_children_per_node=CALL_TREE_MAX_CHILDREN_PER_NODE,
-                            max_tokens=CALL_TREE_MAX_TOKENS
+                            max_tokens=CALL_TREE_MAX_TOKENS,
+                            repo_path=repo_path
                         )
                         if call_tree_section:
                             result.append("")
@@ -709,7 +718,7 @@ class PromptBuilder:
             # Just use the pruned content as-is
 
             # Convert JSON to comment-based format
-            comment_based_content = PromptBuilder._convert_json_to_comment_format(pruned_json_content, merged_functions_data, merged_data_types_data, merged_call_graph_data)
+            comment_based_content = PromptBuilder._convert_json_to_comment_format(pruned_json_content, merged_functions_data, merged_data_types_data, merged_call_graph_data, repo_path)
 
             # Extract file path from JSON to load summaries
             file_path = PromptBuilder._extract_file_path_from_json(pruned_json_content)
@@ -766,7 +775,7 @@ class PromptBuilder:
             logger.error(f"Template file not found: {e}")
             # Use comment-based format even in fallback
             pruned_content = PromptBuilder._apply_code_context_pruning(json_content)
-            comment_based_fallback = PromptBuilder._convert_json_to_comment_format(pruned_content, merged_functions_data, merged_data_types_data, merged_call_graph_data)
+            comment_based_fallback = PromptBuilder._convert_json_to_comment_format(pruned_content, merged_functions_data, merged_data_types_data, merged_call_graph_data, repo_path)
             return f"// Code to ANALYZE\n\n{comment_based_fallback}"
 
     @staticmethod
@@ -907,7 +916,7 @@ class PromptBuilder:
             process_content = _read_package_file(CONTEXT_COLLECTION_PROCESS_FILE)
             if not process_content:
                 logger.warning(f"{CONTEXT_COLLECTION_PROCESS_FILE} not found, using fallback")
-                process_content = "You are a context-gathering agent. Collect all code context needed to analyze the primary function. Output a JSON context bundle."
+                process_content = FALLBACK_CONTEXT_COLLECTION_SYSTEM
 
             # Build system prompt
             system_prompt = process_content
@@ -932,15 +941,17 @@ class PromptBuilder:
 
             # Build user prompt: the function data in comment format + instruction
             analysis_type = PromptBuilder.determine_analysis_type(json_content)
+            context_repo_path = config.get('path_to_repo', os.getcwd()) if config else None
             code_comment_format = PromptBuilder._convert_json_to_comment_format(
                 json_content,
                 merged_functions_data=merged_functions_data,
                 merged_data_types_data=merged_data_types_data,
-                merged_call_graph_data=merged_call_graph_data
+                merged_call_graph_data=merged_call_graph_data,
+                repo_path=context_repo_path
             )
 
             user_prompt = f"## Function to Analyze\n\n{code_comment_format}\n\n"
-            user_prompt += "Collect all context needed to analyze this function and return a JSON context bundle as described in the system prompt. Your response MUST start with `{` and end with `}` — return a JSON object, not an array."
+            user_prompt += "Collect all context needed to analyze this function and return a JSON code collection as described in the system prompt. Your response MUST start with `{` and end with `}` — return a JSON object, not an array."
 
             logger.info(f"Built Stage 4a prompts - System: {len(system_prompt)} chars, User: {len(user_prompt)} chars")
             return system_prompt, user_prompt
@@ -948,7 +959,7 @@ class PromptBuilder:
         except Exception as e:
             logger.error(f"Error building context collection prompt: {e}")
             return (
-                "You are a context-gathering agent. Collect all code context needed to analyze the primary function.",
+                FALLBACK_CONTEXT_COLLECTION_SHORT,
                 f"Collect context for:\n{json_content}"
             )
 
@@ -972,7 +983,7 @@ class PromptBuilder:
             process_content = _read_package_file(ANALYSIS_PROCESS_FILE)
             if not process_content:
                 logger.warning(f"{ANALYSIS_PROCESS_FILE} not found, using fallback")
-                process_content = "You are a senior software engineer. Analyze the provided context bundle and identify bugs and performance issues."
+                process_content = FALLBACK_ANALYSIS_FROM_CONTEXT_SYSTEM
 
             # Build system prompt
             system_prompt = process_content
@@ -991,13 +1002,13 @@ class PromptBuilder:
             # Load output schema requirements
             output_requirements = PromptBuilder.build_output_requirements()
 
-            # Build user prompt: context bundle + output schema
+            # Build user prompt: collected code + output schema
             primary_func_name = context_bundle.get("primary_function", {}).get("name", "unknown")
             primary_func_file = context_bundle.get("primary_function", {}).get("file_path", "unknown")
 
-            user_prompt = f"## Context Bundle for Analysis\n\n"
+            user_prompt = f"## Code for Analysis\n\n"
             user_prompt += f"**Function**: `{primary_func_name}` in `{primary_func_file}`\n\n"
-            user_prompt += "The following context bundle contains all code needed for your analysis. Line numbers in source fields are original source-file line numbers — use them directly in your output.\n\n"
+            user_prompt += "The following code contains everything needed for your analysis. Line numbers in source fields are original source-file line numbers — use them directly in your output.\n\n"
             user_prompt += "```json\n"
             user_prompt += json.dumps(context_bundle, indent=2, ensure_ascii=False)
             user_prompt += "\n```\n\n"
@@ -1009,8 +1020,8 @@ class PromptBuilder:
         except Exception as e:
             logger.error(f"Error building analysis from context prompt: {e}")
             return (
-                "You are a senior software engineer. Analyze the provided context bundle and identify bugs and performance issues. Return a JSON array of issues.",
-                f"Analyze this context bundle:\n{json.dumps(context_bundle, indent=2)}"
+                FALLBACK_ANALYSIS_FROM_CONTEXT_WITH_FORMAT,
+                f"Analyze this code:\n{json.dumps(context_bundle, indent=2)}"
             )
 
     # Large file handling and nested content handling removed - ProjectSummaryGenerator no longer used
@@ -1221,18 +1232,8 @@ class PromptBuilder:
         try:
             normalized_search_name = PromptBuilder._normalize_function_name(function_name)
             
-            # Handle both list format and dict format
+            # Call graph data is a flat list of file entries
             file_entries = merged_call_graph_data
-            if isinstance(merged_call_graph_data, dict):
-                # If it's a dict, it might have a wrapper key
-                if 'call_graph' in merged_call_graph_data:
-                    file_entries = merged_call_graph_data['call_graph']
-                elif 'files' in merged_call_graph_data:
-                    file_entries = merged_call_graph_data['files']
-                else:
-                    # Assume the dict values are the file entries
-                    file_entries = list(merged_call_graph_data.values())
-            
             if not isinstance(file_entries, list):
                 logger.debug(f"Call graph data is not a list: {type(file_entries)}")
                 return None

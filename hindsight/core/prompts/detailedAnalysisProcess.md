@@ -26,8 +26,7 @@ Each tool call \*\*must include a \*\*\`\` describing why it's needed.
 1. **ALWAYS use `getDirectoryListing` FIRST** to check file sizes before reading any files
 2. Use `getSummaryOfFile` to quickly understand a file's purpose and context before deeper analysis
 3. Use `readFile` for reading source files, headers, config files, etc.
-4. Use `findSpecificFilesWithSearchString` to find list of files, with specific extensions and having a given string
-5. Use `runTerminalCmd` for exploration and searching when the above tools are insufficient
+4. Use `runTerminalCmd` for exploration and searching (including grep for finding files by content)
 
 
 **Example Usage**: Call the getDirectoryListing tool with the directory path and reason.
@@ -106,15 +105,15 @@ All terminal commands MUST stay within the repository root. Commands that search
 
 **IMPORTANT**: Always wrap search patterns in single quotes to prevent shell interpretation of special characters.
 
-### findSpecificFilesWithSearchString Tool (Efficient Search)
-**Purpose**: Find files containing a specific string, searching only files with given extensions recursively.
-**Usage**: **PREFERRED over runTerminalCmd** when you need to find files containing specific text patterns.
-**Advantages**: More efficient than terminal commands, built-in filtering by file extensions, returns clean file paths
-**Usage**: Use the structured tool call format provided by the API. The tool will be called with search_string, extensions, and reason parameters.
+### runTerminalCmd Tool (Search & Exploration)
+**Purpose**: Run safe commands for exploration and searching, including grep for finding files containing specific text patterns.
+**Usage**: **PREFERRED** when you need to find files containing specific text patterns.
+**Advantages**: Flexible searching with grep, built-in filtering by file extensions, returns matching lines with context
+**Usage**: Use the structured tool call format provided by the API. The tool will be called with command and reason parameters.
 
-**Example Usage**: Call the findSpecificFilesWithSearchString tool with the search string, file extensions array, and reason.
+**Example Usage**: Call the runTerminalCmd tool with a grep command and reason.
 
-**CRITICAL**: Always try this tool before using `find . -type f` or similar terminal commands for searching file contents.
+**CRITICAL**: Use single-word patterns only with grep. Don't use multi-word patterns, regex, or OR patterns.
 
 ## Tool Selection Decision Tree
 

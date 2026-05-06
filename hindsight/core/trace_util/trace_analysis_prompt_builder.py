@@ -1157,9 +1157,9 @@ class TraceAnalysisPromptBuilder:
             if not merged_call_graph_data:
                 return None
                 
-            # Handle the call graph structure: {"call_graph": [file_entries]}
-            if isinstance(merged_call_graph_data, dict) and 'call_graph' in merged_call_graph_data:
-                call_graph = merged_call_graph_data['call_graph']
+            # Handle the call graph structure: [file_entries]
+            if isinstance(merged_call_graph_data, list):
+                call_graph = merged_call_graph_data
                 
                 # Search through all files and functions for the target function
                 for file_entry in call_graph:

@@ -138,8 +138,9 @@ class FunctionNameMatcher:
         name = func_name.strip()
         
         # Remove Objective-C method prefixes
-        name = re.sub(r'^[-+]\[', '', name)
-        name = re.sub(r'\]$', '', name)
+        if name.startswith('-[') or name.startswith('+['):
+            name = name[2:]
+        name = name.rstrip(']')
         
         # Remove common suffixes
         name = re.sub(r'WithOptions?:?$', '', name)
@@ -427,7 +428,7 @@ class FunctionNameExtractor:
             return True
         
         # Should start with a letter or underscore
-        if not re.match(r'^[a-zA-Z_]', name):
+        if not name or not (name[0].isalpha() or name[0] == '_'):
             return False
         
         return True
