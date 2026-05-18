@@ -25,7 +25,11 @@ TOOL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
                 "description": "Path to the file to read (relative to repository root)"
             }
         },
-        "aliases": {}
+        "aliases": {
+            "filePath": "path",
+            "file_path": "path",
+            "file": "path"
+        }
     },
     "getFileContentByLines": {
         "description": "Read specific line ranges from a file. IMPORTANT: Call checkFileSize first to get the total line count before using this tool - this prevents requesting lines beyond the file's end. The checkFileSize tool returns 'line_count' which tells you the valid range (1 to line_count). Response header also includes total line count for subsequent calls.",
@@ -52,6 +56,7 @@ TOOL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             }
         },
         "aliases": {
+            "filePath": "path",
             "file": "path",
             "file_path": "path",
             "start_line": "startLine",
@@ -72,7 +77,11 @@ TOOL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
                 "description": "Reason for checking file size"
             }
         },
-        "aliases": {}
+        "aliases": {
+            "filePath": "path",
+            "file_path": "path",
+            "file": "path"
+        }
     },
     "runTerminalCmd": {
         "description": "Execute safe terminal commands with validation. Only read-only commands are allowed. For grep: use SINGLE WORD patterns only. DON'T use multi-word patterns, regex (.*), OR patterns (\\|), or wildcard paths (*.swift).",

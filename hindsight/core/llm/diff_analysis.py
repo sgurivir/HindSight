@@ -41,6 +41,7 @@ class DiffAnalysisConfig:
     max_tokens: int = DEFAULT_MAX_TOKENS
     config: Dict[str, Any] = None  # Store the full configuration dict
     file_content_provider: Any = None  # FileContentProvider instance for file resolution
+    mcp_server: Any = None  # Optional AnalysisMCPServer instance (avoids duplicate Tools creation)
 
 
 class DiffAnalysis:
@@ -54,7 +55,8 @@ class DiffAnalysis:
         Initialize DiffAnalysis with configuration.
 
         Args:
-            config: Diff analysis configuration
+            config: Diff analysis configuration. If config.mcp_server is set,
+                    its internal Tools instance is reused (avoids duplicate creation).
         """
         self.config = config
 
@@ -67,36 +69,41 @@ class DiffAnalysis:
         )
         self.claude = Claude(claude_config)
 
-        try:
-            output_provider = get_output_directory_provider()
-            output_base_dir = output_provider.get_custom_base_dir()
-        except RuntimeError:
-            # Fallback if singleton not configured
-            output_base_dir = None
-
-        output_provider = get_output_directory_provider()
-        artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
-
-        ignore_dirs = set()
-        if config.config:
-            exclude_directories = config.config.get('exclude_directories', [])
-            if exclude_directories:
-                ignore_dirs.update(exclude_directories)
-                logger.info(f"Extracted {len(ignore_dirs)} ignored directories from config for diff analysis: {ignore_dirs}")
-            else:
-                logger.info("No excluded directories found in config for diff analysis")
+        # If an AnalysisMCPServer was provided, reuse its Tools instance
+        if config.mcp_server is not None:
+            self.tools = config.mcp_server._tools
+            logger.info("DiffAnalysis: Using Tools instance from AnalysisMCPServer")
         else:
-            logger.info("No config provided for diff analysis - no directories will be ignored")
+            try:
+                output_provider = get_output_directory_provider()
+                output_base_dir = output_provider.get_custom_base_dir()
+            except RuntimeError:
+                # Fallback if singleton not configured
+                output_base_dir = None
 
-        directory_tree_util = None
-        try:
-            from ...utils.directory_tree_util import DirectoryTreeUtil
-            directory_tree_util = DirectoryTreeUtil()
-            logger.info("Created DirectoryTreeUtil instance for diff analysis")
-        except Exception as e:
-            logger.warning(f"Could not create DirectoryTreeUtil instance: {e}")
+            output_provider = get_output_directory_provider()
+            artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
 
-        self.tools = Tools(config.repo_path, output_base_dir, config.file_content_provider, artifacts_dir, directory_tree_util, ignore_dirs)
+            ignore_dirs = set()
+            if config.config:
+                exclude_directories = config.config.get('exclude_directories', [])
+                if exclude_directories:
+                    ignore_dirs.update(exclude_directories)
+                    logger.info(f"Extracted {len(ignore_dirs)} ignored directories from config for diff analysis: {ignore_dirs}")
+                else:
+                    logger.info("No excluded directories found in config for diff analysis")
+            else:
+                logger.info("No config provided for diff analysis - no directories will be ignored")
+
+            directory_tree_util = None
+            try:
+                from ...utils.directory_tree_util import DirectoryTreeUtil
+                directory_tree_util = DirectoryTreeUtil()
+                logger.info("Created DirectoryTreeUtil instance for diff analysis")
+            except Exception as e:
+                logger.warning(f"Could not create DirectoryTreeUtil instance: {e}")
+
+            self.tools = Tools(config.repo_path, output_base_dir, config.file_content_provider, artifacts_dir, directory_tree_util, ignore_dirs)
 
         self.total_input_tokens = 0
         self.total_output_tokens = 0

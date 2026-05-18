@@ -1,6 +1,6 @@
 # Data Flow Analyzer
 
-The Data Flow Analyzer generates hierarchical call trees from AST-based call graphs and uses LLM-powered analysis to identify which functions accept external (untrusted) input. It combines static analysis (Steps 1-3) with LLM-driven security classification (Step 4).
+The Data Flow Analyzer generates hierarchical call trees from AST-based call graphs and uses LLM-powered analysis to identify security-relevant data flows. It combines static analysis (Steps 1-3) with LLM-driven classification (Steps 4-5) and graph-based path discovery (Step 6) to find call paths where untrusted data flows from external input sources to security-sensitive sinks.
 
 ## Usage
 
@@ -25,7 +25,7 @@ python -m hindsight.analyzers.data_flow_analyzer --config config.json --repo /pa
 
 ## Pipeline
 
-`DataFlowAnalysisRunner.run()` executes four steps:
+`DataFlowAnalysisRunner.run()` executes six steps:
 
 ### Step 1: Directory Classification
 
@@ -142,6 +142,100 @@ The analyzer uses priority-based guidance to focus on inputs that represent real
 
 **Output:** `call_tree_with_sources.json` — same schema as `call_tree.json` with an added `ext_input` boolean field on each node.
 
+### Step 5: Sink Discovery (LLM — Batched)
+
+Uses an LLM to classify each function as a security-relevant data sink or not. A "sink" is a function where, if attacker-controlled data reaches it, harm could occur (code execution, data corruption, privilege escalation, etc.).
+
+**How it works:**
+
+The architecture mirrors Step 4 (same batched + fallback approach, same MCP tools, same rate limiting and caching):
+
+1. All functions in the call tree are candidates.
+2. Functions are grouped into batches of up to 8, with token-budget-aware sizing.
+3. The LLM classifies each function as `{is_sink: bool, reason: str, category: str}`.
+4. Missing batch entries are retried in single-function fallback mode.
+5. Results are cached in `sink_cache.json` for incremental reruns.
+
+**Two-pass design:**
+
+- **Pass 1 (Generic LLM):** Classifies functions using the 18 security-relevant sink categories below.
+- **Pass 2 (Domain Refinement):** Placeholder for future domain-specific adjustment (e.g., promoting sinks relevant to "this is a time daemon" or demoting false positives in a read-only service). Currently a no-op.
+
+**Sink categories (18):**
+
+| Category | Examples |
+|----------|----------|
+| `process_execution` | system(), eval(), exec(), dlopen/dlsym |
+| `file_system_write` | write, create, delete, chmod, symlinks |
+| `network_output` | HTTP responses, socket writes, DNS with attacker hostnames |
+| `database_write` | SQL INSERT/UPDATE/DELETE, NoSQL mutations, key-value stores |
+| `memory_operation` | memcpy, memmove, strncpy, malloc with attacker-controlled size |
+| `deserialization` | NSKeyedUnarchiver, pickle.load, JSON.parse with type coercion |
+| `authentication_authorization` | Password verification, token validation, permission checks |
+| `cryptographic_operation` | Key derivation, encryption/decryption, signature verification |
+| `system_state_modification` | settimeofday, system config changes |
+| `ipc_output` | XPC messages, D-Bus signals, Binder intents |
+| `logging_with_user_data` | printf/syslog with format strings from external data |
+| `dynamic_dispatch` | NSSelectorFromString, Class.forName, reflection with user strings |
+| `url_path_construction` | String concatenation for URLs/file paths (SSRF, path traversal) |
+| `query_construction` | SQL/LDAP/XPath/GraphQL injection, command injection, ReDoS |
+| `markup_generation` | HTML/XML/JS template rendering with user variables (XSS) |
+| `privilege_boundary` | setuid/setgid, sandbox transitions, entitlement verification |
+| `resource_allocation` | Thread/FD/socket creation with attacker-controlled count (DoS) |
+| `notification_broadcast` | CFNotificationCenter, Android broadcasts, D-Bus signals |
+
+**Priority guidance:**
+
+- *High priority:* Direct OS modifications, query construction, deserialization, auth decisions, IPC, resource allocation, dynamic dispatch.
+- *Low priority (not sinks):* Pure computation, read-only operations, internal state, getters, static logging, factory methods.
+- *Key distinction:* Focus on WRITE/EXECUTE/MUTATE operations. File write IS a sink; file read is NOT (it's a source).
+
+**Output:** `data_sinks.json` — flat list of `{function, location, reason, category}` for all identified sinks.
+
+### Step 6: Path Discovery (Static Graph Traversal)
+
+Connects the dots: finds call paths from source functions (Step 4) to sink functions (Step 5) through the call graph. This is a pure graph algorithm — no LLM calls, fast and deterministic.
+
+**How it works:**
+
+1. **Load inputs** — Sources from `ext_input_cache.json` + call tree annotations; sinks from `data_sinks.json`.
+2. **Reverse reachability precomputation** — BFS backward from all sinks using `reverse_edges` (callee→callers) to find every node that CAN reach a sink within `max_path_depth` hops. Sources not in this set are skipped entirely.
+3. **Forward BFS per source** — From each source, BFS following outgoing call edges (caller→callee). When a sink is encountered, the path is recorded and traversal stops at that sink (taint terminates).
+4. **Cycle avoidance** — Each BFS path tracks its own visited set, preventing infinite loops while allowing different paths to share intermediate nodes.
+5. **Budget enforcement** — Stops when `max_paths_per_pair` or `max_total_paths` caps are reached.
+
+**Why BFS:**
+
+Shortest paths are discovered first. Short paths (1-3 hops) are far more likely to represent real data flow than long paths, so BFS naturally prioritizes the highest-confidence candidates.
+
+**Configuration:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `path_discovery_max_depth` | 10 | Maximum hops from source to sink |
+| `path_discovery_max_paths_per_pair` | 3 | Keep at most N routes between the same (source, sink) |
+| `path_discovery_max_total_paths` | 5000 | Hard cap on total candidate flows |
+
+Constants defined in `hindsight/core/constants.py`: `PATH_DISCOVERY_MAX_DEPTH`, `PATH_DISCOVERY_MAX_PATHS_PER_PAIR`, `PATH_DISCOVERY_MAX_TOTAL_PATHS`.
+
+**Output format (`candidate_flows.json`):**
+
+```json
+[
+  {
+    "source": "handleURLScheme(_:)",
+    "sink": "executeQuery(_:params:)",
+    "sink_category": "query_construction",
+    "path": ["handleURLScheme(_:)", "parseParameters(_:)", "fetchUser(_:)", "executeQuery(_:params:)"],
+    "path_length": 3,
+    "source_location": [{"file_path": "App/URLHandler.swift", "start_line": 42, "end_line": 68}],
+    "sink_location": [{"file_path": "Data/DBManager.swift", "start_line": 112, "end_line": 130}]
+  }
+]
+```
+
+**Output:** `candidate_flows.json` + `path_discovery_statistics.json` (counts, path length distribution, flows by sink category).
+
 ## Output Files
 
 All written to `<out-dir>/<repo-name>/data_flow_analysis/`:
@@ -152,6 +246,12 @@ All written to `<out-dir>/<repo-name>/data_flow_analysis/`:
 | `call_tree.txt` | Human-readable tree with tree-style indentation |
 | `call_graph_statistics.json` | Node count, edge count, depth, leaf/root counts, mean edges/node |
 | `call_tree_with_sources.json` | Call tree annotated with `ext_input` boolean per function |
+| `external_input_functions.json` | Flat list of functions that accept external input |
+| `ext_input_cache.json` | Cached source classification results (supports incremental reruns) |
+| `data_sinks.json` | Flat list of sink functions with category and reason |
+| `sink_cache.json` | Cached sink classification results (supports incremental reruns) |
+| `candidate_flows.json` | Source-to-sink paths with full call chain and locations |
+| `path_discovery_statistics.json` | Path count, length distribution, flows by sink category |
 
 ## Key Options
 
@@ -170,7 +270,7 @@ DataFlowAnalyzer (BaseAnalyzer)
     - Provides pull_results_from_directory() for downstream consumers
 
 DataFlowAnalysisRunner (AnalysisRunner + UnifiedIssueFilterMixin + ReportGeneratorMixin)
-    - Orchestrates the 4-step pipeline
+    - Orchestrates the 6-step pipeline
     - Inherits AST generation, sleep prevention, directory structure indexing
 
 CallTreeGenerator (hindsight/core/lang_util/call_tree_util.py)
@@ -180,7 +280,7 @@ CallTreeGenerator (hindsight/core/lang_util/call_tree_util.py)
 CodeNavigationServer (hindsight/core/mcp_tools/code_navigation_server.py)
     - FastMCP-based in-process server
     - Exposes code navigation tools backed by call graph + file system
-    - Used by ExternalInputAnalyzer to give the LLM codebase access
+    - Used by ExternalInputAnalyzer and SinkAnalyzer to give the LLM codebase access
 
 ExternalInputAnalyzer (hindsight/analyzers/external_input_analyzer.py)
     - Batched mode: sends up to 8 functions per LLM call with UUID correlation
@@ -188,11 +288,22 @@ ExternalInputAnalyzer (hindsight/analyzers/external_input_analyzer.py)
     - Falls back to single-function iterative tool-calling for missing results
     - Token-bucket rate limiter (40 req/min default, configurable in constants.py)
     - Annotates call tree with ext_input classification
+
+SinkAnalyzer (hindsight/analyzers/sink_analyzer.py)
+    - Same batched + fallback architecture as ExternalInputAnalyzer
+    - Classifies functions into 18 security-relevant sink categories
+    - Two-pass design: generic LLM pass + domain refinement (placeholder)
+
+PathDiscovery (hindsight/analyzers/path_discovery.py)
+    - Pure graph algorithm — no LLM calls
+    - Reverse reachability precomputation to prune unreachable sources
+    - BFS from each source to find shortest paths to sinks
+    - Configurable depth, per-pair, and total path caps
 ```
 
 ## Async Execution Model
 
-Step 4 uses Python's `asyncio` for cooperative multitasking:
+Steps 4 and 5 use Python's `asyncio` for cooperative multitasking:
 
 - **Pre-fetch**: All function bodies are fetched synchronously before async processing begins
 - **Batch creation**: Functions are grouped into batches (max 8) constrained by token budget
@@ -221,3 +332,5 @@ This approach preserves call relationships that follow the natural layering of t
 - Tree construction: O(N)
 - **Steps 1-3 total: O(N log N + E)** for typical graphs
 - **Step 4:** O(⌈F/B⌉) LLM requests in the common case, where F = number of functions and B = batch size (default 8). Falls back to O(F * K) in worst case if all batch responses fail (K = avg tool iterations per function, bounded by `EXTERNAL_INPUT_MAX_TOOL_ITERATIONS = 10`).
+- **Step 5:** Same complexity as Step 4 — O(⌈F/B⌉) LLM requests (batched), O(F * K) worst case.
+- **Step 6:** O(S * D^B) worst case where S = sources, D = max branching factor, B = max depth. In practice, much lower due to: (a) reverse reachability prunes unreachable sources, (b) BFS stops at sinks, (c) per-pair and total caps bound output. Typical runtime is sub-second even for graphs with thousands of nodes.

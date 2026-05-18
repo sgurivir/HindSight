@@ -102,9 +102,9 @@ class TestIssueDeduper:
         """Test that initialization creates the DB directory."""
         mock_embed.get_instance.return_value = Mock()
         
-        deduper = IssueDeduper(artifacts_dir=temp_artifacts_dir)
-        
-        db_path = Path(temp_artifacts_dir) / "issue_deduper_db"
+        deduper = IssueDeduper(artifacts_dir=temp_artifacts_dir, analyzer_type="code_analysis")
+
+        db_path = Path(temp_artifacts_dir) / "issue_deduper_db" / "code_analysis"
         assert db_path.exists()
         
         deduper.cleanup()
@@ -116,11 +116,11 @@ class TestIssueDeduper:
         mock_embed.get_instance.return_value = Mock()
         
         # Create existing DB directory with a file
-        db_path = Path(temp_artifacts_dir) / "issue_deduper_db"
+        db_path = Path(temp_artifacts_dir) / "issue_deduper_db" / "code_analysis"
         db_path.mkdir(parents=True)
         (db_path / "old_file.txt").write_text("old data")
         
-        deduper = IssueDeduper(artifacts_dir=temp_artifacts_dir)
+        deduper = IssueDeduper(artifacts_dir=temp_artifacts_dir, analyzer_type="code_analysis")
         
         # Old file should be gone
         assert not (db_path / "old_file.txt").exists()
@@ -133,7 +133,7 @@ class TestIssueDeduper:
         """Test deduplication of empty list."""
         mock_embed.get_instance.return_value = Mock()
         
-        deduper = IssueDeduper(artifacts_dir=temp_artifacts_dir)
+        deduper = IssueDeduper(artifacts_dir=temp_artifacts_dir, analyzer_type="code_analysis")
         result = deduper.dedupe([])
         
         assert result == []
@@ -146,7 +146,7 @@ class TestIssueDeduper:
         """Test initial statistics."""
         mock_embed.get_instance.return_value = Mock()
         
-        deduper = IssueDeduper(artifacts_dir=temp_artifacts_dir)
+        deduper = IssueDeduper(artifacts_dir=temp_artifacts_dir, analyzer_type="code_analysis")
         stats = deduper.get_stats()
         
         assert stats['total_input'] == 0
@@ -162,7 +162,7 @@ class TestIssueDeduper:
         """Test context manager usage."""
         mock_embed.get_instance.return_value = Mock()
         
-        with IssueDeduper(artifacts_dir=temp_artifacts_dir) as deduper:
+        with IssueDeduper(artifacts_dir=temp_artifacts_dir, analyzer_type="code_analysis") as deduper:
             assert deduper is not None
             result = deduper.dedupe([])
             assert result == []
@@ -370,7 +370,7 @@ class TestDedupeIssuesFunction:
     @patch('hindsight.dedupers.issue_deduper.deduper.DuplicateDetector')
     def test_dedupe_issues_empty(self, mock_detector, mock_ingester, temp_artifacts_dir):
         """Test dedupe_issues with empty list."""
-        result = dedupe_issues([], temp_artifacts_dir)
+        result = dedupe_issues([], temp_artifacts_dir, analyzer_type="code_analysis")
         assert result == []
 
 
@@ -432,7 +432,7 @@ class TestExactDuplicateDetection:
 
 class TestStatsTracking:
     """Tests for statistics tracking."""
-    
+
     def test_stats_tracking(self):
         """Test that statistics are tracked correctly."""
         issues = [
@@ -440,13 +440,234 @@ class TestStatsTracking:
             {"title": "Issue 1", "description": "Desc 1", "file_path": "a.py"},  # Duplicate
             {"title": "Issue 2", "description": "Desc 2", "file_path": "b.py"},
         ]
-        
+
         analyzer_issues = [AnalyzerIssue.from_analyzer_result(i) for i in issues]
-        
+
         detector = DuplicateDetector()
         detector.find_duplicates(analyzer_issues)
-        
+
         stats = detector.get_stats()
         assert stats['total_duplicates'] == 1
         assert stats['exact_matches'] == 1
         assert stats['semantic_matches'] == 0
+
+
+class TestFileNameScoring:
+    """Tests for DuplicateDetector._compute_file_name_score."""
+
+    def test_exact_same_path(self):
+        score = DuplicateDetector._compute_file_name_score(
+            "Daemon/Core/Foo.mm", "Daemon/Core/Foo.mm"
+        )
+        assert score == 1.0
+
+    def test_same_filename_different_dir(self):
+        score = DuplicateDetector._compute_file_name_score(
+            "Daemon/Core/Foo.mm", "Other/Foo.mm"
+        )
+        assert 0.8 <= score < 1.0
+
+    def test_same_filename_no_dirs(self):
+        score = DuplicateDetector._compute_file_name_score("Foo.mm", "Foo.mm")
+        assert score == 1.0
+
+    def test_different_filenames(self):
+        score = DuplicateDetector._compute_file_name_score(
+            "Daemon/Core/Foo.mm", "Daemon/Core/Bar.mm"
+        )
+        assert score == 0.0
+
+    def test_empty_path(self):
+        assert DuplicateDetector._compute_file_name_score("", "Foo.mm") == 0.0
+        assert DuplicateDetector._compute_file_name_score("Foo.mm", "") == 0.0
+
+    def test_same_filename_partial_dir_overlap(self):
+        score = DuplicateDetector._compute_file_name_score(
+            "Daemon/Motion/Utilities/Foo.mm", "Daemon/Motion/Other/Foo.mm"
+        )
+        assert score > 0.8
+
+
+class TestFunctionNameScoring:
+    """Tests for DuplicateDetector._compute_function_name_score."""
+
+    def test_exact_match(self):
+        score = DuplicateDetector._compute_function_name_score(
+            "sendCommandPayload", "sendCommandPayload"
+        )
+        assert score == 1.0
+
+    def test_objc_prefix_match(self):
+        score = DuplicateDetector._compute_function_name_score(
+            "-[CLFoo sendCommandPayload]", "sendCommandPayload"
+        )
+        assert score == 0.7
+
+    def test_substring_match(self):
+        score = DuplicateDetector._compute_function_name_score(
+            "sendCommand", "sendCommandPayload"
+        )
+        assert score == 0.7
+
+    def test_no_match(self):
+        score = DuplicateDetector._compute_function_name_score(
+            "fooBar", "bazQux"
+        )
+        assert score == 0.0
+
+    def test_token_overlap(self):
+        score = DuplicateDetector._compute_function_name_score(
+            "sendCommandPayload", "receiveCommandData"
+        )
+        assert score > 0.3
+
+    def test_empty_names(self):
+        assert DuplicateDetector._compute_function_name_score("", "func") == 0.0
+        assert DuplicateDetector._compute_function_name_score("func", "") == 0.0
+
+    def test_case_insensitive(self):
+        score = DuplicateDetector._compute_function_name_score(
+            "SendCommand", "sendcommand"
+        )
+        assert score == 1.0
+
+    def test_objc_class_method_prefix(self):
+        score = DuplicateDetector._compute_function_name_score(
+            "+[CLManager startUpdating]", "-[CLManager startUpdating]"
+        )
+        assert score == 1.0
+
+
+class TestHybridScoring:
+    """Tests for DuplicateDetector._compute_hybrid_score."""
+
+    def test_all_signals_perfect(self):
+        score = DuplicateDetector._compute_hybrid_score(1.0, 1.0, 1.0, True, True)
+        assert abs(score - 1.0) < 0.001
+
+    def test_all_signals_zero(self):
+        score = DuplicateDetector._compute_hybrid_score(0.0, 0.0, 0.0, True, True)
+        assert score == 0.0
+
+    def test_file_only_mode(self):
+        score = DuplicateDetector._compute_hybrid_score(1.0, 0.0, 0.8, True, False)
+        # Should use HYBRID_WEIGHTS_FILE_ONLY: 0.50 * 1.0 + 0.50 * 0.8 = 0.9
+        assert abs(score - 0.9) < 0.001
+
+    def test_func_only_mode(self):
+        score = DuplicateDetector._compute_hybrid_score(0.0, 1.0, 0.8, False, True)
+        # Should use HYBRID_WEIGHTS_FUNC_ONLY: 0.40 * 1.0 + 0.60 * 0.8 = 0.88
+        assert abs(score - 0.88) < 0.001
+
+    def test_no_structural_fields(self):
+        score = DuplicateDetector._compute_hybrid_score(0.0, 0.0, 0.9, False, False)
+        assert abs(score - 0.9) < 0.001
+
+    def test_strong_file_weak_cosine(self):
+        score = DuplicateDetector._compute_hybrid_score(1.0, 1.0, 0.4, True, True)
+        # 0.40*1.0 + 0.25*1.0 + 0.35*0.4 = 0.79
+        assert abs(score - 0.79) < 0.001
+
+
+class TestHybridSemanticDuplication:
+    """Tests for hybrid semantic duplicate detection with mocked vector store."""
+
+    def _make_issue(self, id, title, desc, file_path=None, func=None):
+        return AnalyzerIssue(
+            id=id, title=title, description=desc,
+            file_path=file_path, function_name=func
+        )
+
+    @patch('hindsight.dedupers.issue_deduper.duplicate_detector.EmbeddingGenerator')
+    def test_same_file_same_func_detected(self, mock_embed_cls):
+        mock_gen = Mock()
+        mock_gen.generate.return_value = [0.1] * 384
+        mock_embed_cls.get_instance.return_value = mock_gen
+
+        mock_store = Mock()
+        mock_store.query.return_value = [
+            ("issue-1", {"file_path": "Daemon/Core/Foo.mm", "function_name": "sendCmd"}, 0.3)
+        ]
+
+        detector = DuplicateDetector(threshold=0.85, vector_store=mock_store)
+        issue = self._make_issue("issue-2", "perf problem", "slow", "Daemon/Core/Foo.mm", "sendCmd")
+
+        match = detector._check_semantic_similarity(issue, {"issue-1"})
+        assert match is not None
+        assert match.original_id == "issue-1"
+        assert match.similarity_score >= 0.85
+
+    @patch('hindsight.dedupers.issue_deduper.duplicate_detector.EmbeddingGenerator')
+    def test_different_file_rejected(self, mock_embed_cls):
+        mock_gen = Mock()
+        mock_gen.generate.return_value = [0.1] * 384
+        mock_embed_cls.get_instance.return_value = mock_gen
+
+        mock_store = Mock()
+        # Very high cosine similarity (distance=0.05) but different file
+        mock_store.query.return_value = [
+            ("issue-1", {"file_path": "Daemon/Core/Bar.mm", "function_name": "sendCmd"}, 0.05)
+        ]
+
+        detector = DuplicateDetector(threshold=0.85, vector_store=mock_store)
+        issue = self._make_issue("issue-2", "perf problem", "slow", "Daemon/Core/Foo.mm", "sendCmd")
+
+        match = detector._check_semantic_similarity(issue, {"issue-1"})
+        assert match is None
+
+    @patch('hindsight.dedupers.issue_deduper.duplicate_detector.EmbeddingGenerator')
+    def test_missing_file_falls_back_to_cosine(self, mock_embed_cls):
+        mock_gen = Mock()
+        mock_gen.generate.return_value = [0.1] * 384
+        mock_embed_cls.get_instance.return_value = mock_gen
+
+        mock_store = Mock()
+        # High cosine similarity, no file_path on candidate
+        mock_store.query.return_value = [
+            ("issue-1", {"file_path": "", "function_name": ""}, 0.1)
+        ]
+
+        detector = DuplicateDetector(threshold=0.85, vector_store=mock_store)
+        issue = self._make_issue("issue-2", "perf problem", "slow")
+
+        match = detector._check_semantic_similarity(issue, {"issue-1"})
+        # cosine = 1 - 0.1/2 = 0.95 → above 0.85
+        assert match is not None
+        assert abs(match.similarity_score - 0.95) < 0.01
+
+    @patch('hindsight.dedupers.issue_deduper.duplicate_detector.EmbeddingGenerator')
+    def test_candidate_not_in_seen_ids_skipped(self, mock_embed_cls):
+        mock_gen = Mock()
+        mock_gen.generate.return_value = [0.1] * 384
+        mock_embed_cls.get_instance.return_value = mock_gen
+
+        mock_store = Mock()
+        mock_store.query.return_value = [
+            ("issue-1", {"file_path": "Foo.mm", "function_name": "f"}, 0.05)
+        ]
+
+        detector = DuplicateDetector(threshold=0.85, vector_store=mock_store)
+        issue = self._make_issue("issue-2", "perf", "slow", "Foo.mm", "f")
+
+        match = detector._check_semantic_similarity(issue, {"other-id"})
+        assert match is None
+
+    @patch('hindsight.dedupers.issue_deduper.duplicate_detector.EmbeddingGenerator')
+    def test_best_candidate_selected(self, mock_embed_cls):
+        mock_gen = Mock()
+        mock_gen.generate.return_value = [0.1] * 384
+        mock_embed_cls.get_instance.return_value = mock_gen
+
+        mock_store = Mock()
+        mock_store.query.return_value = [
+            ("issue-1", {"file_path": "Foo.mm", "function_name": "funcA"}, 0.4),
+            ("issue-3", {"file_path": "Foo.mm", "function_name": "funcA"}, 0.1),
+        ]
+
+        detector = DuplicateDetector(threshold=0.50, vector_store=mock_store)
+        issue = self._make_issue("issue-2", "perf", "slow", "Foo.mm", "funcA")
+
+        match = detector._check_semantic_similarity(issue, {"issue-1", "issue-3"})
+        assert match is not None
+        # issue-3 has lower distance (higher cosine) → higher hybrid score
+        assert match.original_id == "issue-3"

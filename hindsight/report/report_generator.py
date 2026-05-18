@@ -796,6 +796,79 @@ def generate_html_report(issues, output_file=DEFAULT_HTML_REPORT, project_name=N
                 padding: 15px;
             }}
         }}
+
+        /* Radar duplicate highlight styles */
+        .issue.has-radar-match {{
+            background: #fef9c3 !important;
+            border-left: 4px solid #ca8a04 !important;
+        }}
+        .issue.has-radar-match:nth-child(even) {{
+            background: #fdf6b2 !important;
+        }}
+        .radar-dedupe-info {{
+            background: rgba(202, 138, 4, 0.1);
+            border: 1px solid rgba(202, 138, 4, 0.3);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-top: 12px;
+        }}
+        .radar-dedupe-header {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+            font-weight: 600;
+            color: #a16207;
+            font-size: 0.9375rem;
+        }}
+        .radar-match-item {{
+            background: rgba(255, 255, 255, 0.8);
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin: 6px 0;
+        }}
+        .radar-match-row {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }}
+        .radar-issue-link {{
+            font-family: 'SF Mono', Monaco, monospace;
+            font-weight: 600;
+            color: #0066cc;
+            text-decoration: underline;
+            font-size: 0.875rem;
+        }}
+        .radar-score {{
+            background: #ca8a04;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }}
+        .radar-score.high, .radar-score.very_high {{
+            background: #dc2626;
+        }}
+        .radar-score.moderate {{
+            background: #f59e0b;
+            color: #1f2937;
+        }}
+        .radar-score.low {{
+            background: #10b981;
+        }}
+        .radar-match-title {{
+            font-size: 0.875rem;
+            color: #374151;
+            font-weight: 500;
+            margin: 4px 0;
+        }}
+        .radar-match-scores {{
+            font-size: 0.75rem;
+            color: #6b7280;
+            margin-top: 4px;
+        }}
     </style>
 </head>
 <body>
@@ -870,7 +943,7 @@ def generate_html_report(issues, output_file=DEFAULT_HTML_REPORT, project_name=N
 
             issues.forEach((issue, index) => {{
                 const issueSection = document.createElement('section');
-                issueSection.className = 'issue';
+                issueSection.className = 'issue' + (issue.radar_matches && issue.radar_matches.length > 0 ? ' has-radar-match' : '');
                 issueSection.setAttribute('data-severity', issue.kind || issue.severity);
                 issueSection.setAttribute('data-directory', getIssueDirectory(issue.file_path || issue.file));
 
@@ -946,6 +1019,29 @@ def generate_html_report(issues, output_file=DEFAULT_HTML_REPORT, project_name=N
                             <summary>Evidence</summary>
                             <p>${{issue.evidence}}</p>
                         </details>
+                        ` : ''}}
+
+                        ${{issue.radar_matches && issue.radar_matches.length > 0 ? `
+                        <div class="radar-dedupe-info">
+                            <div class="radar-dedupe-header">
+                                <span>${{issue.radar_matches.some(m => m.confidenceLevel === 'high' || m.confidenceLevel === 'very_high') ? '🔴' : '🟡'}}</span>
+                                <span>${{issue.radar_matches.some(m => m.confidenceLevel === 'high' || m.confidenceLevel === 'very_high') ? 'Likely Duplicate' : 'Potential Duplicate'}} (${{issue.radar_matches.length}} match${{issue.radar_matches.length > 1 ? 'es' : ''}})</span>
+                            </div>
+                            <ul style="list-style: none; padding: 0; margin: 0;">
+                                ${{issue.radar_matches.map(match => `
+                                <li class="radar-match-item">
+                                    <div class="radar-match-row">
+                                        <a href="${{match.issueUrl}}" class="radar-issue-link">${{match.issueUrl}}</a>
+                                        <span class="radar-score ${{match.confidenceLevel}}">${{match.hybridScore}}%</span>
+                                    </div>
+                                    ${{match.issueTitle ? `<div class="radar-match-title">${{match.issueTitle}}</div>` : ''}}
+                                    <div class="radar-match-scores">
+                                        File: ${{match.filePathScore}}% | Function: ${{match.functionNameScore}}% | Semantic: ${{match.cosineScore}}%
+                                    </div>
+                                </li>
+                                `).join('')}}
+                            </ul>
+                        </div>
                         ` : ''}}
                     </article>
                 `;
@@ -1330,28 +1426,25 @@ def generate_html_report(issues, output_file=DEFAULT_HTML_REPORT, project_name=N
             }}
 
             // Build content with optional evidence field
-            const impact = issue.impact || issue.description || 'No impact information available';
-            const evidence = issue.evidence || '';
-            const solution = issue.suggestion || issue.potential_solution || issue.solution || 'No solution provided';
+            const issueDescription = (issue.issue || issue.description || 'No description available').replace(/<br\s*\/?>/gi, '\\n');
+            const impact = (issue.impact || issue.description || 'No impact information available').replace(/<br\s*\/?>/gi, '\\n');
+            const evidence = (issue.evidence || '').replace(/<br\s*\/?>/gi, '\\n');
+            const solution = (issue.suggestion || issue.potential_solution || issue.solution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
 
-            let content = `Title: In ${{functionName}}() in ${{fileName}}, there is potential issue
+            let content = `Title:\\n${{issueDescription}}
 
-HindSight has found a potential issue
-
-In ${{functionName}}() in ${{filePath}}, there is potential issue
-
-Impact: ${{impact}}`;
+Impact:\\n${{impact}}`;
 
             // Add evidence if it exists
             if (evidence) {{
                 content += `
 
-Evidence: ${{evidence}}`;
+Evidence:\\n${{evidence}}`;
             }}
 
             content += `
 
-Potential Solution: ${{solution}}`;
+Potential Solution:\\n${{solution}}`;
 
             navigator.clipboard.writeText(content).then(() => {{
                 // Show feedback
@@ -1407,25 +1500,26 @@ Potential Solution: ${{solution}}`;
                 // Get the file path - use original_file_path if available for full relative path
                 const filePath = issue.original_file_path || issue.file_path || issue.file || 'Unknown';
                 const lineNumber = issue.lines || issue.line_number || issue.lineNumber || 'N/A';
-                const issueText = issue.issue || 'No description available';
-                const impact = issue.impact || issue.description || 'No impact information available';
-                const evidence = issue.evidence || '';
-                const solution = issue.suggestion || issue.potential_solution || issue.solution || 'No solution provided';
+                const issueText = (issue.issue || 'No description available').replace(/<br\s*\/?>/gi, '\\n');
+                const impact = (issue.impact || issue.description || 'No impact information available').replace(/<br\s*\/?>/gi, '\\n');
+                const evidence = (issue.evidence || '').replace(/<br\s*\/?>/gi, '\\n');
+                const solution = (issue.suggestion || issue.potential_solution || issue.solution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
 
                 // Build the output, only including evidence if it exists
-                let output = `file name: ${{filePath}},
-line number: ${{lineNumber}},
-issue: ${{issueText}},
-impact: ${{impact}}`;
-                
+                let output = `Title:\\n${{issueText}}
+
+Impact:\\n${{impact}}`;
+
                 if (evidence) {{
-                    output += `,
-potential evidence: ${{evidence}}`;
+                    output += `
+
+Evidence:\\n${{evidence}}`;
                 }}
-                
-                output += `,
-Potential Solution: ${{solution}}`;
-                
+
+                output += `
+
+Potential Solution:\\n${{solution}}`;
+
                 return output;
             }}).join(separator);
 

@@ -14,10 +14,10 @@
         "Resources", "en.lproj", "CardioHealthTests", "CoreLocation.xcodeproj", "vagrant", 
         "regressiontests", "Resources", ".workflow"
     ],
-    "include_directories": [],
+    "include_directories": ["Daemon", "Framework", "LocationAuthorization", "Shared"],
     "exclude_files": [],
     
-    "min_function_body_length": 7,
+    "min_function_body_length": 5,
     
     "user_prompts": [ ""]
 }

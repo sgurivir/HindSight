@@ -39,6 +39,14 @@ from ..core.constants import (
     MERGED_DEFINED_CLASSES_FILE,
     EXTERNAL_INPUT_RATE_LIMIT,
     EXTERNAL_INPUT_DEFAULT_WORKERS,
+    SINK_ANALYSIS_RATE_LIMIT,
+    SINK_ANALYSIS_DEFAULT_WORKERS,
+    PATH_DISCOVERY_MAX_DEPTH,
+    PATH_DISCOVERY_MAX_PATHS_PER_PAIR,
+    PATH_DISCOVERY_MAX_TOTAL_PATHS,
+    FLOW_VULN_RATE_LIMIT,
+    FLOW_VULN_DEFAULT_WORKERS,
+    FLOW_VULN_MAX_FLOWS_TO_ANALYZE,
 )
 from ..core.lang_util.call_graph_util import CallGraph, load_call_graph_from_json, print_statistics
 from ..core.lang_util.call_tree_util import CallTreeGenerator
@@ -49,6 +57,7 @@ from ..utils.config_util import (
     get_api_key_from_config,
     get_llm_provider_type
 )
+from ..utils.filtered_file_finder import FilteredFileFinder
 from ..utils.log_util import setup_default_logging, get_logger
 from ..utils.output_directory_provider import get_output_directory_provider
 
@@ -385,13 +394,14 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
 
             return await loop.run_in_executor(None, _sync_call)
 
-        # Collect all function names from the call tree
+        # Collect all function names from the call tree, respecting directory/file filters
         all_functions: List[str] = []
 
         def collect_functions(node: Dict[str, Any]) -> None:
             func_name = node.get("function", "")
             if func_name and func_name != "ROOT":
-                all_functions.append(func_name)
+                if self._should_analyze_function(node, config):
+                    all_functions.append(func_name)
             for child in node.get("children", []):
                 collect_functions(child)
 
@@ -403,6 +413,8 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
             if f not in seen:
                 seen.add(f)
                 unique_functions.append(f)
+
+        self.logger.info(f"Functions after directory/file filtering: {len(unique_functions)}")
 
         # Load cached results from previous runs
         data_flow_paths = self.get_default_data_flow_paths(
@@ -531,6 +543,568 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
 
         return annotated_tree
 
+    def _run_sink_discovery_with_llm(
+        self,
+        config: dict,
+        call_tree: Dict[str, Any],
+        max_workers: int
+    ) -> Dict[str, Any]:
+        """
+        Use LLM with MCP code navigation tools to determine which
+        functions are security-relevant data sinks.
+
+        Mirrors _run_external_input_analysis: async workers in parallel,
+        rate-limited, with caching.
+
+        Args:
+            config: Configuration dictionary
+            call_tree: The call tree dict (may already have ext_input annotations)
+            max_workers: Number of parallel async workers
+
+        Returns:
+            Dict with sink analysis results and annotated call tree
+        """
+        from .sink_analyzer import SinkAnalyzer
+        from ..core.llm.llm import Claude, ClaudeConfig, create_llm_provider
+        from ..core.constants import (
+            DEFAULT_LLM_API_END_POINT, DEFAULT_LLM_MODEL,
+            DATA_FLOW_ANALYZER_MODEL, DATA_FLOW_ANALYZER_MAX_TOKENS,
+            ModelLimits,
+        )
+
+        self.logger.info("Starting sink discovery with LLM...")
+
+        # Load the raw call graph data for the MCP server
+        ast_call_graph_dir = config['astCallGraphDir']
+        nested_call_graph_path = os.path.join(ast_call_graph_dir, NESTED_CALL_GRAPH_FILE)
+
+        with open(nested_call_graph_path, 'r') as f:
+            call_graph_data = json.load(f)
+
+        # Initialize MCP code navigation server
+        mcp_server = CodeNavigationServer(
+            repo_path=config['path_to_repo'],
+            call_graph_data=call_graph_data
+        )
+        self.logger.info(f"MCP server initialized with {mcp_server.graph.get_num_nodes()} symbols")
+
+        # Build LLM provider
+        api_key = get_api_key_from_config(config)
+        llm_config = ClaudeConfig(
+            api_key=api_key or "",
+            api_url=config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
+            model=config.get('model', DATA_FLOW_ANALYZER_MODEL),
+            max_tokens=config.get('max_tokens', DATA_FLOW_ANALYZER_MAX_TOKENS),
+            provider_type=get_llm_provider_type(config)
+        )
+        provider = create_llm_provider(llm_config)
+        model_name = config.get('model', DATA_FLOW_ANALYZER_MODEL)
+        context_window = ModelLimits.get_context_window(model_name)
+
+        async def async_llm_request(system_prompt: str, messages: List[Dict[str, str]]) -> str:
+            loop = asyncio.get_event_loop()
+
+            def _sync_call():
+                full_messages = [{"role": "system", "content": system_prompt}] + messages
+                payload = provider.create_payload(full_messages, stream=False)
+                response = provider.make_request(payload)
+                if response is None:
+                    return ""
+                if "error" in response:
+                    return ""
+                choices = response.get("choices", [])
+                if not choices:
+                    return ""
+                return choices[0].get("message", {}).get("content", "")
+
+            return await loop.run_in_executor(None, _sync_call)
+
+        # Collect all function names from the call tree, respecting directory/file filters
+        all_functions: List[str] = []
+
+        def collect_functions(node: Dict[str, Any]) -> None:
+            func_name = node.get("function", "")
+            if func_name and func_name != "ROOT":
+                if self._should_analyze_function(node, config):
+                    all_functions.append(func_name)
+            for child in node.get("children", []):
+                collect_functions(child)
+
+        collect_functions(call_tree.get("call_tree", {}))
+        seen: set = set()
+        unique_functions = []
+        for f in all_functions:
+            if f not in seen:
+                seen.add(f)
+                unique_functions.append(f)
+
+        self.logger.info(f"Functions after directory/file filtering: {len(unique_functions)}")
+
+        # Load cached results
+        data_flow_paths = self.get_default_data_flow_paths(
+            config['path_to_repo'], config.get('output_base_dir')
+        )
+        cache_path = os.path.join(data_flow_paths['data_flow_dir'], "sink_cache.json")
+        cached_results: Dict[str, tuple] = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r') as f:
+                    cache_data = json.load(f)
+                for func_name, entry in cache_data.items():
+                    cached_results[func_name] = (
+                        entry["is_sink"], entry["reason"], entry.get("category", "none")
+                    )
+                self.logger.info(f"Loaded {len(cached_results)} cached sink results from {cache_path}")
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                self.logger.warning(f"Failed to load sink cache, starting fresh: {e}")
+                cached_results = {}
+
+        # Filter out already-cached functions
+        failed_reasons = {"LLM request failed", "Empty LLM response", "No answer produced",
+                          "Max iterations exhausted without valid answer"}
+        functions_to_analyze = [
+            f for f in unique_functions
+            if f not in cached_results
+            or cached_results[f][1] in failed_reasons
+            or cached_results[f][1].startswith("Error:")
+        ]
+
+        self.logger.info(f"Analyzing {len(functions_to_analyze)} functions for sinks "
+                         f"({len(unique_functions) - len(functions_to_analyze)} cached, "
+                         f"workers={max_workers}, rate_limit={SINK_ANALYSIS_RATE_LIMIT}/min)")
+
+        # Incremental cache persistence
+        import threading
+        cache_lock = threading.Lock()
+
+        def _persist_result(func_name: str, is_sink: bool, reason: str, category: str) -> None:
+            with cache_lock:
+                cached_results[func_name] = (is_sink, reason, category)
+                cache_data = {
+                    fn: {"is_sink": s, "reason": r, "category": c}
+                    for fn, (s, r, c) in cached_results.items()
+                }
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, 'w') as f:
+                    json.dump(cache_data, f, indent=2)
+
+        if functions_to_analyze:
+            analyzer = SinkAnalyzer(
+                mcp_server=mcp_server,
+                llm_request_fn=async_llm_request,
+                rate_limit=SINK_ANALYSIS_RATE_LIMIT,
+                max_workers=max_workers,
+                context_window=context_window,
+                on_result_callback=_persist_result,
+            )
+
+            results = asyncio.run(analyzer.analyze_all(functions_to_analyze))
+
+            # Retry failed functions
+            failed_functions = [
+                func for func, (_, reason, _) in results.items()
+                if reason in failed_reasons or reason.startswith("Error:")
+            ]
+
+            if failed_functions:
+                self.logger.info(f"Retrying {len(failed_functions)} failed sink functions after 60s backoff...")
+                import time
+                time.sleep(60)
+                retry_analyzer = SinkAnalyzer(
+                    mcp_server=mcp_server,
+                    llm_request_fn=async_llm_request,
+                    rate_limit=SINK_ANALYSIS_RATE_LIMIT,
+                    max_workers=max_workers,
+                    context_window=context_window,
+                    on_result_callback=_persist_result,
+                )
+                retry_results = asyncio.run(retry_analyzer.analyze_all(failed_functions))
+                for func, result in retry_results.items():
+                    results[func] = result
+                analyzer._results.update(retry_results)
+        else:
+            analyzer = SinkAnalyzer(
+                mcp_server=mcp_server,
+                llm_request_fn=async_llm_request,
+                rate_limit=SINK_ANALYSIS_RATE_LIMIT,
+                max_workers=max_workers,
+                context_window=context_window,
+            )
+            results = {}
+
+        # Merge cached + new results
+        all_results = dict(cached_results)
+        all_results.update(results)
+        analyzer._results = all_results
+
+        # Write data_sinks.json — flat list of functions classified as sinks
+        sink_functions = []
+        for func_name, (is_sink, reason, category) in all_results.items():
+            if is_sink:
+                # Look up location from the call tree
+                location = self._find_function_location(call_tree, func_name)
+                sink_functions.append({
+                    "function": func_name,
+                    "location": location,
+                    "reason": reason,
+                    "category": category,
+                })
+
+        data_sinks_path = os.path.join(data_flow_paths['data_flow_dir'], "data_sinks.json")
+        os.makedirs(os.path.dirname(data_sinks_path), exist_ok=True)
+        with open(data_sinks_path, 'w') as f:
+            json.dump(sink_functions, f, indent=2)
+
+        sink_count = len(sink_functions)
+        self.logger.info(f"Sink discovery complete: {sink_count}/{len(all_results)} functions are sinks")
+        self.logger.info(f"Data sinks written to: {data_sinks_path}")
+
+        return {
+            "all_results": all_results,
+            "sink_functions": sink_functions,
+            "analyzer": analyzer,
+        }
+
+    def _run_sink_discovery_with_domain_understanding(
+        self,
+        config: dict,
+        call_tree: Dict[str, Any],
+        sink_results: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Stage 2: Refine sink discovery using domain-specific understanding.
+
+        Currently a no-op placeholder. Future implementation will use
+        domain context (e.g., "this is a time daemon" or "this is a web server")
+        to adjust sink classifications — promoting domain-specific sinks that
+        the generic LLM pass may have missed, and demoting false positives.
+
+        Args:
+            config: Configuration dictionary
+            call_tree: The call tree dict
+            sink_results: Results from stage 1 (_run_sink_discovery_with_llm)
+
+        Returns:
+            The sink_results dict, unchanged.
+        """
+        self.logger.info("Sink discovery with domain understanding: no-op (not yet implemented)")
+        return sink_results
+
+    def _find_function_location(
+        self, call_tree: Dict[str, Any], func_name: str
+    ) -> List[Dict[str, Any]]:
+        """Find the location entries for a function in the call tree."""
+        def _search(node: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+            if node.get("function") == func_name:
+                return node.get("location", [])
+            for child in node.get("children", []):
+                found = _search(child)
+                if found is not None:
+                    return found
+            return None
+
+        result = _search(call_tree.get("call_tree", {}))
+        return result if result is not None else []
+
+    def _should_analyze_function(self, node: Dict[str, Any], config: dict) -> bool:
+        """
+        Check if a function node should be analyzed based on include_directories,
+        exclude_directories, and exclude_files config filters.
+
+        Uses partial path matching consistent with code_analyzer behavior.
+
+        Args:
+            node: A call tree node with 'function' and 'location' fields
+            config: Configuration dictionary containing filtering parameters
+
+        Returns:
+            bool: True if the function should be analyzed
+        """
+        include_directories = config.get('include_directories', [])
+        exclude_directories = config.get('exclude_directories', [])
+        exclude_files = config.get('exclude_files', [])
+
+        if not include_directories and not exclude_directories and not exclude_files:
+            return True
+
+        locations = node.get("location", [])
+        if not locations:
+            return True
+
+        for loc in locations:
+            file_path = loc.get("file_path", "")
+            if not file_path:
+                continue
+            normalized = file_path.lstrip('./')
+            if FilteredFileFinder.should_analyze_by_directory_filters(
+                normalized, include_directories, exclude_directories, exclude_files
+            ):
+                return True
+
+        return False
+
+    def _run_path_discovery(
+        self,
+        config: dict,
+        call_tree: Dict[str, Any],
+        sink_results: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Step 6: Static path discovery — find call paths from sources to sinks.
+
+        Loads the call graph, source functions, and sink functions, then runs
+        BFS-based path finding to produce candidate data flow paths.
+
+        Args:
+            config: Configuration dictionary (must have astCallGraphDir, path_to_repo)
+            call_tree: The call tree dict (with ext_input annotations)
+            sink_results: Results dict from sink discovery (contains sink_functions list)
+
+        Returns:
+            List of candidate flow dicts
+        """
+        from .path_discovery import PathDiscovery
+
+        self.logger.info("Starting static path discovery (source → sink)...")
+
+        # Load the call graph
+        ast_call_graph_dir = config['astCallGraphDir']
+        nested_call_graph_path = os.path.join(ast_call_graph_dir, NESTED_CALL_GRAPH_FILE)
+
+        with open(nested_call_graph_path, 'r') as f:
+            call_graph_data = json.load(f)
+
+        call_graph = load_call_graph_from_json(call_graph_data)
+        self.logger.info(f"Call graph loaded: {call_graph.get_num_nodes()} nodes, {call_graph.get_num_edges()} edges")
+
+        # Collect source functions from the annotated call tree
+        source_functions: set = set()
+
+        def collect_sources(node: Dict[str, Any]) -> None:
+            if node.get("ext_input"):
+                func_name = node.get("function", "")
+                if func_name:
+                    source_functions.add(func_name)
+            for child in node.get("children", []):
+                collect_sources(child)
+
+        collect_sources(call_tree.get("call_tree", {}))
+
+        # Also load from ext_input_cache.json for completeness (cached results
+        # cover all analyzed functions, not just direct children of ROOT)
+        data_flow_paths = self.get_default_data_flow_paths(
+            config['path_to_repo'], config.get('output_base_dir')
+        )
+        ext_cache_path = os.path.join(data_flow_paths['data_flow_dir'], "ext_input_cache.json")
+        if os.path.exists(ext_cache_path):
+            with open(ext_cache_path, 'r') as f:
+                ext_cache = json.load(f)
+            for func_name, entry in ext_cache.items():
+                if entry.get("ext_input"):
+                    source_functions.add(func_name)
+
+        # Collect sink functions → category mapping
+        sink_function_map: Dict[str, str] = {}
+        for sink_entry in sink_results.get("sink_functions", []):
+            sink_function_map[sink_entry["function"]] = sink_entry.get("category", "unknown")
+
+        self.logger.info(f"Sources: {len(source_functions)}, Sinks: {len(sink_function_map)}")
+
+        # Run path discovery
+        max_depth = config.get('path_discovery_max_depth', PATH_DISCOVERY_MAX_DEPTH)
+        max_per_pair = config.get('path_discovery_max_paths_per_pair', PATH_DISCOVERY_MAX_PATHS_PER_PAIR)
+        max_total = config.get('path_discovery_max_total_paths', PATH_DISCOVERY_MAX_TOTAL_PATHS)
+
+        discoverer = PathDiscovery(
+            call_graph=call_graph,
+            max_path_depth=max_depth,
+            max_paths_per_pair=max_per_pair,
+            max_total_paths=max_total,
+        )
+
+        candidate_flows = discoverer.discover_paths(source_functions, sink_function_map)
+
+        # Enrich flows with location data
+        for flow in candidate_flows:
+            flow["source_location"] = self._find_function_location(call_tree, flow["source"])
+            flow["sink_location"] = self._find_function_location(call_tree, flow["sink"])
+
+        # Write candidate_flows.json
+        output_path = os.path.join(data_flow_paths['data_flow_dir'], "candidate_flows.json")
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(candidate_flows, f, indent=2)
+
+        # Write statistics
+        stats = discoverer.get_statistics(candidate_flows)
+        stats_path = os.path.join(data_flow_paths['data_flow_dir'], "path_discovery_statistics.json")
+        with open(stats_path, 'w') as f:
+            json.dump(stats, f, indent=2)
+
+        self.logger.info(f"Path discovery complete:")
+        self.logger.info(f"  Candidate flows: {stats['total_candidate_flows']}")
+        self.logger.info(f"  Unique (source, sink) pairs: {stats['unique_pairs']}")
+        self.logger.info(f"  Unique sources with paths: {stats['unique_sources']}")
+        self.logger.info(f"  Unique sinks reached: {stats['unique_sinks']}")
+        if stats['path_length_distribution']:
+            self.logger.info(f"  Path lengths: {stats['path_length_distribution']}")
+        if stats['flows_by_sink_category']:
+            top_cats = list(stats['flows_by_sink_category'].items())[:5]
+            self.logger.info(f"  Top sink categories: {dict(top_cats)}")
+        self.logger.info(f"  Output: {output_path}")
+
+        return candidate_flows
+
+    def _run_flow_vulnerability_analysis(
+        self,
+        config: dict,
+        candidate_flows: List[Dict[str, Any]],
+        max_workers: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Step 7: LLM-based vulnerability analysis of candidate data flow paths.
+
+        For each candidate flow, the LLM queries the CWE catalog to find relevant
+        weakness patterns, reads code along the path, and determines whether untrusted
+        data reaches the sink without adequate sanitization.
+
+        Args:
+            config: Configuration dictionary
+            candidate_flows: List of candidate flow dicts from path discovery
+            max_workers: Number of parallel async workers
+
+        Returns:
+            List of confirmed vulnerability findings
+        """
+        from .flow_vulnerability_analyzer import FlowVulnerabilityAnalyzer
+        from ..core.knowledge.cwe_store import CWEStore
+        from ..core.llm.llm import Claude, ClaudeConfig, create_llm_provider
+        from ..core.constants import (
+            DEFAULT_LLM_API_END_POINT,
+            DATA_FLOW_ANALYZER_MODEL, DATA_FLOW_ANALYZER_MAX_TOKENS,
+            ModelLimits,
+        )
+
+        self.logger.info("Starting flow vulnerability analysis (CWE anti-pattern detection)...")
+
+        if not candidate_flows:
+            self.logger.info("No candidate flows to analyze")
+            return []
+
+        # Prioritize shorter paths (more likely to be exploitable)
+        sorted_flows = sorted(candidate_flows, key=lambda f: f.get("path_length", 99))
+        max_flows = config.get("flow_vuln_max_flows", FLOW_VULN_MAX_FLOWS_TO_ANALYZE)
+        flows_to_analyze = sorted_flows[:max_flows]
+
+        if len(candidate_flows) > max_flows:
+            self.logger.info(
+                f"Capped at {max_flows} flows (from {len(candidate_flows)} candidates), "
+                f"prioritizing shortest paths"
+            )
+
+        # Load CWE catalog
+        cwe_store = CWEStore()
+        self.logger.info(f"CWE catalog loaded: {cwe_store.entry_count} entries")
+
+        # Load the call graph data for MCP server
+        ast_call_graph_dir = config['astCallGraphDir']
+        nested_call_graph_path = os.path.join(ast_call_graph_dir, NESTED_CALL_GRAPH_FILE)
+
+        with open(nested_call_graph_path, 'r') as f:
+            call_graph_data = json.load(f)
+
+        # Initialize MCP code navigation server
+        mcp_server = CodeNavigationServer(
+            repo_path=config['path_to_repo'],
+            call_graph_data=call_graph_data
+        )
+        self.logger.info(f"MCP server initialized with {mcp_server.graph.get_num_nodes()} symbols")
+
+        # Build LLM provider
+        api_key = get_api_key_from_config(config)
+        llm_config = ClaudeConfig(
+            api_key=api_key or "",
+            api_url=config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
+            model=config.get('model', DATA_FLOW_ANALYZER_MODEL),
+            max_tokens=config.get('max_tokens', DATA_FLOW_ANALYZER_MAX_TOKENS),
+            provider_type=get_llm_provider_type(config)
+        )
+        provider = create_llm_provider(llm_config)
+        model_name = config.get('model', DATA_FLOW_ANALYZER_MODEL)
+        context_window = ModelLimits.get_context_window(model_name)
+
+        async def async_llm_request(system_prompt: str, messages: List[Dict[str, str]]) -> str:
+            loop = asyncio.get_event_loop()
+
+            def _sync_call():
+                full_messages = [{"role": "system", "content": system_prompt}] + messages
+                payload = provider.create_payload(full_messages, stream=False)
+                response = provider.make_request(payload)
+                if response is None:
+                    return ""
+                if "error" in response:
+                    return ""
+                choices = response.get("choices", [])
+                if not choices:
+                    return ""
+                return choices[0].get("message", {}).get("content", "")
+
+            return await loop.run_in_executor(None, _sync_call)
+
+        data_flow_paths = self.get_default_data_flow_paths(
+            config['path_to_repo'], config.get('output_base_dir')
+        )
+        cache_path = os.path.join(data_flow_paths['data_flow_dir'], "vulnerability_cache.json")
+        prompts_dir = os.path.join(data_flow_paths['data_flow_dir'], "prompts_sent")
+
+        self.logger.info(
+            f"Analyzing {len(flows_to_analyze)} flows for vulnerabilities "
+            f"(workers={max_workers}, rate_limit={FLOW_VULN_RATE_LIMIT}/min)"
+        )
+
+        analyzer = FlowVulnerabilityAnalyzer(
+            mcp_server=mcp_server,
+            cwe_store=cwe_store,
+            llm_request_fn=async_llm_request,
+            rate_limit=FLOW_VULN_RATE_LIMIT,
+            max_workers=max_workers,
+            context_window=context_window,
+            prompts_dir=prompts_dir,
+            cache_path=cache_path,
+        )
+
+        all_results = asyncio.run(analyzer.analyze_all(flows_to_analyze))
+
+        # Collect all confirmed vulnerabilities
+        all_vulns: List[Dict[str, Any]] = []
+        for flow_key, vulns in all_results.items():
+            source, sink = flow_key.split("|", 1) if "|" in flow_key else (flow_key, "")
+            for vuln in vulns:
+                vuln["source"] = source
+                vuln["sink"] = sink
+                all_vulns.append(vuln)
+
+        # Write output
+        output_path = os.path.join(data_flow_paths['data_flow_dir'], "vulnerabilities.json")
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(all_vulns, f, indent=2)
+
+        vuln_count = len(all_vulns)
+        flows_with_vulns = sum(1 for v in all_results.values() if v)
+        self.logger.info(f"Flow vulnerability analysis complete:")
+        self.logger.info(f"  Total vulnerabilities found: {vuln_count}")
+        self.logger.info(f"  Flows with vulnerabilities: {flows_with_vulns}/{len(all_results)}")
+        if all_vulns:
+            severity_counts = {}
+            for v in all_vulns:
+                sev = v.get("severity", "unknown")
+                severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            self.logger.info(f"  By severity: {severity_counts}")
+        self.logger.info(f"  Output: {output_path}")
+
+        return all_vulns
+
     def merge_include_exclude_directories_from_config_and_params(
         self,
         config_dict: Dict[str, Any],
@@ -571,10 +1145,12 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
         force_recreate_ast: bool = False,
         exclude_directories: List[str] = None,
         include_directories: List[str] = None,
+        exclude_files: List[str] = None,
         max_call_depth: int = 20,
         show_location: bool = True,
         sort_by_depth: bool = True,
-        max_workers: int = EXTERNAL_INPUT_DEFAULT_WORKERS
+        max_workers: int = EXTERNAL_INPUT_DEFAULT_WORKERS,
+        enable_cwe_analysis: bool = True,
     ):
         """
         Main entry point for the Data Flow Analyzer.
@@ -586,16 +1162,24 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
             force_recreate_ast: Force recreation of AST call graphs
             exclude_directories: List of directories to exclude
             include_directories: List of directories to include
+            exclude_files: List of files to exclude
             max_call_depth: Maximum depth for call tree generation
             show_location: Show file locations in text output
             sort_by_depth: Sort branches by depth (longest first, default: True)
             max_workers: Number of parallel workers for external input analysis
+            enable_cwe_analysis: Enable CWE vulnerability analysis on candidate flows
         """
         # Merge include/exclude directories from config and params
         computed_include_directories, computed_exclude_directories = \
             self.merge_include_exclude_directories_from_config_and_params(
                 config_dict, include_directories, exclude_directories
             )
+
+        # Merge exclude_files from config and params
+        config_exclude_files = config_dict.get('exclude_files', []) or []
+        exclude_files_from_config = set(config_exclude_files) if config_exclude_files else set()
+        exclude_files_from_args = set(exclude_files) if exclude_files else set()
+        computed_exclude_files = list(exclude_files_from_config.union(exclude_files_from_args))
 
         self.logger.info(f"Arguments passed to runner.run:")
         self.logger.info(f"  config_dict: {config_dict}")
@@ -604,6 +1188,7 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
         self.logger.info(f"  force_recreate_ast: {force_recreate_ast}")
         self.logger.info(f"  exclude_directories: {computed_exclude_directories}")
         self.logger.info(f"  include_directories: {computed_include_directories}")
+        self.logger.info(f"  exclude_files: {computed_exclude_files}")
         self.logger.info(f"  max_call_depth: {max_call_depth}")
         self.logger.info(f"  show_location: {show_location}")
         self.logger.info(f"  sort_by_depth: {sort_by_depth}")
@@ -613,16 +1198,18 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
             self._start_sleep_prevention()
 
             config = config_dict.copy()
-            
+
             # Set repo_path in config
             config['path_to_repo'] = repo_path
             config['max_call_depth'] = max_call_depth
             config['show_location'] = show_location
             config['sort_by_depth'] = sort_by_depth
+            config['enable_cwe_analysis'] = enable_cwe_analysis
 
-            # Set merged directories
+            # Set merged directories and files
             config['exclude_directories'] = computed_exclude_directories
             config['include_directories'] = computed_include_directories
+            config['exclude_files'] = computed_exclude_files
 
             # Determine the output base directory
             output_base_dir = out_dir
@@ -672,7 +1259,17 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
 
             # Step 3: Call Tree Generation
             self.logger.info("\n\n=== CALL TREE GENERATION ===")
-            call_tree = self._generate_call_tree(config)
+            data_flow_paths = self.get_default_data_flow_paths(
+                config['path_to_repo'], config.get('output_base_dir')
+            )
+            call_tree_path = data_flow_paths['call_tree_json']
+
+            if not force_recreate_ast and os.path.exists(call_tree_path):
+                self.logger.info(f"Existing call tree found - loading from {call_tree_path}")
+                with open(call_tree_path, 'r') as f:
+                    call_tree = json.load(f)
+            else:
+                call_tree = self._generate_call_tree(config)
             
             if call_tree:
                 metadata = call_tree.get('metadata', {})
@@ -685,6 +1282,37 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
             if call_tree:
                 self.logger.info("\n\n=== EXTERNAL INPUT ANALYSIS ===")
                 self._run_external_input_analysis(config, call_tree, max_workers)
+
+            # Step 5: Sink Discovery (LLM + domain understanding)
+            sink_results = None
+            if call_tree:
+                self.logger.info("\n\n=== SINK DISCOVERY ===")
+                # Stage 1: LLM-based sink classification
+                sink_results = self._run_sink_discovery_with_llm(config, call_tree, max_workers)
+                # Stage 2: Domain-understanding refinement (no-op for now)
+                self._run_sink_discovery_with_domain_understanding(config, call_tree, sink_results)
+
+            # Step 6: Path Discovery (static graph traversal)
+            candidate_flows = None
+            if call_tree and sink_results:
+                candidate_flows_path = os.path.join(
+                    data_flow_paths['data_flow_dir'], "candidate_flows.json"
+                )
+                if os.path.exists(candidate_flows_path):
+                    self.logger.info("\n\n=== PATH DISCOVERY (Source → Sink) ===")
+                    self.logger.info(f"Existing candidate_flows.json found - loading")
+                    with open(candidate_flows_path, 'r') as f:
+                        candidate_flows = json.load(f)
+                else:
+                    self.logger.info("\n\n=== PATH DISCOVERY (Source → Sink) ===")
+                    candidate_flows = self._run_path_discovery(config, call_tree, sink_results)
+
+            # Step 7: Flow Vulnerability Analysis (LLM + CWE tools)
+            if candidate_flows and config.get('enable_cwe_analysis', True):
+                self.logger.info("\n\n=== FLOW VULNERABILITY ANALYSIS (CWE) ===")
+                self._run_flow_vulnerability_analysis(config, candidate_flows, max_workers)
+            elif candidate_flows and not config.get('enable_cwe_analysis', True):
+                self.logger.info("\n\nCWE vulnerability analysis disabled by config")
 
             self.logger.info("\n\nData flow analysis pipeline completed successfully!")
 
@@ -760,6 +1388,11 @@ python -m hindsight.analyzers.data_flow_analyzer --config config.json --repo /pa
         help="List of directories to include in analysis"
     )
     parser.add_argument(
+        "--exclude-files",
+        nargs="+",
+        help="List of files to exclude from analysis"
+    )
+    parser.add_argument(
         "--max-call-depth",
         type=int,
         default=20,
@@ -795,6 +1428,12 @@ python -m hindsight.analyzers.data_flow_analyzer --config config.json --repo /pa
         default=EXTERNAL_INPUT_DEFAULT_WORKERS,
         help=f"Number of parallel workers for external input analysis (default: {EXTERNAL_INPUT_DEFAULT_WORKERS})"
     )
+    parser.add_argument(
+        "--no-cwe-analysis",
+        action="store_true",
+        default=False,
+        help="Disable CWE vulnerability analysis on candidate flows (Step 7)"
+    )
 
     args = parser.parse_args()
 
@@ -819,10 +1458,12 @@ python -m hindsight.analyzers.data_flow_analyzer --config config.json --repo /pa
         force_recreate_ast=args.force_recreate_ast,
         exclude_directories=args.exclude_directories,
         include_directories=args.include_directories,
+        exclude_files=args.exclude_files,
         max_call_depth=args.max_call_depth,
         show_location=args.show_location,
         sort_by_depth=args.sort_by_depth,
-        max_workers=args.workers
+        max_workers=args.workers,
+        enable_cwe_analysis=not args.no_cwe_analysis,
     )
 
 

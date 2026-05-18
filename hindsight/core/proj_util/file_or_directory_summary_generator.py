@@ -162,7 +162,7 @@ class FileOrDirectorySummaryGenerator:
         self._get_or_create_tools(repo_path)
         
         # Setup conversation logging (same as working analyzers)
-        Claude.setup_prompts_logging()
+        Claude.setup_prompts_logging("summary_generation")
         
         # Create Claude configuration
         claude_config = ClaudeConfig(
@@ -538,7 +538,7 @@ Examples:
     
     try:
         # Setup prompts logging and clear older prompts for standalone usage
-        Claude.setup_prompts_logging()
+        Claude.setup_prompts_logging("summary_generation")
         Claude.clear_older_prompts()
         
         # Load and validate configuration

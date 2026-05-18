@@ -65,11 +65,12 @@ class IssueDeduper:
     4. Returns filtered list with duplicates removed
     
     The vector DB is stored in the repository's artifacts directory:
-    ~/llm_artifacts/<repo_name>/issue_deduper_db/
-    
+    ~/llm_artifacts/<repo_name>/issue_deduper_db/<analyzer_type>/
+
     Usage:
         deduper = IssueDeduper(
             artifacts_dir="~/llm_artifacts/corelocation",
+            analyzer_type="code_analysis",
             threshold=0.85
         )
         unique_issues = deduper.dedupe(issues)
@@ -84,20 +85,22 @@ class IssueDeduper:
     def __init__(
         self,
         artifacts_dir: str,
+        analyzer_type: str,
         threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
         batch_size: int = DEFAULT_BATCH_SIZE
     ):
         """
         Initialize the deduper with repository-specific vector DB.
-        
+
         Args:
             artifacts_dir: Path to repository artifacts directory
                           (e.g., ~/llm_artifacts/corelocation/)
+            analyzer_type: Analyzer identifier (e.g., "code_analysis", "trace_analysis")
             threshold: Similarity threshold for duplicate detection (0.0-1.0).
             batch_size: Batch size for embedding generation.
         """
         self.artifacts_dir = Path(artifacts_dir).expanduser()
-        self.db_path = self.artifacts_dir / VECTOR_DB_SUBDIR
+        self.db_path = self.artifacts_dir / VECTOR_DB_SUBDIR / analyzer_type
         self.threshold = threshold
         self.batch_size = batch_size
         
@@ -266,25 +269,28 @@ class IssueDeduper:
 def dedupe_issues(
     issues: List[Dict[str, Any]],
     artifacts_dir: str,
+    analyzer_type: str,
     threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     batch_size: int = DEFAULT_BATCH_SIZE
 ) -> List[Dict[str, Any]]:
     """
     Convenience function to deduplicate issues.
-    
+
     This is a simple wrapper around IssueDeduper for one-off deduplication.
-    
+
     Args:
         issues: List of issue dictionaries from analyzer.
         artifacts_dir: Path to repository artifacts directory.
+        analyzer_type: Analyzer identifier (e.g., "code_analysis", "trace_analysis")
         threshold: Similarity threshold for duplicate detection.
         batch_size: Batch size for embedding generation.
-    
+
     Returns:
         List of unique issues (duplicates removed).
     """
     with IssueDeduper(
         artifacts_dir=artifacts_dir,
+        analyzer_type=analyzer_type,
         threshold=threshold,
         batch_size=batch_size
     ) as deduper:

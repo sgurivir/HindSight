@@ -1,1 +1,1 @@
-"""MCP (Model Context Protocol) server for code navigation."""
+"""MCP (Model Context Protocol) servers for code navigation and unified analysis."""

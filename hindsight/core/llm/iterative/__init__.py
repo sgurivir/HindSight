@@ -34,6 +34,11 @@ from .diff_context_analyzer import DiffContextAnalyzer
 from .diff_analysis_analyzer import DiffAnalysisAnalyzer
 from .response_challenger_analyzer import ResponseChallengerAnalyzer
 from .trivial_filter_analyzer import TrivialFilterAnalyzer
+from .perf_context_analyzer import PerfContextAnalyzer
+from .perf_analysis_analyzer import PerfAnalysisAnalyzer
+from .trace_context_analyzer import TraceContextAnalyzer
+from .trace_analysis_analyzer import TraceAnalysisAnalyzer
+from .trace_solution_validator_analyzer import TraceSolutionValidatorAnalyzer
 
 __all__ = [
     'BaseIterativeAnalyzer',
@@ -43,4 +48,9 @@ __all__ = [
     'DiffAnalysisAnalyzer',
     'ResponseChallengerAnalyzer',
     'TrivialFilterAnalyzer',
+    'PerfContextAnalyzer',
+    'PerfAnalysisAnalyzer',
+    'TraceContextAnalyzer',
+    'TraceAnalysisAnalyzer',
+    'TraceSolutionValidatorAnalyzer',
 ]

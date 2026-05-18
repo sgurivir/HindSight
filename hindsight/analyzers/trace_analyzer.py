@@ -6,14 +6,16 @@ Handles trace files and provides LLM analysis results based on configuration
 """
 
 import argparse
+import asyncio
 import json
 import os
 import sys
 import tempfile
+import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .analysis_runner import AnalysisRunner
 from .analysis_runner_mixins import UnifiedIssueFilterMixin, ReportGeneratorMixin
@@ -21,10 +23,11 @@ from .base_analyzer import BaseAnalyzer
 from .directory_classifier import DirectoryClassifier
 from .token_tracker import TokenTracker
 from ..issue_filter import TraceRelevanceFilter, create_unified_filter
-from ..core.constants import DEFAULT_MAX_TOKENS, PROCESSED_OUTPUT_DIR, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT
+from ..core.constants import DEFAULT_MAX_TOKENS, PROCESSED_OUTPUT_DIR, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT, TRACE_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT, LLM_PROVIDER_RATE_WINDOW_SECONDS
 from ..core.lang_util.ast_call_graph_parser import ASTCallGraphParser
 from ..core.llm.llm import Claude
-from ..core.llm.tools import Tools
+from ..core.mcp_tools.analysis_server import AnalysisMCPServer
+from ..core.async_infra import RateLimiter, run_worker_pool
 from ..core.trace_util.trace_analysis_prompt_builder import TraceAnalysisPromptBuilder
 from ..core.trace_util.trace_code_analysis import TraceAnalysisConfig, TraceCodeAnalysis
 from ..core.trace_util.trace_result_repository import TraceAnalysisResultRepository
@@ -99,7 +102,7 @@ class TraceAnalyzer(BaseAnalyzer):
                     config=self.config
                 )
 
-                trace_analysis = TraceCodeAnalysis(analysis_config)
+                trace_analysis = TraceCodeAnalysis(analysis_config, mcp_server=getattr(self, '_mcp_server', None))
                 success = trace_analysis.run_analysis()
 
                 if success:
@@ -141,6 +144,8 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
         super().__init__()
 
         self.analyzed_records_registry = None
+        self._registry_lock = threading.Lock()  # Protects analyzed_records_registry access
+        self._token_tracker_lock = threading.Lock()  # Protects token_tracker access
 
         self.api_key = None
         self.config = None
@@ -206,10 +211,11 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             temp_builder = TraceAnalysisPromptBuilder()
             callstack_text = temp_builder._convert_callstack_to_text_format(callstack)
 
-            if self.analyzed_records_registry and callstack_text and self.analyzed_records_registry.is_analyzed(callstack_text):
-                trace_id = f"trace_{callstack_index+1:04d}"
-                self.logger.info(f"Skipping {trace_id} as it has already been analyzed")
-                return True  # Return True since it's already been processed
+            with self._registry_lock:
+                if self.analyzed_records_registry and callstack_text and self.analyzed_records_registry.is_analyzed(callstack_text):
+                    trace_id = f"trace_{callstack_index+1:04d}"
+                    self.logger.info(f"Skipping {trace_id} as it has already been analyzed")
+                    return True  # Return True since it's already been processed
 
             trace_id = f"trace_{callstack_index+1:04d}"
 
@@ -246,12 +252,13 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                 if hasattr(self, '_start_function_analysis_tracking'):
                     self._start_function_analysis_tracking(callstack_text or trace_id)
 
-                trace_analysis = TraceCodeAnalysis(analysis_config)
+                trace_analysis = TraceCodeAnalysis(analysis_config, mcp_server=getattr(self, '_mcp_server', None))
                 success = trace_analysis.run_analysis()
 
                 if self.token_tracker:
                     input_tokens, output_tokens = trace_analysis.get_token_totals()
-                    self.token_tracker.add_token_usage(input_tokens, output_tokens)
+                    with self._token_tracker_lock:
+                        self.token_tracker.add_token_usage(input_tokens, output_tokens)
 
                 if hasattr(self, '_record_function_analysis_result'):
                     self._record_function_analysis_result(
@@ -319,7 +326,8 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                         return False
 
                     if self.analyzed_records_registry and callstack_text:
-                        self.analyzed_records_registry.add_analyzed(callstack_text)
+                        with self._registry_lock:
+                            self.analyzed_records_registry.add_analyzed(callstack_text)
 
                     return True
                 else:
@@ -489,7 +497,7 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
 
         tracking_file = os.path.join(ast_call_graph_dir, "processed_AST_cache.json")
         # Create analysis_input directory at the same level as code_insights, not inside it
-        output_dir = os.path.join(os.path.dirname(ast_call_graph_dir), PROCESSED_OUTPUT_DIR)
+        output_dir = os.path.join(os.path.dirname(ast_call_graph_dir), PROCESSED_OUTPUT_DIR, "trace_analysis")
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -610,12 +618,29 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
 
         artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
 
-        tools = Tools(self.repo_path, None, file_content_provider, artifacts_dir, self.directory_tree_util, ignore_dirs)
-
+        # Load call graph data for AnalysisMCPServer (enables code navigation tools)
+        call_graph_data = None
         ast_files_config = self.get_complete_ast_files_config(
             repo_path=self.repo_path,
             output_base_dir=output_provider.get_custom_base_dir()
         )
+        merged_graph_file = ast_files_config.get('merged_graph_file')
+        if merged_graph_file and os.path.exists(merged_graph_file):
+            call_graph_data = read_json_file(merged_graph_file)
+            if call_graph_data:
+                self.logger.info(f"Loaded call graph data for AnalysisMCPServer from: {merged_graph_file}")
+            else:
+                self.logger.info("Call graph file exists but could not be loaded, continuing without code nav tools")
+
+        mcp_server = AnalysisMCPServer(
+            repo_path=self.repo_path,
+            file_content_provider=file_content_provider,
+            artifacts_dir=artifacts_dir,
+            directory_tree_util=self.directory_tree_util,
+            ignore_dirs=ignore_dirs,
+            call_graph_data=call_graph_data,
+        )
+        self._mcp_server = mcp_server
 
         self._ensure_ast_files_exist(config, ast_files_config)
 
@@ -678,43 +703,91 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
         successful_analyses = 0
         failed_analyses = 0
 
-        # Process each callstack directly (no prompt files)
-        for i, (callstack_index, callstack) in enumerate(callstacks_to_analyze, 1):
-            try:
-                progress_msg = f"[{i}/{len(callstacks_to_analyze)}]"
-                trace_id = f"trace_{callstack_index+1:04d}"
-                self.logger.info(f"{progress_msg} Analyzing: {trace_id}")
+        # Thread lock for shared mutable state (registry, publisher, counters)
+        _shared_state_lock = threading.Lock()
 
-                # Generate prompt content on the fly
-                prompt_content, callstack_data = prompt_builder.create_context_for(
-                    callstack=callstack,
-                    prompt_filename=f"{trace_id}.txt"
-                )
+        # Pre-generate prompt content for each callstack (done sequentially since
+        # prompt_builder is not thread-safe)
+        work_items: List[Tuple[int, list, str, dict]] = []
+        for callstack_index, callstack in callstacks_to_analyze:
+            trace_id = f"trace_{callstack_index+1:04d}"
+            prompt_content, callstack_data = prompt_builder.create_context_for(
+                callstack=callstack,
+                prompt_filename=f"{trace_id}.txt"
+            )
+            work_items.append((callstack_index, callstack, prompt_content, callstack_data))
 
-                # Analyze the callstack directly
-                success = self._analyze_single_callstack(
+        self.logger.info(f"Generated prompts for {len(work_items)} callstacks, starting parallel analysis with {TRACE_ANALYZER_DEFAULT_WORKERS} workers")
+
+        # Define the async worker function for a single callstack
+        runner_self = self  # capture for use in async closure
+
+        async def _analyze_callstack_async(
+            item: Tuple[int, list, str, dict],
+        ) -> bool:
+            """Async worker: analyze a single callstack in a thread executor."""
+            callstack_index, callstack, prompt_content, callstack_data = item
+            loop = asyncio.get_running_loop()
+
+            def _sync_analyze() -> bool:
+                return runner_self._analyze_single_callstack(
                     callstack_index=callstack_index,
                     callstack=callstack,
                     prompt_content=prompt_content,
                     callstack_data=callstack_data,
-                    trace_analysis_out_dir=trace_analysis_out_dir
+                    trace_analysis_out_dir=trace_analysis_out_dir,
                 )
 
+            return await loop.run_in_executor(None, _sync_analyze)
+
+        # Callbacks for result/error handling
+        completed_count = [0]  # mutable counter for progress logging
+
+        def _on_result(item: Tuple[int, list, str, dict], success: bool) -> None:
+            nonlocal successful_analyses, failed_analyses
+            callstack_index = item[0]
+            trace_id = f"trace_{callstack_index+1:04d}"
+            with _shared_state_lock:
+                completed_count[0] += 1
+                progress_msg = f"[{completed_count[0]}/{len(work_items)}]"
                 if success:
                     successful_analyses += 1
-                    self.logger.info(f"{progress_msg} ✓ Successfully analyzed: {trace_id}")
+                    runner_self.logger.info(f"{progress_msg} ✓ Successfully analyzed: {trace_id}")
                 else:
                     failed_analyses += 1
-                    self.logger.info(f"{progress_msg} ✗ Failed to analyze: {trace_id}")
+                    runner_self.logger.info(f"{progress_msg} ✗ Failed to analyze: {trace_id}")
 
-            except Exception as e:
+        def _on_error(item: Tuple[int, list, str, dict], exc: Exception) -> None:
+            nonlocal failed_analyses
+            callstack_index = item[0]
+            trace_id = f"trace_{callstack_index+1:04d}"
+            with _shared_state_lock:
+                completed_count[0] += 1
                 failed_analyses += 1
-                self.logger.error(f"{progress_msg} ✗ Error analyzing callstack {callstack_index}: {e}")
+                runner_self.logger.error(
+                    f"[{completed_count[0]}/{len(work_items)}] ✗ Error analyzing {trace_id}: {exc}"
+                )
+
+        # Run the async worker pool
+        rate_limiter = RateLimiter(max_requests=LLM_PROVIDER_RATE_LIMIT,
+                                           window_seconds=LLM_PROVIDER_RATE_WINDOW_SECONDS)
+
+        async def _run_pool():
+            await run_worker_pool(
+                items=work_items,
+                worker_fn=_analyze_callstack_async,
+                max_workers=TRACE_ANALYZER_DEFAULT_WORKERS,
+                rate_limiter=rate_limiter,
+                on_result=_on_result,
+                on_error=_on_error,
+            )
+
+        asyncio.run(_run_pool())
 
         self.logger.info(f"Trace analysis completed. Success: {successful_analyses}, Failed: {failed_analyses}")
 
-        # Log tool usage summary
-        tools.log_tool_usage_summary()
+        # Log tool usage summary (AnalysisMCPServer wraps tools internally)
+        self._mcp_server._tools.log_tool_usage_summary()
 
         # Log centralized token usage summary
         if self.token_tracker and (successful_analyses > 0 or failed_analyses > 0):
@@ -753,12 +826,28 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                 return False, None
 
             # Convert results to issues format for report generation
+            # Attach callstack_data from the parent result to each issue so the
+            # HTML report can include the original trace in the copy button output.
+            # Also set a Callstack text field so issues from the same trace share
+            # one callstack overlay entry in the report.
             all_issues = []
             for result in all_results:
+                callstack_data = result.get('callstack_data')
+                callstack_list = result.get('callstack', [])
+                callstack_text = '\n'.join(callstack_list) if callstack_list else ''
+                issues_list = None
                 if 'results' in result and isinstance(result['results'], list):
-                    all_issues.extend(result['results'])
+                    issues_list = result['results']
                 elif 'issues' in result and isinstance(result['issues'], list):
-                    all_issues.extend(result['issues'])
+                    issues_list = result['issues']
+
+                if issues_list is not None:
+                    for issue in issues_list:
+                        if callstack_data and 'original_callstack' not in issue:
+                            issue['original_callstack'] = callstack_data
+                        if callstack_text and 'Callstack' not in issue:
+                            issue['Callstack'] = callstack_text
+                        all_issues.append(issue)
                 else:
                     # Single result format
                     all_issues.append(result)
@@ -778,6 +867,7 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                     # Initialize deduper with artifacts directory
                     deduper = IssueDeduper(
                         artifacts_dir=artifacts_dir,
+                        analyzer_type="trace_analysis",
                         threshold=config.get('dedupe_threshold', 0.85)
                     )
                     
@@ -800,6 +890,14 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                 except Exception as e:
                     self.logger.warning(f"Issue deduplication failed, continuing with all issues: {e}")
 
+            # Radar issue deduplication (optional, triggered by --issue-dedupe)
+            issue_dedupe_keyword = config.get('issue_dedupe_keyword')
+            if issue_dedupe_keyword and all_issues:
+                try:
+                    self.logger.info(f"Running radar deduplication with keyword: '{issue_dedupe_keyword}'")
+                    all_issues = self._run_radar_deduplication(all_issues, issue_dedupe_keyword)
+                except Exception as e:
+                    self.logger.warning(f"Radar deduplication failed, continuing without it: {e}")
 
             # Use the utility function to organize issues by directory
             # Pass exclude directories from config to issue organizer
@@ -870,7 +968,124 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             return False, None
 
 
-    def generate_report_from_existing_issues(self, config_file: str, repo_path: str, out_dir: str):
+    def _run_radar_deduplication(self, all_issues: list, keyword: str) -> list:
+        """
+        Run radar issue deduplication: download radars by keyword, ingest, and match.
+
+        Annotates each issue dict with a 'radar_matches' key containing match data.
+        Returns the same list of issues (possibly annotated). If anything fails,
+        raises an exception that the caller should catch.
+        """
+        import hashlib
+        from pathlib import Path
+        from hindsight.utils.output_directory_provider import get_output_directory_provider
+
+        output_provider = get_output_directory_provider()
+        artifacts_dir = output_provider.get_repo_artifacts_dir()
+
+        safe_keyword = keyword.replace(' ', '_').replace('/', '_')
+        radar_dupes_dir = os.path.join(artifacts_dir, 'radar_dupes', safe_keyword)
+        issue_download_dir = os.path.join(radar_dupes_dir, 'issues')
+        vector_db_dir = os.path.join(radar_dupes_dir, 'vector_db')
+        os.makedirs(issue_download_dir, exist_ok=True)
+        os.makedirs(vector_db_dir, exist_ok=True)
+
+        self.logger.info(f"Radar dupes directory: {radar_dupes_dir}")
+
+        # Step 1: Download radars
+        from hindsight.dedupers.issue_tracking_deduper.issue_helper import IssueDownloader
+        downloader = IssueDownloader(
+            output_dir=str(issue_download_dir),
+            client_name='TraceAnalyzerRadarDedupe'
+        )
+        downloaded = downloader.download_issues_by_keyword(
+            keyword=keyword,
+            rate_limit_delay=0.1
+        )
+        self.logger.info(f"Downloaded {len(downloaded)} new radars (keyword: '{keyword}')")
+
+        # Step 2: Ingest into vector DB
+        from hindsight.dedupers.issue_tracking_deduper.issue_tracking_deduper.vector_db.ingestion import IssueIngester
+        ingester = IssueIngester(db_path=str(vector_db_dir))
+        total, added, skipped = ingester.ingest_directory(
+            Path(issue_download_dir),
+            recursive=True,
+            show_progress=False
+        )
+        self.logger.info(f"Ingestion: {total} files processed, {added} added, {skipped} skipped")
+        ingester.close()
+
+        # Step 3: Match issues
+        from hindsight.dedupers.issue_tracking_deduper.issue_tracking_deduper.vector_db.store import VectorStore
+        from hindsight.dedupers.issue_tracking_deduper.issue_tracking_deduper.vector_db.embeddings import EmbeddingGenerator
+        from hindsight.dedupers.issue_tracking_deduper.issue_tracking_deduper.deduper.hybrid_matcher import HybridMatcher
+        from hindsight.dedupers.issue_tracking_deduper.issue_tracking_deduper.deduper.issue import Issue
+
+        vector_store = VectorStore(db_path=str(vector_db_dir))
+        if vector_store.count() == 0:
+            self.logger.warning("Vector DB is empty after ingestion, skipping radar matching")
+            vector_store.close()
+            return all_issues
+
+        embedding_generator = EmbeddingGenerator()
+        matcher = HybridMatcher(
+            vector_store=vector_store,
+            embedding_generator=embedding_generator,
+        )
+
+        issues_with_matches = 0
+        total_matches = 0
+
+        for idx, issue_dict in enumerate(all_issues):
+            key_parts = [
+                issue_dict.get('issue', ''),
+                issue_dict.get('file_path', ''),
+                issue_dict.get('function_name', ''),
+                str(issue_dict.get('lines', ''))
+            ]
+            issue_id = f"trace_{idx}_{hashlib.md5('|'.join(key_parts).encode()).hexdigest()[:8]}"
+
+            deduper_issue = Issue(
+                id=issue_id,
+                title=issue_dict.get('issue', ''),
+                description=issue_dict.get('description', issue_dict.get('issue', '')),
+                file_path=issue_dict.get('file_path'),
+                function_name=issue_dict.get('function_name'),
+                severity=issue_dict.get('severity'),
+                category=issue_dict.get('category'),
+            )
+
+            matches = matcher.find_matches(deduper_issue)
+
+            if matches:
+                issues_with_matches += 1
+                total_matches += len(matches)
+                issue_dict['radar_matches'] = [
+                    {
+                        'issueId': m.issue_id,
+                        'issueUrl': m.issue_url,
+                        'issueTitle': m.issue_title,
+                        'hybridScore': m.hybrid_percentage,
+                        'confidenceLevel': m.confidence_level,
+                        'filePathScore': m.file_path_percentage,
+                        'functionNameScore': m.function_name_percentage,
+                        'cosineScore': m.cosine_similarity_percentage,
+                        'matchReasons': m.match_reasons,
+                    }
+                    for m in matches
+                ]
+
+        vector_store.close()
+
+        self.logger.info(
+            f"Radar deduplication complete: {issues_with_matches}/{len(all_issues)} issues "
+            f"matched, {total_matches} total matches"
+        )
+
+        return all_issues
+
+
+    def generate_report_from_existing_issues(self, config_file: str, repo_path: str, out_dir: str, issue_dedupe_keyword: str = None):
         """Generate report from existing trace analysis files without running analysis."""
         try:
             self.logger.info("Starting report generation from existing trace analysis issues...")
@@ -878,6 +1093,7 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             # Load and validate configuration
             self.logger.info(f"Loading configuration from: {config_file}")
             config = load_config_tolerant(config_file)
+            config['issue_dedupe_keyword'] = issue_dedupe_keyword
 
             # Store repo_path for use in methods and set in config for consistency
             self.repo_path = repo_path
@@ -957,7 +1173,7 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             return False
 
 
-    def run(self, config_file: str, repo_path: str, hotspot_file: str, out_dir: str, num_traces_to_analyze: int = 100, batch_index: int = 0):
+    def run(self, config_file: str, repo_path: str, hotspot_file: str, out_dir: str, num_traces_to_analyze: int = 100, batch_index: int = 0, issue_dedupe_keyword: str = None):
         """Main entry point for the Trace Analysis tool."""
         try:
             # Store parameters for use in other methods
@@ -970,6 +1186,7 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             # Load and validate configuration
             self.logger.info(f"Loading configuration from: {config_file}")
             config = load_config_tolerant(config_file)
+            config['issue_dedupe_keyword'] = issue_dedupe_keyword
 
             # Skip analytics session - using centralized TokenTracker instead
             # self._start_analytics_session(repo_path)
@@ -1000,7 +1217,8 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             # Create AnalyzedRecordsRegistry instance with project name based on repo directory
             dirname = os.path.basename(repo_path.rstrip('/'))
             project_name = f"trace_analysis_{dirname}"
-            self.analyzed_records_registry = AnalyzedRecordsRegistry(project_name)
+            registry_dir = os.path.join(output_provider.get_repo_artifacts_dir(), "trace_analysis", "analyzed_records")
+            self.analyzed_records_registry = AnalyzedRecordsRegistry(project_name, stored_results_directory=registry_dir)
             self.logger.info(f"Initialized AnalyzedRecordsRegistry with project name: {project_name}")
             stats = self.analyzed_records_registry.get_stats()
             self.logger.info(f"Registry stats: {stats['total_analyzed']} previously analyzed records")
@@ -1014,14 +1232,14 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             # Setup prompt logging - use the base directory where outputs are stored
             # Use out_dir parameter instead of reading from JSON config
             custom_base_dir = out_dir
-            Claude.setup_prompts_logging()
+            Claude.setup_prompts_logging("trace_analysis")
             
             # Clear older prompts at the beginning of analysis
             Claude.clear_older_prompts()
 
             # Get the actual directory used for logging from the singleton
             output_provider = get_output_directory_provider()
-            actual_prompts_dir = f"{output_provider.get_repo_artifacts_dir()}/prompts_sent"
+            actual_prompts_dir = f"{output_provider.get_repo_artifacts_dir()}/prompts_sent/trace_analysis"
             self.logger.info(f"Prompt logging setup completed in: {actual_prompts_dir}")
 
             self.logger.info("Configuration loaded successfully")
@@ -1172,6 +1390,13 @@ def main():
         action="store_true",
         help="Generate report from existing trace analysis files without running analysis. Requires --config to locate artifacts."
     )
+    parser.add_argument(
+        "--issue-dedupe",
+        type=str,
+        default=None,
+        metavar="KEYWORD",
+        help="Run radar deduplication: download radars matching KEYWORD, then highlight matching issues in the HTML report"
+    )
 
     args = parser.parse_args()
 
@@ -1210,6 +1435,7 @@ def main():
             config_file=args.config,
             repo_path=args.repo,
             out_dir=args.out_dir,
+            issue_dedupe_keyword=args.issue_dedupe,
         )
         sys.exit(0 if success else 1)
     else:
@@ -1226,6 +1452,7 @@ def main():
             out_dir=args.out_dir,
             num_traces_to_analyze=args.num_traces_to_analyze,
             batch_index=args.batch_index,
+            issue_dedupe_keyword=args.issue_dedupe,
         )
 
     # Print token usage summary after analysis

@@ -49,12 +49,15 @@ class CodeAnalysis:
     Handles the complete analysis process from input to output.
     """
 
-    def __init__(self, config: AnalysisConfig):
+    def __init__(self, config: AnalysisConfig, mcp_server=None):
         """
         Initialize CodeAnalysis with configuration.
 
         Args:
             config: Analysis configuration
+            mcp_server: Optional AnalysisMCPServer instance. If provided, its internal
+                Tools instance is used instead of creating a new Tools instance.
+                This enables code-navigation tools and unified MCP dispatch.
         """
         self.config = config
         self.file_filter = config.file_filter or []
@@ -71,42 +74,49 @@ class CodeAnalysis:
         )
         self.claude = Claude(claude_config)
 
-        try:
-            output_provider = get_output_directory_provider()
-            output_base_dir = output_provider.get_custom_base_dir()
-        except RuntimeError:
-            # Fallback if singleton not configured
-            output_base_dir = None
-
-        # Get ignore directories from config and create case variants (same as main.py)
-        ignore_dirs = set()
-        if config.config and config.config.get('exclude_directories'):
-            base_dirs_to_ignore = config.config.get('exclude_directories', [])
-            for dir_name in base_dirs_to_ignore:
-                ignore_dirs.add(dir_name)
-                ignore_dirs.add(dir_name.upper())
-                ignore_dirs.add(dir_name.lower())
-
-        file_content_provider = config.file_content_provider if hasattr(config, 'file_content_provider') else None
-
-        output_provider = get_output_directory_provider()
-        artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
-
-        directory_tree_util = None
-        try:
-            # Lazy import to avoid circular dependency
-            from ...analyzers.analysis_runner import AnalysisRunner
-            directory_tree_util = AnalysisRunner().directory_tree_util
-        except Exception as e:
-            logger.warning(f"Could not get DirectoryTreeUtil from AnalysisRunner: {e}")
-            # Create a new DirectoryTreeUtil instance as fallback
+        if mcp_server is not None:
+            # Use the MCP server's internal Tools instance for backward compatibility
+            # with the tools_executor.tools.execute_tool_use() interface
+            self.tools = mcp_server.tools
+            self._mcp_server = mcp_server
+        else:
             try:
-                directory_tree_util = DirectoryTreeUtil()
-                logger.info("Created new DirectoryTreeUtil instance as fallback")
-            except Exception as e2:
-                logger.error(f"Could not create DirectoryTreeUtil instance: {e2}")
+                output_provider = get_output_directory_provider()
+                output_base_dir = output_provider.get_custom_base_dir()
+            except RuntimeError:
+                # Fallback if singleton not configured
+                output_base_dir = None
 
-        self.tools = Tools(config.repo_path, output_base_dir, file_content_provider, artifacts_dir, directory_tree_util, ignore_dirs)
+            # Get ignore directories from config and create case variants (same as main.py)
+            ignore_dirs = set()
+            if config.config and config.config.get('exclude_directories'):
+                base_dirs_to_ignore = config.config.get('exclude_directories', [])
+                for dir_name in base_dirs_to_ignore:
+                    ignore_dirs.add(dir_name)
+                    ignore_dirs.add(dir_name.upper())
+                    ignore_dirs.add(dir_name.lower())
+
+            file_content_provider = config.file_content_provider if hasattr(config, 'file_content_provider') else None
+
+            output_provider = get_output_directory_provider()
+            artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
+
+            directory_tree_util = None
+            try:
+                # Lazy import to avoid circular dependency
+                from ...analyzers.analysis_runner import AnalysisRunner
+                directory_tree_util = AnalysisRunner().directory_tree_util
+            except Exception as e:
+                logger.warning(f"Could not get DirectoryTreeUtil from AnalysisRunner: {e}")
+                # Create a new DirectoryTreeUtil instance as fallback
+                try:
+                    directory_tree_util = DirectoryTreeUtil()
+                    logger.info("Created new DirectoryTreeUtil instance as fallback")
+                except Exception as e2:
+                    logger.error(f"Could not create DirectoryTreeUtil instance: {e2}")
+
+            self.tools = Tools(config.repo_path, output_base_dir, file_content_provider, artifacts_dir, directory_tree_util, ignore_dirs)
+            self._mcp_server = None
 
         self.processed_cache_file = config.processed_cache_file
 

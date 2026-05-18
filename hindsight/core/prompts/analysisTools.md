@@ -277,4 +277,4 @@ Need to understand a function or type?
 - Want `getCode`? → Use `readFile`
 - Want file content? → Use `readFile`
 - Want directory listing? → Use `list_files`
-- Want `getDirectoryListing`? → Use `list_files` instead
+- Want to list directory contents? → Use `list_files`

@@ -158,7 +158,7 @@ Every code snippet you include in the output **MUST carry the original source-fi
 - These are the line numbers as they appear in the actual file on disk.
 - Never use relative or zero-based line numbers.
 - Never estimate or approximate line numbers.
-- If a tool does not return line numbers, call `getDirectoryListing` then use `readFile` with a tool that does expose line numbers. If still unavailable, note `"line_numbers_unavailable": true` on that snippet and do not fabricate numbers.
+- If a tool does not return line numbers, call `checkFileSize` then use `getFileContentByLines` which exposes line numbers. If still unavailable, note `"line_numbers_unavailable": true` on that snippet and do not fabricate numbers.
 
 ---
 

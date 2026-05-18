@@ -25,6 +25,7 @@ from ..ast_index import RepoAstIndex
 from ...utils.config_util import load_config_tolerant
 from ...utils.file_util import read_json_file
 from ...utils.log_util import get_logger
+from .hot_spot_util import HotSpotUtil
 
 # Add the project root to Python path for imports
 project_root = Path(__file__).parent.parent
@@ -199,69 +200,61 @@ class TraceAnalysisPromptBuilder:
 
     def _process_callstack_format(self):
         """
-        Process the new callstack format file and convert to processed JSON format.
+        Process the hotspot JSON tree file and convert to processed JSON format.
+        Uses HotSpotUtil to flatten the nested callstack tree into individual entries.
         Supports batching based on num_traces_to_analyze and batch_index.
         """
         try:
-            # Parse the callstack file into individual traces
-            all_traces = self._parse_callstack_file(self.hotspot_file)
-            
-            if not all_traces:
-                self.logger.error("No traces found in callstack file")
+            # Use HotSpotUtil to flatten the JSON tree into individual callstack groups
+            filter_processes = self.config.get("filter_processes") if self.config else None
+            HotSpotUtil.process(
+                _input=self.hotspot_file,
+                _output=self.processed_hotspot_file,
+                filter_processes=filter_processes
+            )
+
+            # Also generate a human-readable text file next to the input JSON
+            text_output = self.hotspot_file.parent / (self.hotspot_file.stem + "_callstacks.txt")
+            HotSpotUtil.process_to_text(
+                _input=self.hotspot_file,
+                _output=text_output,
+                libraries_of_interest=filter_processes
+            )
+            self.logger.info(f"Generated text callstacks file: {text_output}")
+
+            # Verify output was created
+            if not self.processed_hotspot_file.exists():
+                self.logger.error("HotSpotUtil failed to produce processed hotspot file")
                 return False
-            
-            self.logger.info(f"Parsed {len(all_traces)} traces from callstack file")
-            
+
+            # Load the processed data to apply batching
+            processed_data = read_json_file(str(self.processed_hotspot_file))
+            if not processed_data:
+                self.logger.error("No traces found in hotspot file after processing")
+                return False
+
+            self.logger.info(f"HotSpotUtil produced {len(processed_data)} callstack groups")
+
             # Apply batching if num_traces_to_analyze is set
             if hasattr(self, 'num_traces_to_analyze') and self.num_traces_to_analyze:
                 num_traces = self.num_traces_to_analyze
                 batch_index = getattr(self, 'batch_index', 0)
-                
-                # Calculate batch boundaries
+
                 start_idx = batch_index * num_traces
                 end_idx = start_idx + num_traces
-                
-                # Check if batch is out of range
-                if start_idx >= len(all_traces):
-                    self.logger.warning(f"Batch {batch_index} is out of range. Total traces available: {len(all_traces)}, requested start: {start_idx}")
+
+                if start_idx >= len(processed_data):
+                    self.logger.warning(f"Batch {batch_index} is out of range. Total traces available: {len(processed_data)}, requested start: {start_idx}")
                     self.logger.info(f"Using all available traces instead of batch {batch_index}")
-                    selected_traces = all_traces
                 else:
-                    # Select the requested batch
-                    selected_traces = all_traces[start_idx:end_idx]
-                    self.logger.info(f"Selected batch {batch_index}: traces {start_idx}-{min(end_idx-1, len(all_traces)-1)} ({len(selected_traces)} traces)")
-            else:
-                selected_traces = all_traces
-                self.logger.info(f"Processing all {len(selected_traces)} traces")
-            
-            # Convert to the expected processed format (list of callstack groups)
-            processed_data = []
-            for trace in selected_traces:
-                # Each trace becomes a callstack group
-                callstack_group = []
-                for frame in trace:
-                    # Convert frame to expected format
-                    entry = {
-                        "path": frame.get('function_name', ''),
-                        "ownerName": frame.get('library_name', ''),
-                        "sourcePath": frame.get('source_file', ''),
-                        "cost": int(float(frame.get('raw_cost', 0))),
-                        "normalizedCost": float(frame.get('percentage', 0))
-                    }
-                    callstack_group.append(entry)
-                
-                if callstack_group:
-                    processed_data.append(callstack_group)
-            
-            # Save processed data to JSON file
-            with open(self.processed_hotspot_file, 'w', encoding='utf-8') as f:
-                json.dump(processed_data, f, indent=2)
-            
-            self.logger.info(f"Processed callstack data saved to: {self.processed_hotspot_file}")
-            self.logger.info(f"Generated {len(processed_data)} callstack groups")
-            
+                    selected = processed_data[start_idx:end_idx]
+                    self.logger.info(f"Selected batch {batch_index}: traces {start_idx}-{min(end_idx-1, len(processed_data)-1)} ({len(selected)} traces)")
+                    # Rewrite with only the selected batch
+                    with open(self.processed_hotspot_file, 'w', encoding='utf-8') as f:
+                        json.dump(selected, f, indent=2)
+
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Error processing callstack format: {e}")
             return False
@@ -928,10 +921,7 @@ class TraceAnalysisPromptBuilder:
             else:
                 context += "\nNo relevant files found for content lookup.\n"
 
-            log_message = f"Created context for callstack with {len(callstack_lines)} function calls, {len(relevant_function_contexts)} function contexts, and {len(relevant_files)} files"
-            if prompt_filename:
-                log_message += f" -> {prompt_filename}"
-            self.logger.info(log_message)
+            self.logger.info(f"Created context for callstack with {len(callstack_lines)} function calls, {len(relevant_function_contexts)} function contexts, and {len(relevant_files)} files")
 
             # Get callstack data for embedding
             callstack_data = self.get_callstack_data_for_embedding(callstack)

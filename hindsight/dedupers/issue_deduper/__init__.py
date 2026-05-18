@@ -18,6 +18,7 @@ Usage:
     # Initialize with artifacts directory
     deduper = IssueDeduper(
         artifacts_dir="~/llm_artifacts/corelocation",
+        analyzer_type="code_analysis",
         threshold=0.85
     )
     
@@ -31,7 +32,7 @@ Usage:
     deduper.cleanup()
 
 Or using context manager:
-    with IssueDeduper(artifacts_dir="~/llm_artifacts/corelocation") as deduper:
+    with IssueDeduper(artifacts_dir="~/llm_artifacts/corelocation", analyzer_type="code_analysis") as deduper:
         unique_issues = deduper.dedupe(issues)
 
 Or using convenience function:
@@ -39,7 +40,8 @@ Or using convenience function:
     
     unique_issues = dedupe_issues(
         issues=issues,
-        artifacts_dir="~/llm_artifacts/corelocation"
+        artifacts_dir="~/llm_artifacts/corelocation",
+        analyzer_type="code_analysis"
     )
 """
 

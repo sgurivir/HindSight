@@ -183,7 +183,7 @@ class Claude:
         logger.info(f"Initialized Claude client with model: {config.model}")
 
     @classmethod
-    def setup_prompts_logging(cls) -> None:
+    def setup_prompts_logging(cls, analyzer_type: str) -> None:
         """
         Setup conversation logging directory.
         Uses the OutputDirectoryProvider singleton for directory configuration.
@@ -193,7 +193,7 @@ class Claude:
         artifacts_dir = output_provider.get_repo_artifacts_dir()
         final_output_dir = artifacts_dir
 
-        new_prompts_dir = os.path.join(final_output_dir, "prompts_sent")
+        new_prompts_dir = os.path.join(final_output_dir, "prompts_sent", analyzer_type)
 
         # Create errors directory under results/
         results_dir = os.path.join(final_output_dir, "results")

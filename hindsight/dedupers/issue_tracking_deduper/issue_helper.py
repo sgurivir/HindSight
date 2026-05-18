@@ -39,19 +39,20 @@ try:
         from radarclient import AuthenticationStrategyAppleConnect
     except ImportError:
         from radarclient import AuthenticationStrategySPNego as AuthenticationStrategyAppleConnect
+    _RADARCLIENT_AVAILABLE = True
 except ImportError:
-    print("radarclient not installed.")
-    print("Install with: python3 -m pip install --user -i https://pypi.apple.com/simple radarclient")
-    raise
+    _RADARCLIENT_AVAILABLE = False
 
 
 def get_current_user() -> Optional[str]:
     """
     Get the currently logged in AppleConnect username.
-    
+
     Returns:
         Username string or None if not detected
     """
+    if not _RADARCLIENT_AVAILABLE:
+        return None
     try:
         accounts = AppleDirectoryQuery.logged_in_appleconnect_accounts()
         if accounts:
@@ -143,11 +144,19 @@ class IssueDownloader:
     def __init__(self, output_dir: str = None, client_name: str = 'IssueDownloader'):
         """
         Initialize the IssueDownloader.
-        
+
         Args:
             output_dir: Directory to save markdown files (default: ~/issues_on_file/)
             client_name: Name to identify this client to the Radar API
+
+        Raises:
+            ImportError: If radarclient is not installed.
         """
+        if not _RADARCLIENT_AVAILABLE:
+            raise ImportError(
+                "radarclient is not installed. "
+                "Install with: python3 -m pip install --user -i https://pypi.apple.com/simple radarclient"
+            )
         system_identifier = ClientSystemIdentifier(client_name, '1.0')
         self.client = RadarClient(AuthenticationStrategyAppleConnect(), system_identifier)
         

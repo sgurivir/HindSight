@@ -514,15 +514,16 @@ class TestClaudePromptsLogging:
     def test_setup_prompts_logging(self, mock_output_provider, temp_output_dir):
         """Test setting up prompts logging directory."""
         with patch('hindsight.core.llm.llm.get_output_directory_provider', return_value=mock_output_provider):
-            Claude.setup_prompts_logging()
-            
+            Claude.setup_prompts_logging("code_analysis")
+
             assert Claude._prompts_dir is not None
+            assert Claude._prompts_dir.endswith("prompts_sent/code_analysis")
             assert os.path.exists(Claude._prompts_dir)
 
     def test_clear_older_prompts(self, mock_output_provider, temp_output_dir):
         """Test clearing older prompts."""
         with patch('hindsight.core.llm.llm.get_output_directory_provider', return_value=mock_output_provider):
-            Claude.setup_prompts_logging()
+            Claude.setup_prompts_logging("code_analysis")
             
             # Create a test file in prompts directory
             test_file = os.path.join(Claude._prompts_dir, "test.txt")

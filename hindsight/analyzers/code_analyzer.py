@@ -53,10 +53,12 @@ python -m hindsight.analyzers.code_analyzer --config config.json --repo /path/to
 """
 
 import argparse
+import asyncio
 import json
 import os
 import sys
 import tempfile
+import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -75,10 +77,14 @@ from ..core.constants import (DEFAULT_LOGS_DIR, DEFAULT_MAX_TOKENS,
                               DEFAULT_NUM_FUNCTIONS_TO_ANALYZE,
                               MERGED_DEFINED_CLASSES_FILE,
                               MERGED_SYMBOLS_FILE, NESTED_CALL_GRAPH_FILE,
-                              PROCESSED_OUTPUT_DIR, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT)
+                              PROCESSED_OUTPUT_DIR, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT,
+                              CODE_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT,
+                              LLM_PROVIDER_RATE_WINDOW_SECONDS)
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
 from ..core.lang_util.filter_by_file_util import FilterByFileUtil
 from ..core.ast_index import RepoAstIndex
+from ..core.async_infra import RateLimiter, run_worker_pool
+from ..core.mcp_tools.analysis_server import AnalysisMCPServer
 from hindsight.utils.log_util import LogUtil, get_logger, setup_default_logging
 from ..core.llm.code_analysis import AnalysisConfig, CodeAnalysis
 from ..core.llm.llm import Claude
@@ -156,8 +162,15 @@ class CodeAnalyzer(LLMBasedAnalyzer):
             self.logger.warning(f"AST validation failed: {e}")
             # Don't fail initialization - let individual property access handle missing files
 
-    def analyze_function(self, func_record: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-        """Analyze a single function record using LLM."""
+    def analyze_function(self, func_record: Mapping[str, Any], mcp_server=None) -> Optional[Mapping[str, Any]]:
+        """Analyze a single function record using LLM.
+
+        Args:
+            func_record: Function data record to analyze.
+            mcp_server: Optional AnalysisMCPServer instance. When provided, it is
+                passed to CodeAnalysis so that code-navigation tools are available
+                and the MCP dispatch layer is used for tool execution.
+        """
         if not self._initialized:
             raise RuntimeError("Analyzer not initialized. Call initialize() first.")
 
@@ -188,7 +201,8 @@ class CodeAnalyzer(LLMBasedAnalyzer):
                 )
 
                 # Create CodeAnalysis instance with pre-loaded data
-                code_analysis = CodeAnalysis(analysis_config)
+                # Pass the MCP server if available for unified tool dispatch
+                code_analysis = CodeAnalysis(analysis_config, mcp_server=mcp_server)
 
                 # Override the AST index with our cached instance to avoid reloading
                 code_analysis.ast_index = self.ast_index
@@ -793,7 +807,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         # repo_path = config['path_to_repo']  # Unused variable
 
         # Ensure analysis_input directory exists
-        self.processed_output_dir = os.path.join(os.path.dirname(ast_call_graph_dir), PROCESSED_OUTPUT_DIR)
+        self.processed_output_dir = os.path.join(os.path.dirname(ast_call_graph_dir), PROCESSED_OUTPUT_DIR, "code_analysis")
         os.makedirs(self.processed_output_dir, exist_ok=True)
 
         # Validate call graph file exists
@@ -1188,23 +1202,65 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             self.logger.info("Skipping code analysis due to missing API key")
             return 0, 0
 
+        # --- Create AnalysisMCPServer for unified tool dispatch ---
+        # This provides the MCP layer with optional code-navigation tools
+        # (call-graph tools will be used by prompts in Phase 4)
+        try:
+            output_provider = get_output_directory_provider()
+            mcp_output_base_dir = output_provider.get_custom_base_dir()
+        except RuntimeError:
+            mcp_output_base_dir = None
+
+        mcp_ignore_dirs = set()
+        if config.get('exclude_directories'):
+            for dir_name in config.get('exclude_directories', []):
+                mcp_ignore_dirs.add(dir_name)
+                mcp_ignore_dirs.add(dir_name.upper())
+                mcp_ignore_dirs.add(dir_name.lower())
+
+        mcp_file_content_provider = self.get_file_content_provider() if hasattr(self, 'get_file_content_provider') else None
+
+        mcp_artifacts_dir = None
+        try:
+            output_provider = get_output_directory_provider()
+            mcp_artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
+        except RuntimeError:
+            pass
+
+        mcp_directory_tree_util = getattr(self, 'directory_tree_util', None)
+
+        # Pass call graph data to enable code-navigation tools (when available)
+        mcp_call_graph_data = getattr(self, 'call_graph_data', None)
+
+        mcp_server = AnalysisMCPServer(
+            repo_path=repo_path,
+            file_content_provider=mcp_file_content_provider,
+            artifacts_dir=mcp_artifacts_dir,
+            directory_tree_util=mcp_directory_tree_util,
+            ignore_dirs=mcp_ignore_dirs,
+            call_graph_data=mcp_call_graph_data,
+        )
+
+        # --- Determine worker count ---
+        max_workers = config.get('code_analyzer_workers', CODE_ANALYZER_DEFAULT_WORKERS)
+        rate_limit = config.get('code_analyzer_rate_limit', LLM_PROVIDER_RATE_LIMIT)
+        rate_window = config.get('code_analyzer_rate_window_seconds', LLM_PROVIDER_RATE_WINDOW_SECONDS)
+        self.logger.info(f"Parallel analysis: max_workers={max_workers}, rate_limit={rate_limit} per {rate_window}s")
+
+        # --- Thread-safe counters and publisher lock ---
+        _publisher_lock = threading.Lock()
+        _counters_lock = threading.Lock()
         successful_analyses = 0
         failed_analyses = 0
 
-        # Process each filtered function (already sorted by length, longest first)
-        for i, func_data in enumerate(filtered_functions, 1):
-            # Check for cancellation every N functions
-            if i > 1 and (i - 1) % self._cancellation_check_interval == 0:
-                if not self._should_continue():
-                    self.logger.info(f"Analysis cancelled at function {i}/{total_functions}")
-                    self.logger.info(f"Processed {successful_analyses} successfully, {failed_analyses} failed before cancellation")
-                    return successful_analyses, failed_analyses
-            
-            # Start issue-specific prompt logging for this function
-            # This creates a numbered subdirectory (e.g., prompts_sent/1/, prompts_sent/2/)
-            # to prevent prompts from being overwritten when analyzing multiple functions
-            Claude.start_issue_logging(i)
-            
+        # --- Define the per-function analysis work ---
+        def _process_single_function(func_data: Dict, index: int) -> bool:
+            """Process a single function entry: cache check, analysis, publish.
+
+            Returns True on success, False on failure.
+            """
+            nonlocal successful_analyses, failed_analyses
+
             func_entry = func_data['func_entry']
             function_length = func_data['length']
 
@@ -1220,7 +1276,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
 
             # Check if already processed using publisher with concurrent lookup across all prior result stores
             if self.results_publisher:
-                self.logger.debug(f"[{i}/{total_functions}] Checking cache for function='{function_name}', file='{primary_file}', checksum='{function_checksum}'")
+                self.logger.debug(f"[{index}/{total_functions}] Checking cache for function='{function_name}', file='{primary_file}', checksum='{function_checksum}'")
 
                 existing_result = self.results_publisher.check_existing_result(
                     primary_file,
@@ -1229,9 +1285,9 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 )
 
                 if existing_result:
-                    self.logger.info(f"[{i}/{total_functions}] ⏭️  ANALYSIS SKIPPED - Same checksum found for {function_name}")
-                    self.logger.info(f"[{i}/{total_functions}] 🔍 Function: {function_name} | File: {primary_file} | Checksum: {function_checksum}")
-                    self.logger.info(f"[{i}/{total_functions}] ✅ Content unchanged ({function_length} lines) - reusing existing analysis result")
+                    self.logger.info(f"[{index}/{total_functions}] ANALYSIS SKIPPED - Same checksum found for {function_name}")
+                    self.logger.info(f"[{index}/{total_functions}] Function: {function_name} | File: {primary_file} | Checksum: {function_checksum}")
+                    self.logger.info(f"[{index}/{total_functions}] Content unchanged ({function_length} lines) - reusing existing analysis result")
 
                     # Republish the existing result to the current analysis session
                     repo_name = os.path.basename(repo_path.rstrip('/'))
@@ -1248,53 +1304,51 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                             # Validate the normalized result
                             validation_errors = normalized_result.validate()
                             if validation_errors:
-                                self.logger.warning(f"[{i}/{total_functions}] ⚠️  Existing result validation failed: {validation_errors}")
-                                existing_results = []
+                                self.logger.warning(f"[{index}/{total_functions}] Existing result validation failed: {validation_errors}")
+                                existing_results_list = []
                             else:
-                                existing_results = [issue.to_dict() for issue in normalized_result.results]
+                                existing_results_list = [issue.to_dict() for issue in normalized_result.results]
 
                             # Apply Level 1 (Category) filtering to cached results
-                            # This ensures cached results from before the filter was implemented are properly filtered
-                            if self.unified_issue_filter and existing_results:
-                                original_count = len(existing_results)
-                                # Only apply Level 1 (Category) filtering to cached results
-                                # Skip Level 2 and Level 3 (LLM-based) to avoid extra API calls for cached data
-                                existing_results = self.unified_issue_filter.category_filter.filter_issues(existing_results)
-                                if len(existing_results) != original_count:
-                                    dropped_count = original_count - len(existing_results)
-                                    self.logger.info(f"[{i}/{total_functions}] 🔍 Applied Level 1 category filter to cached results: dropped {dropped_count} issues, keeping {len(existing_results)}")
+                            if self.unified_issue_filter and existing_results_list:
+                                original_count = len(existing_results_list)
+                                existing_results_list = self.unified_issue_filter.category_filter.filter_issues(existing_results_list)
+                                if len(existing_results_list) != original_count:
+                                    dropped_count = original_count - len(existing_results_list)
+                                    self.logger.info(f"[{index}/{total_functions}] Applied Level 1 category filter to cached results: dropped {dropped_count} issues, keeping {len(existing_results_list)}")
 
                             # Republish the existing result to the current analysis
-                            self.results_publisher.add_result(
-                                repo_name=repo_name,
-                                file_path=primary_file,
-                                function=function_name,
-                                function_checksum=function_checksum,
-                                results=existing_results
-                            )
-                            self.logger.info(f"[{i}/{total_functions}] 📤 Republished existing result with {len(existing_results)} issues to current analysis")
+                            with _publisher_lock:
+                                self.results_publisher.add_result(
+                                    repo_name=repo_name,
+                                    file_path=primary_file,
+                                    function=function_name,
+                                    function_checksum=function_checksum,
+                                    results=existing_results_list
+                                )
+                            self.logger.info(f"[{index}/{total_functions}] Republished existing result with {len(existing_results_list)} issues to current analysis")
 
                         except Exception as e:
-                            self.logger.warning(f"[{i}/{total_functions}] ⚠️  Failed to normalize existing result: {e}, skipping republish")
+                            self.logger.warning(f"[{index}/{total_functions}] Failed to normalize existing result: {e}, skipping republish")
 
-                    successful_analyses += 1
-                    continue
+                    with _counters_lock:
+                        successful_analyses += 1
+                    return True
                 else:
-                    self.logger.debug(f"[{i}/{total_functions}] NO existing result found for {function_name} - will analyze")
+                    self.logger.debug(f"[{index}/{total_functions}] NO existing result found for {function_name} - will analyze")
             else:
-                self.logger.debug(f"[{i}/{total_functions}] No results publisher available - will analyze {function_name}")
+                self.logger.debug(f"[{index}/{total_functions}] No results publisher available - will analyze {function_name}")
 
             # Generate temporary function file on-demand
             temp_file_path = self._generate_temp_function_file(func_entry, repo_path)
             if not temp_file_path:
-                self.logger.warning(f"[{i}/{total_functions}] Failed to generate temp file for {function_name}")
-                failed_analyses += 1
-                continue
+                self.logger.warning(f"[{index}/{total_functions}] Failed to generate temp file for {function_name}")
+                with _counters_lock:
+                    failed_analyses += 1
+                return False
 
             try:
-                progress_msg = f"[{i}/{total_functions}]"
-                self.logger.info("")
-                self.logger.info("")
+                progress_msg = f"[{index}/{total_functions}]"
                 self.logger.info("")
                 self.logger.info("=" * 80)
                 self.logger.info(f"{progress_msg} Analyzing: {function_name} ({function_length} lines)")
@@ -1307,41 +1361,37 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 with open(temp_file_path, 'r', encoding='utf-8') as f:
                     json_data = json.load(f)
 
-                # Use analyzer to analyze the function
-                result = analyzer.analyze_function(json_data)
+                # Use analyzer to analyze the function with MCP server
+                result = analyzer.analyze_function(json_data, mcp_server=mcp_server)
 
+                success = False
                 if result is not None:
                     # Use centralized schema to create standardized result
                     try:
-
                         # Normalize the result to ensure it's in the correct format
                         if isinstance(result, list):
-                            # Filter out any invalid items and ensure all items have required fields
                             valid_issues = []
                             for item in result:
                                 if isinstance(item, dict):
-                                    # Ensure required fields exist with defaults
                                     if 'issue' not in item:
                                         item['issue'] = item.get('description', 'No description provided')
                                     if 'severity' not in item:
-                                        item['severity'] = 'medium'  # Default severity
+                                        item['severity'] = 'medium'
                                     if 'category' not in item:
-                                        item['category'] = 'general'  # Default category
+                                        item['category'] = 'general'
                                     valid_issues.append(item)
                                 else:
                                     self.logger.warning(f"Skipping invalid result item: {type(item)} - {item}")
                             issues_list = valid_issues
                         elif isinstance(result, dict):
-                            # Single result - ensure required fields exist
                             if 'issue' not in result:
                                 result['issue'] = result.get('description', 'No description provided')
                             if 'severity' not in result:
-                                result['severity'] = 'medium'  # Default severity
+                                result['severity'] = 'medium'
                             if 'category' not in result:
-                                result['category'] = 'general'  # Default category
+                                result['category'] = 'general'
                             issues_list = [result]
                         else:
-                            # Unexpected format - create a generic issue
                             self.logger.warning(f"Unexpected result format: {type(result)} - {result}")
                             issues_list = [{
                                 'issue': f'Analysis completed with unexpected result format: {str(result)}',
@@ -1360,7 +1410,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                         # Validate the result
                         validation_errors = standardized_result.validate()
                         if validation_errors:
-                            self.logger.warning(f"[{i}/{total_functions}] ⚠️  Result validation failed: {validation_errors}")
+                            self.logger.warning(f"[{index}/{total_functions}] Result validation failed: {validation_errors}")
                             success = False
                         else:
                             # Convert to dict format for publisher
@@ -1369,12 +1419,10 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                             # Apply unified issue filter before publishing (only for new analysis results)
                             if self.unified_issue_filter and result_issues:
                                 self.logger.debug(f"Applying unified issue filter to {len(result_issues)} issues")
-                                
+
                                 # Get the original function context from the processed entry
-                                # The function context was stored in the temp file at line 705 in _process_function_entry
                                 function_context = None
                                 try:
-                                    # Read the function context from the temp file that was just processed
                                     with open(temp_file_path, 'r', encoding='utf-8') as f:
                                         temp_data = json.load(f)
                                     function_context = temp_data.get('code', '')
@@ -1385,13 +1433,13 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                                 except Exception as e:
                                     self.logger.warning(f"Failed to retrieve function context for Level 3 filtering: {e}")
                                     function_context = None
-                                
+
                                 filtered_issues = self.unified_issue_filter.filter_issues(result_issues, function_context)
-                                
+
                                 if len(filtered_issues) != len(result_issues):
                                     dropped_count = len(result_issues) - len(filtered_issues)
                                     self.logger.info(f"Unified issue filter: dropped {dropped_count} issues, keeping {len(filtered_issues)} issues")
-                                
+
                                 result_issues = filtered_issues
                             elif not self.unified_issue_filter:
                                 self.logger.debug("Unified issue filter not available - publishing all issues")
@@ -1399,35 +1447,29 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                             # Publish result using publisher-subscriber system
                             repo_name = os.path.basename(repo_path.rstrip('/'))
                             if self.results_publisher:
-                                self.results_publisher.add_result(
-                                    repo_name=repo_name,
-                                    file_path=primary_file,
-                                    function=function_name,
-                                    function_checksum=function_checksum,
-                                    results=result_issues
-                                )
+                                with _publisher_lock:
+                                    self.results_publisher.add_result(
+                                        repo_name=repo_name,
+                                        file_path=primary_file,
+                                        function=function_name,
+                                        function_checksum=function_checksum,
+                                        results=result_issues
+                                    )
                                 success = True
                             else:
-                                # Publisher not initialized - this is an error condition
                                 self.logger.error("Publisher not available - cannot save analysis results")
                                 success = False
 
                     except Exception as e:
-                        self.logger.error(f"[{i}/{total_functions}] ✗ Failed to create standardized result: {e}")
+                        self.logger.error(f"[{index}/{total_functions}] Failed to create standardized result: {e}")
                         self.logger.error(f"Result type: {type(result)}, Result: {result}")
                         success = False
 
                     # Use centralized token tracking
-                    # Get real token counts from the analyzer's last analysis instance
                     if hasattr(analyzer, '_last_analysis') and analyzer._last_analysis:
-                        input_tokens, output_tokens = self.token_tracker.record_tokens_from_analysis(analyzer._last_analysis)
-                    else:
-                        # Fallback: no tokens recorded for failed analysis
-                        input_tokens, output_tokens = 0, 0
+                        self.token_tracker.record_tokens_from_analysis(analyzer._last_analysis)
                 else:
-                    # Only consider it a failure if result is None (no response or malformed response)
                     success = False
-                    input_tokens, output_tokens = 0, 0
 
                 # Record function analysis result
                 self._record_function_analysis_result(
@@ -1437,19 +1479,24 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 )
 
                 if success:
-                    successful_analyses += 1
-                    # Check if result is empty array and log accordingly
+                    with _counters_lock:
+                        successful_analyses += 1
                     if isinstance(result, list) and len(result) == 0:
-                        self.logger.info(f"{progress_msg} ✓ Successfully analyzed: {function_name} ({function_length} lines) - No issues found")
+                        self.logger.info(f"{progress_msg} Successfully analyzed: {function_name} ({function_length} lines) - No issues found")
                     else:
-                        self.logger.info(f"{progress_msg} ✓ Successfully analyzed: {function_name} ({function_length} lines)")
+                        self.logger.info(f"{progress_msg} Successfully analyzed: {function_name} ({function_length} lines)")
                 else:
-                    failed_analyses += 1
-                    self.logger.error(f"{progress_msg} ✗ Failed to analyze: {function_name} ({function_length} lines) - No response or malformed response received")
+                    with _counters_lock:
+                        failed_analyses += 1
+                    self.logger.error(f"{progress_msg} Failed to analyze: {function_name} ({function_length} lines) - No response or malformed response received")
+
+                return success
 
             except Exception as e:
-                failed_analyses += 1
-                self.logger.error(f"{progress_msg} ✗ Error analyzing {function_name}: {e}")
+                with _counters_lock:
+                    failed_analyses += 1
+                self.logger.error(f"[{index}/{total_functions}] Error analyzing {function_name}: {e}")
+                return False
 
             finally:
                 # Clean up temporary INPUT file only (not the analysis result file)
@@ -1460,11 +1507,46 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                     except OSError as e:
                         self.logger.warning(f"Failed to cleanup temp input file {temp_file_path}: {e}")
 
-                # NOTE: Analysis result files in code_analysis_dir are preserved for caching
-                # They allow skipping re-analysis when the program runs again on the same repository
-                
-                # End issue-specific prompt logging for this function
-                Claude.end_issue_logging()
+        # --- Execute analysis via async worker pool with rate limiting ---
+        self.logger.info(f"Starting parallel analysis with {max_workers} workers for {total_functions} functions")
+        rate_limiter = RateLimiter(max_requests=rate_limit, window_seconds=rate_window)
+
+        # Build indexed items for the worker pool: (index, func_data)
+        indexed_items = list(enumerate(filtered_functions, 1))
+
+        async def _async_analyze_function(item):
+            """Async worker function that wraps the synchronous per-function analysis."""
+            index, func_data = item
+
+            # Check for cancellation
+            if not self._should_continue():
+                return False
+
+            # Run the synchronous analysis in a thread executor to avoid blocking
+            # the event loop (the LLM calls and file I/O are blocking)
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, _process_single_function, func_data, index
+            )
+
+        def _on_error(item, exc):
+            """Handle worker errors gracefully."""
+            index, func_data = item
+            func_name = func_data['func_entry'].get('function', 'unknown')
+            self.logger.error(f"[{index}/{total_functions}] Worker error for {func_name}: {exc}")
+            with _counters_lock:
+                nonlocal failed_analyses
+                failed_analyses += 1
+
+        asyncio.run(
+            run_worker_pool(
+                items=indexed_items,
+                worker_fn=_async_analyze_function,
+                max_workers=max_workers,
+                rate_limiter=rate_limiter,
+                on_error=_on_error,
+            )
+        )
 
         # Finalize analyzer
         try:
@@ -1777,6 +1859,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                     # Initialize deduper with artifacts directory
                     deduper = IssueDeduper(
                         artifacts_dir=artifacts_dir,
+                        analyzer_type="code_analysis",
                         threshold=config.get('dedupe_threshold', 0.85)
                     )
                     
@@ -1798,6 +1881,15 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                     
                 except Exception as e:
                     self.logger.warning(f"Issue deduplication failed, continuing with all issues: {e}")
+
+            # Radar issue deduplication (optional, triggered by --issue-dedupe)
+            issue_dedupe_keyword = config.get('issue_dedupe_keyword')
+            if issue_dedupe_keyword and all_issues:
+                try:
+                    self.logger.info(f"Running radar deduplication with keyword: '{issue_dedupe_keyword}'")
+                    all_issues = self._run_radar_deduplication(all_issues, issue_dedupe_keyword)
+                except Exception as e:
+                    self.logger.warning(f"Radar deduplication failed, continuing without it: {e}")
 
             # ── FP CSV Filter (Pass 1 + Pass 2) ───────────────────────────────
             # Runs after dedup so the semantic search operates on a smaller,
@@ -1953,6 +2045,121 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             self.logger.error(f"Error generating report: {e}")
             self.logger.error(f"Full traceback: {traceback.format_exc()}")
             return False, None
+
+    def _run_radar_deduplication(self, all_issues: list, keyword: str) -> list:
+        """
+        Run radar issue deduplication: download radars by keyword, ingest, and match.
+
+        Annotates each issue dict with a 'radar_matches' key containing match data.
+        Returns the same list of issues (possibly annotated). If anything fails,
+        raises an exception that the caller should catch.
+        """
+        import hashlib
+        from pathlib import Path
+
+        output_provider = get_output_directory_provider()
+        artifacts_dir = output_provider.get_repo_artifacts_dir()
+
+        safe_keyword = keyword.replace(' ', '_').replace('/', '_')
+        radar_dupes_dir = os.path.join(artifacts_dir, 'radar_dupes', safe_keyword)
+        issue_download_dir = os.path.join(radar_dupes_dir, 'issues')
+        vector_db_dir = os.path.join(radar_dupes_dir, 'vector_db')
+        os.makedirs(issue_download_dir, exist_ok=True)
+        os.makedirs(vector_db_dir, exist_ok=True)
+
+        self.logger.info(f"Radar dupes directory: {radar_dupes_dir}")
+
+        # Step 1: Download radars
+        from hindsight.dedupers.issue_tracking_deduper.issue_helper import IssueDownloader
+        downloader = IssueDownloader(
+            output_dir=str(issue_download_dir),
+            client_name='CodeAnalyzerRadarDedupe'
+        )
+        downloaded = downloader.download_issues_by_keyword(
+            keyword=keyword,
+            rate_limit_delay=0.1
+        )
+        self.logger.info(f"Downloaded {len(downloaded)} new radars (keyword: '{keyword}')")
+
+        # Step 2: Ingest into vector DB
+        from hindsight.dedupers.issue_tracking_deduper.issue_tracking_deduper.vector_db.ingestion import IssueIngester
+        ingester = IssueIngester(db_path=str(vector_db_dir))
+        total, added, skipped = ingester.ingest_directory(
+            Path(issue_download_dir),
+            recursive=True,
+            show_progress=False
+        )
+        self.logger.info(f"Ingestion: {total} files processed, {added} added, {skipped} skipped")
+        ingester.close()
+
+        # Step 3: Match issues
+        from hindsight.dedupers.issue_tracking_deduper.issue_tracking_deduper.vector_db.store import VectorStore
+        from hindsight.dedupers.issue_tracking_deduper.issue_tracking_deduper.vector_db.embeddings import EmbeddingGenerator
+        from hindsight.dedupers.issue_tracking_deduper.issue_tracking_deduper.deduper.hybrid_matcher import HybridMatcher
+        from hindsight.dedupers.issue_tracking_deduper.issue_tracking_deduper.deduper.issue import Issue
+
+        vector_store = VectorStore(db_path=str(vector_db_dir))
+        if vector_store.count() == 0:
+            self.logger.warning("Vector DB is empty after ingestion, skipping radar matching")
+            vector_store.close()
+            return all_issues
+
+        embedding_generator = EmbeddingGenerator()
+        matcher = HybridMatcher(
+            vector_store=vector_store,
+            embedding_generator=embedding_generator,
+        )
+
+        issues_with_matches = 0
+        total_matches = 0
+
+        for idx, issue_dict in enumerate(all_issues):
+            key_parts = [
+                issue_dict.get('issue', ''),
+                issue_dict.get('file_path', ''),
+                issue_dict.get('function_name', ''),
+                str(issue_dict.get('lines', ''))
+            ]
+            issue_id = f"code_{idx}_{hashlib.md5('|'.join(key_parts).encode()).hexdigest()[:8]}"
+
+            deduper_issue = Issue(
+                id=issue_id,
+                title=issue_dict.get('issue', ''),
+                description=issue_dict.get('description', issue_dict.get('issue', '')),
+                file_path=issue_dict.get('file_path'),
+                function_name=issue_dict.get('function_name'),
+                severity=issue_dict.get('severity'),
+                category=issue_dict.get('category'),
+            )
+
+            matches = matcher.find_matches(deduper_issue)
+
+            if matches:
+                issues_with_matches += 1
+                total_matches += len(matches)
+                issue_dict['radar_matches'] = [
+                    {
+                        'issueId': m.issue_id,
+                        'issueUrl': m.issue_url,
+                        'issueTitle': m.issue_title,
+                        'hybridScore': m.hybrid_percentage,
+                        'confidenceLevel': m.confidence_level,
+                        'filePathScore': m.file_path_percentage,
+                        'functionNameScore': m.function_name_percentage,
+                        'cosineScore': m.cosine_similarity_percentage,
+                        'matchReasons': m.match_reasons,
+                    }
+                    for m in matches
+                ]
+
+        vector_store.close()
+
+        self.logger.info(
+            f"Radar deduplication complete: {issues_with_matches}/{len(all_issues)} issues "
+            f"matched, {total_matches} total matches"
+        )
+
+        return all_issues
 
     def _collect_dropped_issues(self) -> List[Dict[str, Any]]:
         """
@@ -2608,14 +2815,14 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 self.logger.info(f"Logs will be saved to: {logs_dir}")
 
             # Setup prompt logging - use the output base directory
-            Claude.setup_prompts_logging()
+            Claude.setup_prompts_logging("code_analysis")
             
             # Clear older prompts at the beginning of analysis
             Claude.clear_older_prompts()
 
             # Get the actual directory used for logging from the singleton
             output_provider = get_output_directory_provider()
-            actual_prompts_dir = f"{output_provider.get_repo_artifacts_dir()}/prompts_sent"
+            actual_prompts_dir = f"{output_provider.get_repo_artifacts_dir()}/prompts_sent/code_analysis"
             self.logger.info(f"Prompt logging setup completed and older prompts cleared in: {actual_prompts_dir}")
 
             # Create FileContentProvider instance for the repository
@@ -2890,6 +3097,13 @@ EXAMPLES:
         help="Generate report from existing analysis files without running analysis. Requires --config to locate artifacts."
     )
     parser.add_argument(
+        "--issue-dedupe",
+        type=str,
+        default=None,
+        metavar="KEYWORD",
+        help="Run radar deduplication: download radars matching KEYWORD, then highlight matching issues in the HTML report"
+    )
+    parser.add_argument(
         "--false-positives-csv",
         default=None,
         metavar="CSV_PATH",
@@ -3023,6 +3237,8 @@ EXAMPLES:
                 "FP CSV Filter enabled with: %s", args.false_positives_csv
             )
 
+        config['issue_dedupe_keyword'] = args.issue_dedupe
+
         success = runner.generate_report_from_existing_issues(
             config_dict=config,
             repo_path=args.repo,
@@ -3067,6 +3283,7 @@ EXAMPLES:
     # Prepare config for report generation
     report_config = config.copy()
     report_config['path_to_repo'] = args.repo
+    report_config['issue_dedupe_keyword'] = args.issue_dedupe
     
     # Set analysis directory for report generation
     from ..utils.output_directory_provider import get_output_directory_provider

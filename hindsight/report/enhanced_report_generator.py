@@ -1165,6 +1165,79 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
                 font-size: 1.2em;
             }}
         }}
+
+        /* Radar duplicate highlight styles */
+        .issue.has-radar-match {{
+            background: #fef9c3 !important;
+            border-left: 4px solid #ca8a04 !important;
+        }}
+        .issue.has-radar-match:nth-child(even) {{
+            background: #fdf6b2 !important;
+        }}
+        .radar-dedupe-info {{
+            background: rgba(202, 138, 4, 0.1);
+            border: 1px solid rgba(202, 138, 4, 0.3);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-top: 12px;
+        }}
+        .radar-dedupe-header {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+            font-weight: 600;
+            color: #a16207;
+            font-size: 0.9375rem;
+        }}
+        .radar-match-item {{
+            background: rgba(255, 255, 255, 0.8);
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin: 6px 0;
+        }}
+        .radar-match-row {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }}
+        .radar-issue-link {{
+            font-family: 'SF Mono', Monaco, monospace;
+            font-weight: 600;
+            color: #0066cc;
+            text-decoration: underline;
+            font-size: 0.875rem;
+        }}
+        .radar-score {{
+            background: #ca8a04;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }}
+        .radar-score.high, .radar-score.very_high {{
+            background: #dc2626;
+        }}
+        .radar-score.moderate {{
+            background: #f59e0b;
+            color: #1f2937;
+        }}
+        .radar-score.low {{
+            background: #10b981;
+        }}
+        .radar-match-title {{
+            font-size: 0.875rem;
+            color: #374151;
+            font-weight: 500;
+            margin: 4px 0;
+        }}
+        .radar-match-scores {{
+            font-size: 0.75rem;
+            color: #6b7280;
+            margin-top: 4px;
+        }}
     </style>
 </head>
 <body>
@@ -1183,7 +1256,7 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
                 <h1>Trace Analysis</h1>
                 <div style="display: flex; align-items: center; font-size: 1.1em; opacity: 0.8;">
                     <span style="flex: 0 0 33.33%;">{repository_text}</span>
-                    <span style="flex: 0 0 33.33%; text-align: center;"></span>
+                    <span style="flex: 0 0 33.33%; text-align: center;"><button class="copy-btn" onclick="copyAllIssues()">Copy All</button></span>
                     <span style="flex: 0 0 33.33%; text-align: right;">{date_text}</span>
                 </div>
             </div>
@@ -1227,6 +1300,7 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
 
         // Store currently displayed issues for copy functionality
         let currentlyDisplayedIssues = [];
+        let allFilteredIssues = [];
 
         // Function to extract the smallest normalized cost (top of callstack) from an issue
         function getSmallestNormalizedCost(issue) {{
@@ -1276,7 +1350,7 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
 
             issues.forEach((issue, index) => {{
                 const issueSection = document.createElement('section');
-                issueSection.className = 'issue';
+                issueSection.className = 'issue' + (issue.radar_matches && issue.radar_matches.length > 0 ? ' has-radar-match' : '');
                 issueSection.setAttribute('data-severity', issue.kind || issue.severity);
                 issueSection.setAttribute('data-directory', getIssueDirectory(issue.file_path || issue.file));
 
@@ -1312,7 +1386,7 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
 
                     <div class="issue__meta">
                         <dl class="kv">
-                            <div><dt>Function</dt><dd><code>${{issue.function_name || issue.function || 'Unknown'}}</code>${{callstackLink}}</dd></div>
+                            <div><dt>Function</dt><dd><code>${{issue.function_name || issue.functionName || issue.function || 'Unknown'}}</code>${{callstackLink}}</dd></div>
                             <div class="line-item"><dt>Line</dt><dd>${{issue.line_number || issue.lines || issue.line || 'N/A'}}</dd></div>
                         </dl>
                     </div>
@@ -1338,6 +1412,29 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
                             <summary>Evidence</summary>
                             <p>${{issue.evidence}}</p>
                         </details>
+                        ` : ''}}
+
+                        ${{issue.radar_matches && issue.radar_matches.length > 0 ? `
+                        <div class="radar-dedupe-info">
+                            <div class="radar-dedupe-header">
+                                <span>${{issue.radar_matches.some(m => m.confidenceLevel === 'high' || m.confidenceLevel === 'very_high') ? '🔴' : '🟡'}}</span>
+                                <span>${{issue.radar_matches.some(m => m.confidenceLevel === 'high' || m.confidenceLevel === 'very_high') ? 'Likely Duplicate' : 'Potential Duplicate'}} (${{issue.radar_matches.length}} match${{issue.radar_matches.length > 1 ? 'es' : ''}})</span>
+                            </div>
+                            <ul style="list-style: none; padding: 0; margin: 0;">
+                                ${{issue.radar_matches.map(match => `
+                                <li class="radar-match-item">
+                                    <div class="radar-match-row">
+                                        <a href="${{match.issueUrl}}" class="radar-issue-link">${{match.issueUrl}}</a>
+                                        <span class="radar-score ${{match.confidenceLevel}}">${{match.hybridScore}}%</span>
+                                    </div>
+                                    ${{match.issueTitle ? `<div class="radar-match-title">${{match.issueTitle}}</div>` : ''}}
+                                    <div class="radar-match-scores">
+                                        File: ${{match.filePathScore}}% | Function: ${{match.functionNameScore}}% | Semantic: ${{match.cosineScore}}%
+                                    </div>
+                                </li>
+                                `).join('')}}
+                            </ul>
+                        </div>
                         ` : ''}}
                     </article>
                 `;
@@ -1555,6 +1652,81 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
             }}
         }});
 
+        // Copy all filtered issues to clipboard
+        function copyAllIssues() {{
+            const issuesToCopy = allFilteredIssues.length > 0 ? allFilteredIssues : issuesData.issues;
+
+            const issues = issuesToCopy.filter(issue => {{
+                const sev = (issue.kind || issue.severity || '').toLowerCase();
+                return sev !== 'low';
+            }});
+
+            if (issues.length === 0) {{
+                alert('No issues to copy (Low priority issues are excluded)');
+                return;
+            }}
+
+            const separator = '\\n======================\\n';
+
+            const formattedIssues = issues.map(issue => {{
+                const filePath = issue.original_file_path || issue.file_path || 'Unknown File';
+                const functionName = issue.function_name || issue.functionName || issue.function || 'Unknown';
+                let fileName = 'Unknown File';
+                if (issue.file_name) {{
+                    fileName = issue.file_name;
+                }} else if (filePath && filePath !== 'Unknown File') {{
+                    fileName = filePath.includes('/') ? filePath.split('/').pop() : filePath;
+                }}
+
+                const smallestCost = getSmallestNormalizedCost(issue);
+                const normalizedCostText = smallestCost !== null && smallestCost > 0
+                    ? `\\nNormalized Cost: ${{smallestCost.toFixed(3)}}%`
+                    : '';
+
+                const callstackText = getCallstackText(issue);
+                const callstackSection = callstackText && callstackText !== 'No callstack available'
+                    ? `\\nOriginal Trace Callstack:\\n${{callstackText}}`
+                    : '';
+
+                const issueDescription = (issue.description || issue.issue || 'No description available').replace(/<br\s*\/?>/gi, '\\n');
+                const impactText = (issue.Impact || issue.impact || 'No impact information available').replace(/<br\s*\/?>/gi, '\\n');
+                const solutionText = (issue['Potential solution'] || issue.potentialSolution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
+
+                return `Title:\\n${{issueDescription}}${{normalizedCostText}}
+
+Impact:\\n${{impactText}}
+
+Potential Solution:\\n${{solutionText}}${{callstackSection}}`;
+            }}).join(separator);
+
+            navigator.clipboard.writeText(formattedIssues).then(() => {{
+                const button = event.target;
+                const originalText = button.textContent;
+                button.textContent = 'Copied!';
+                button.classList.add('copied');
+                setTimeout(() => {{
+                    button.textContent = originalText;
+                    button.classList.remove('copied');
+                }}, 2000);
+            }}).catch(err => {{
+                console.error('Failed to copy: ', err);
+                const textArea = document.createElement('textarea');
+                textArea.value = formattedIssues;
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+                const button = event.target;
+                const originalText = button.textContent;
+                button.textContent = 'Copied!';
+                button.classList.add('copied');
+                setTimeout(() => {{
+                    button.textContent = originalText;
+                    button.classList.remove('copied');
+                }}, 2000);
+            }});
+        }}
+
         // Copy issue to clipboard function - generates text based on what user sees (WYSIWYG)
         function copyIssueToClipboard(issueIndex) {{
             // Use the currently displayed issues array instead of the original issues array
@@ -1566,7 +1738,7 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
 
             // Get the file path - use original_file_path if available for full relative path, otherwise use file_path
             const filePath = issue.original_file_path || issue.file_path || 'Unknown File';
-            const functionName = issue.function_name || issue.function || 'Unknown';
+            const functionName = issue.function_name || issue.functionName || issue.function || 'Unknown';
             
             // Extract filename from the full path for the title
             let fileName = 'Unknown File';
@@ -1594,15 +1766,15 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
                 ? `\\nOriginal Trace Callstack:\\n${{callstackText}}`
                 : '';
 
-            const content = `Title: In ${{functionName}}() in ${{fileName}}, there is potential issue
+            const issueDescription = (issue.description || issue.issue || 'No description available').replace(/<br\s*\/?>/gi, '\\n');
+            const impactText = (issue.Impact || issue.impact || 'No impact information available').replace(/<br\s*\/?>/gi, '\\n');
+            const solutionText = (issue['Potential solution'] || issue.potentialSolution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
 
-LLM_StaticAnalysys has found a potential issue
+            const content = `Title:\\n${{issueDescription}}${{normalizedCostText}}
 
-In ${{functionName}}() in ${{filePath}}, there is potential issue${{normalizedCostText}}
+Impact:\\n${{impactText}}
 
-Impact: ${{issue.Impact || issue.impact || 'No impact information available'}}
-
-Potential Solution: ${{issue['Potential solution'] || issue.potentialSolution || 'No solution provided'}}${{callstackSection}}`;
+Potential Solution:\\n${{solutionText}}${{callstackSection}}`;
 
             navigator.clipboard.writeText(content).then(() => {{
                 // Show feedback
@@ -1789,6 +1961,7 @@ Potential Solution: ${{issue['Potential solution'] || issue.potentialSolution ||
                 }});
             }}
 
+            allFilteredIssues = filteredIssues;
             renderIssues(filteredIssues);
         }}
 

@@ -6,8 +6,10 @@ Core constants used across the Hindsight analysis system
 
 # Common constants for analysis
 DEFAULT_MAX_TOKENS = 64000
-DEFAULT_API_RATE_LIMIT = 160  # requests per 4 minutes (40/min)
-DEFAULT_RATE_LIMIT_WINDOW = 240  # seconds (4 minutes)
+LLM_PROVIDER_RATE_LIMIT = 40  # Maximum LLM requests per window across all analyzers
+LLM_PROVIDER_RATE_WINDOW_SECONDS = 240  # Rate limit window in seconds (4 minutes)
+DEFAULT_API_RATE_LIMIT = LLM_PROVIDER_RATE_LIMIT  # Legacy alias
+DEFAULT_RATE_LIMIT_WINDOW = LLM_PROVIDER_RATE_WINDOW_SECONDS  # Legacy alias
 DEFAULT_LOGS_DIR = "logs"
 DEFAULT_DIFF_DAYS = 21  # Default number of days to look back for recently modified files
 MAX_TOOL_ITERATIONS = 20  # Maximum iterations for LLM tool usage
@@ -29,12 +31,47 @@ MAX_SUPPORTED_FILE_COUNT = 14000  # Maximum number of files with supported exten
 CANCELLATION_CHECK_INTERVAL = 1  # Check for cancellation every N functions during analysis
 
 # External input analysis constants
-EXTERNAL_INPUT_RATE_LIMIT = 40  # Maximum LLM requests per minute (160 per 4min quota)
+EXTERNAL_INPUT_RATE_LIMIT = LLM_PROVIDER_RATE_LIMIT  # Legacy alias
 EXTERNAL_INPUT_DEFAULT_WORKERS = 3  # Default parallel workers for external input analysis
 EXTERNAL_INPUT_MAX_TOOL_ITERATIONS = 10  # Max tool iterations per function analysis
 EXTERNAL_INPUT_BATCH_SIZE = 8  # Functions per batch in batched analysis mode
 EXTERNAL_INPUT_TOKEN_BUDGET_RATIO = 0.5  # Use at most 50% of context window for input (leaves room for output)
 EXTERNAL_INPUT_CHARS_PER_TOKEN = 4  # Approximate chars per token for budget estimation
+
+# Code analysis parallel worker constants
+CODE_ANALYZER_DEFAULT_WORKERS = 3  # Default parallel workers for code analysis
+CODE_ANALYZER_RATE_LIMIT = LLM_PROVIDER_RATE_LIMIT  # Legacy alias
+CODE_ANALYZER_RATE_WINDOW_SECONDS = LLM_PROVIDER_RATE_WINDOW_SECONDS  # Legacy alias
+
+# Sink analysis constants (mirrors external input analysis)
+SINK_ANALYSIS_RATE_LIMIT = LLM_PROVIDER_RATE_LIMIT  # Legacy alias
+SINK_ANALYSIS_RATE_WINDOW_SECONDS = LLM_PROVIDER_RATE_WINDOW_SECONDS  # Legacy alias
+SINK_ANALYSIS_DEFAULT_WORKERS = 3  # Default parallel workers for sink analysis
+SINK_ANALYSIS_MAX_TOOL_ITERATIONS = 10  # Max tool iterations per function analysis
+SINK_ANALYSIS_BATCH_SIZE = 8  # Functions per batch in batched analysis mode
+SINK_ANALYSIS_TOKEN_BUDGET_RATIO = 0.5  # Use at most 50% of context window for input
+SINK_ANALYSIS_CHARS_PER_TOKEN = 4  # Approximate chars per token for budget estimation
+
+# Diff analyzer constants (async worker pool)
+DIFF_ANALYZER_DEFAULT_WORKERS = 3  # Default parallel workers for diff analysis
+DIFF_ANALYZER_RATE_LIMIT = LLM_PROVIDER_RATE_LIMIT  # Legacy alias
+DIFF_ANALYZER_RATE_WINDOW_SECONDS = LLM_PROVIDER_RATE_WINDOW_SECONDS  # Legacy alias
+
+# Trace analysis constants
+TRACE_ANALYZER_DEFAULT_WORKERS = 3  # Default parallel workers for trace analysis
+TRACE_ANALYZER_RATE_LIMIT = LLM_PROVIDER_RATE_LIMIT  # Legacy alias
+TRACE_ANALYZER_RATE_WINDOW_SECONDS = LLM_PROVIDER_RATE_WINDOW_SECONDS  # Legacy alias
+
+# Path discovery constants
+PATH_DISCOVERY_MAX_DEPTH = 10  # Maximum hops from source to sink
+PATH_DISCOVERY_MAX_PATHS_PER_PAIR = 3  # Maximum paths per (source, sink) pair
+PATH_DISCOVERY_MAX_TOTAL_PATHS = 5000  # Hard cap on total candidate paths
+
+# Flow vulnerability analysis constants (CWE anti-pattern detection)
+FLOW_VULN_RATE_LIMIT = 40  # Maximum LLM requests per minute
+FLOW_VULN_DEFAULT_WORKERS = 3  # Default parallel workers
+FLOW_VULN_MAX_TOOL_ITERATIONS = 15  # Max tool iterations per flow analysis
+FLOW_VULN_MAX_FLOWS_TO_ANALYZE = 200  # Hard cap on flows to analyze (prioritize shorter paths)
 
 # AST generation constants
 AST_GENERATION_TIMEOUT_SECS = 3600  # Timeout for AST generation subprocess (1 hour)

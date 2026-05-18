@@ -147,12 +147,21 @@ class HybridMatcher:
         for doc_id, metadata, distance in candidates:
             # Get issue description
             issue_description = documents.get(doc_id, '')
-            
+
             # Compute individual scores
             cosine_score = self._distance_to_similarity(distance)
             file_score = self._compute_file_score(issue, metadata, issue_description)
             func_score = self._compute_function_score(issue, metadata, issue_description)
-            
+
+            # Hard gate: if the issue has a file name and no file name
+            # match was found in the candidate, it is definitely not a dupe.
+            if issue.file_name and file_score == 0.0:
+                logger.debug(
+                    f"Skipping candidate {metadata.get('issue_id', doc_id)}: "
+                    f"no file name match for {issue.file_name}"
+                )
+                continue
+
             # Compute weighted hybrid score
             hybrid_score = (
                 self.weights['file_path'] * file_score +

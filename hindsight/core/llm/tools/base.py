@@ -84,7 +84,8 @@ class ToolsBase:
         self.artifacts_dir = artifacts_dir
         self.directory_tree_util = directory_tree_util
         self.allowed_commands = {
-            'ls', 'find', 'grep', 'wc', 'head', 'tail', 'cat', 'tree', 'file', 'sed'
+            'ls', 'find', 'grep', 'wc', 'head', 'tail', 'cat', 'tree', 'file', 'sed',
+            'awk', 'sort', 'uniq', 'cut', 'xargs', 'diff', 'strings'
         }
         
         # Initialize enhanced command validator

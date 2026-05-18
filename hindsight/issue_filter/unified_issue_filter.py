@@ -26,6 +26,7 @@ sys.path.insert(0, str(project_root))
 from .category_filter import CategoryBasedFilter
 from .llm_filter import LLMBasedFilter
 from .response_challenger import LLMResponseChallenger
+from .non_actionable_issue_filter import NonActionableIssueFilter
 
 
 class UnifiedIssueFilter:
@@ -72,13 +73,19 @@ class UnifiedIssueFilter:
         
         # Track dropped issues counts for statistics
         self.level1_dropped_count = 0
+        self.non_actionable_dropped_count = 0
         self.level2_dropped_count = 0
         self.level3_dropped_count = 0
-        
+
         # Initialize Level 1: Category-based filter (always enabled)
         # Now uses ALLOWLIST approach - only logicBug and performance are kept by default
         self.category_filter = CategoryBasedFilter(
             additional_allowed_categories=additional_allowed_categories,
+            dropped_issues_dir=dropped_issues_dir
+        )
+
+        # Initialize Level 1.5: Non-actionable heuristic filter (always enabled, no LLM)
+        self.non_actionable_filter = NonActionableIssueFilter(
             dropped_issues_dir=dropped_issues_dir
         )
         
@@ -164,17 +171,27 @@ class UnifiedIssueFilter:
         
         # Reset dropped counts for this filtering session
         self.level1_dropped_count = 0
+        self.non_actionable_dropped_count = 0
         self.level2_dropped_count = 0
         self.level3_dropped_count = 0
-        
+
         # Level 1: Category-based filtering (hard filter)
         self.logger.info("UnifiedIssueFilter: Applying Level 1 (category-based) filtering...")
         filtered_issues = self.category_filter.filter_issues(issues)
-        
+
         self.level1_dropped_count = original_count - len(filtered_issues)
         if self.level1_dropped_count > 0:
             self.logger.info(f"UnifiedIssueFilter: Level 1 dropped {self.level1_dropped_count} issues, {len(filtered_issues)} remaining")
-        
+
+        # Level 1.5: Non-actionable heuristic filtering (always enabled, no LLM)
+        if filtered_issues:
+            self.logger.info("UnifiedIssueFilter: Applying Level 1.5 (non-actionable heuristic) filtering...")
+            pre_count = len(filtered_issues)
+            filtered_issues = self.non_actionable_filter.filter_issues(filtered_issues)
+            self.non_actionable_dropped_count = pre_count - len(filtered_issues)
+            if self.non_actionable_dropped_count > 0:
+                self.logger.info(f"UnifiedIssueFilter: Level 1.5 dropped {self.non_actionable_dropped_count} issues, {len(filtered_issues)} remaining")
+
         # Level 2: LLM-based filtering (intelligent filter)
         if self.llm_filter and self.llm_filter.is_available() and filtered_issues:
             self.logger.info("UnifiedIssueFilter: Applying Level 2 (LLM-based) filtering...")
@@ -225,6 +242,8 @@ class UnifiedIssueFilter:
             "level1_enabled": True,
             "level1_allowed_categories": list(self.category_filter.get_allowed_categories()),
             "level1_dropped_count": getattr(self, 'level1_dropped_count', 0),
+            "level1_5_enabled": True,
+            "level1_5_non_actionable_dropped_count": getattr(self, 'non_actionable_dropped_count', 0),
             "level2_enabled": self.enable_llm_filtering,
             "level2_available": self.llm_filter.is_available() if self.llm_filter else False,
             "level2_dropped_count": getattr(self, 'level2_dropped_count', 0),

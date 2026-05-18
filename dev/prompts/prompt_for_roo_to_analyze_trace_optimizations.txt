@@ -1,0 +1,144 @@
+You are analyzing a performance trace optimization report for a native codebase. The issues are in a TEXT file.
+
+Your job is to evaluate each proposed optimization on two criteria:
+1. Is the optimization VIABLE? (Can it actually be implemented given the code architecture?)
+2. Is the optimization WORTH PURSUING? (Is the cost/impact ratio justified?)
+
+Drop any issue that fails either criterion. Produce a filtered HTML report of only the issues worth acting on.
+
+Inputs:
+- Trace optimization report (TEXT file) at: <path>
+  The text file format has issues separated by "======================" with fields:
+    Title: <optimization description>
+    Normalized Cost: <percentage>
+    Impact: <description>
+    Potential Solution: <suggested fix>
+    Original Trace Callstack: <call stack>
+- Repository source code is available in this workspace.
+
+---
+
+RESTARTABILITY (this is a long-running task):
+
+On startup, check for trace_analysis_progress.txt in the output directory.
+
+- If trace_analysis_progress.txt EXISTS: resume from where you left off. Skip issues already
+  marked with a terminal status ([KEPT], [DROPPED-NOT-VIABLE], [DROPPED-NOT-WORTH], [DROPPED-DUPE]).
+  Only process issues still marked [PENDING].
+
+- If trace_analysis_progress.txt DOES NOT EXIST: create it immediately after parsing the input file.
+  List every issue as:
+    [PENDING] <issue title (first 80 chars)>
+
+After evaluating EACH issue, update trace_analysis_progress.txt immediately:
+    [KEPT] <title>
+    [DROPPED-NOT-VIABLE] <title> — <one-line reason>
+    [DROPPED-NOT-WORTH] <title> — <one-line reason>
+    [DROPPED-DUPE] <title> — duplicate of: <other title>
+
+CRITICAL: Write trace_analysis_progress.txt after EVERY single issue evaluation. Do not batch updates.
+This ensures that if the task is interrupted, no work is lost on restart.
+
+---
+
+Critical workflow (must follow exactly):
+
+1) Parse the text file. Extract each issue separated by "======================".
+   Create or load trace_analysis_progress.txt as described above.
+
+2) For EACH issue not already resolved in trace_analysis_progress.txt, evaluate sequentially:
+
+   a) VIABILITY CHECK — Open the referenced source file(s) and verify:
+      - Does the code actually exist at the described location?
+      - Is the proposed change architecturally feasible? (e.g., can you actually pass by reference there, or does ownership semantics prevent it? Is the API boundary yours to change?)
+      - Are there constraints (thread safety, ABI stability, framework requirements) that block the fix?
+      - Mark as NOT VIABLE if: code doesn't exist, API isn't yours to change, fix would break invariants, or the description fundamentally misunderstands what the code does.
+
+   b) WORTH PURSUING CHECK — Assess cost vs. benefit:
+      - Is the normalized cost significant enough to matter? (Issues below ~0.05% on non-hot paths are generally not worth the churn.)
+      - Is the fix straightforward relative to the gain? A 0.1% gain requiring a multi-file refactor across module boundaries is likely not worth it.
+      - Is this on a genuinely hot path (high frequency invocation), or is it a one-time/rare path that happened to show up in a specific trace?
+      - Would the fix introduce maintenance burden disproportionate to the gain?
+      - Mark as NOT WORTH PURSUING if: cost is negligible, fix complexity far exceeds benefit, or the path isn't actually hot in production.
+
+   c) Update trace_analysis_progress.txt with the verdict IMMEDIATELY after evaluating this issue.
+
+3) After all issues are processed, collect those marked [KEPT]. De-duplicate (same optimization
+   target + same core claim). Mark duplicates as [DROPPED-DUPE] in trace_analysis_progress.txt.
+
+4) Output a single HTML file named trace_analysis_results.html with the surviving issues.
+
+---
+
+HTML OUTPUT FORMAT:
+
+Generate a self-contained HTML file with a tile/card-based layout. Each issue is rendered as a card
+with a "Copy" button. There is also a global "Copy All" button. The format mirrors the Hindsight
+trace_analyzer report style.
+
+Structure:
+- A header section with title "Trace Analysis Results" and a summary line ("X of Y issues survived
+  filtering") plus a "Copy All" button.
+- Priority filter buttons: All | High | Medium | Low
+- A 2-column responsive grid of issue cards, sorted by Priority (High first), then Normalized Cost descending.
+
+Each issue card contains:
+- Header row: Title (from "Title:" field, verbatim) + Priority badge (HIGH/MEDIUM/LOW) + Copy button
+- Metadata row: Normalized Cost percentage
+- Body with collapsible sections (<details open>):
+  - "Original Trace" — the full Original Trace Callstack text, displayed in a <pre> block
+  - "Issue" — the Title/description text
+  - "Impact" — from "Impact:" field, verbatim
+  - "Potential Solution" — from "Potential Solution:" field, verbatim
+  - "Viability Notes" — brief note on why this is implementable
+
+Copy button behavior (per-tile):
+When clicked, copies this text to clipboard:
+    Title:
+    <title text>
+    Normalized Cost: <percentage>
+
+    Original Trace Callstack:
+    <full callstack text>
+
+    Impact:
+    <impact text>
+
+    Potential Solution:
+    <solution text>
+
+After copying, the button text changes to "Copied!" (green) for 2 seconds then reverts.
+
+"Copy All" button behavior:
+Copies all visible/filtered issues separated by "\n======================\n" in the same per-issue
+format as above. Excludes Low priority issues.
+
+Required styling (inline CSS in <style> block):
+- Body: font-family system-ui, sans-serif; background #f5f5f7; margin 0
+- Cards: background #fff; border 1px solid #e5e5ea; border-radius 12px; box-shadow 0 1px 2px rgba(0,0,0,.04)
+- Card header: display flex; justify-content space-between; padding 1rem 1.25rem; border-bottom 1px solid #e5e5ea
+- Grid: display grid; grid-template-columns repeat(2, 1fr); gap 2rem; padding 30px
+- Priority badges: HIGH=#b00020 bg #fee, MEDIUM=#b35c00 bg #fff3e0, LOW=#2a7f3f bg #e8f5e9
+  (inline-flex, padding 4px 10px, border-radius 12px, font-size 0.8rem, font-weight 600)
+- Copy button: background #007bff; color white; border none; border-radius 12px; padding 4px 10px;
+  font-size 0.8em; cursor pointer; margin-left 10px; font-weight 600; height 24px
+- Copy button hover: background #0056b3
+- Copy button .copied state: background #28a745
+- Filter buttons: padding 8px 16px; border 1px solid rgba(0,0,0,0.15); background #fff; border-radius 20px;
+  active state: background #1d1d1f; color #fff
+- Collapsible sections (.callout): border 1px solid #e5e5ea; border-radius 10px; padding .75rem .9rem; margin .75rem 0
+- <pre> blocks inside callout: white-space pre-wrap; word-break break-all; font-size 0.85em; max-height 300px; overflow-y auto
+- Responsive: @media (max-width: 900px) { grid-template-columns: 1fr }
+
+JavaScript requirements:
+- Filter buttons toggle visibility by priority (data-priority attribute on cards)
+- copyIssueToClipboard(index) function using navigator.clipboard.writeText with fallback to execCommand
+- copyAllIssues() function that collects all visible non-Low issues and copies with separator
+- Both copy functions show "Copied!" feedback for 2 seconds
+
+Rules:
+- Copy title / impact / potential solution EXACTLY from report (no paraphrase).
+- Do not invent issues.
+- Be aggressive about filtering. The goal is a short, actionable list. When in doubt, drop it.
+- If you cannot locate the referenced code to verify viability, DROP the issue.
+- Include a summary at the top of the HTML: "X of Y issues survived filtering" with a brief breakdown of why issues were dropped (e.g., "12 dropped as not viable, 8 dropped as not worth pursuing, 3 duplicates removed").

@@ -22,11 +22,11 @@ Usage:
     from hindsight.dedupers.issue_deduper import IssueDeduper, dedupe_issues
     
     # Using the class
-    with IssueDeduper(artifacts_dir="~/llm_artifacts/repo") as deduper:
+    with IssueDeduper(artifacts_dir="~/llm_artifacts/repo", analyzer_type="code_analysis") as deduper:
         unique_issues = deduper.dedupe(issues)
-    
+
     # Using the convenience function
-    unique_issues = dedupe_issues(issues, artifacts_dir="~/llm_artifacts/repo")
+    unique_issues = dedupe_issues(issues, artifacts_dir="~/llm_artifacts/repo", analyzer_type="code_analysis")
 """
 
 # Apply numpy binary compatibility warnings filter BEFORE any imports

@@ -1,0 +1,422 @@
+# CWE (Common Weakness Enumeration) Catalog for Data Flow Analysis
+# Target languages: C, C++, Swift, Objective-C
+#
+# Each entry describes an anti-pattern the LLM should look for when
+# examining data flow paths from external-input sources to security sinks.
+#
+# Fields:
+#   id: CWE identifier (e.g., CWE-79)
+#   name: Short weakness name
+#   category: Parent category from CWE taxonomy
+#   anti_pattern: Plain-English description of the code pattern that triggers this weakness
+#   data_flow_signal: What to look for along a source→sink data flow path
+#   severity: default severity (critical/high/medium/low)
+#   languages: which languages this applies to (empty = all four target languages)
+
+categories:
+
+  - name: "Data Neutralization Issues"
+    id: "CWE-137"
+    entries:
+      - id: "CWE-78"
+        name: "OS Command Injection"
+        anti_pattern: "User-controlled string concatenated or interpolated into a shell command without sanitization"
+        data_flow_signal: "external input → string interpolation/concatenation → system()/popen()/exec*()/NSTask.launch()/Process.run()"
+        severity: "critical"
+        languages: []
+
+      - id: "CWE-79"
+        name: "Cross-site Scripting (XSS)"
+        anti_pattern: "User-controlled data rendered in HTML/web view without escaping"
+        data_flow_signal: "external input → string concatenation → WKWebView.loadHTMLString / UIWebView / HTML template rendering"
+        severity: "high"
+        languages: ["swift", "objc"]
+
+      - id: "CWE-89"
+        name: "SQL Injection"
+        anti_pattern: "User-controlled data concatenated into a SQL query string instead of using parameterized queries"
+        data_flow_signal: "external input → string format/concat → sqlite3_exec / sqlite3_prepare without bind parameters"
+        severity: "critical"
+        languages: []
+
+      - id: "CWE-94"
+        name: "Code Injection"
+        anti_pattern: "User-controlled data passed to eval() or dynamic code execution without validation"
+        data_flow_signal: "external input → NSExpression / JSContext.evaluateScript / dlopen with user path"
+        severity: "critical"
+        languages: ["swift", "objc"]
+
+      - id: "CWE-134"
+        name: "Use of Externally-Controlled Format String"
+        anti_pattern: "User-controlled data used as the format string argument to printf-family or NSLog functions"
+        data_flow_signal: "external input → printf/sprintf/NSLog/os_log format argument (first arg) instead of data argument"
+        severity: "critical"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-611"
+        name: "XML External Entity (XXE)"
+        anti_pattern: "XML parser processes external entities from untrusted input without disabling DTD/entity resolution"
+        data_flow_signal: "external input → NSXMLParser/XMLParser/libxml2 with shouldResolveExternalEntities=true or XML_PARSE_DTDLOAD"
+        severity: "high"
+        languages: []
+
+      - id: "CWE-917"
+        name: "Expression Language Injection"
+        anti_pattern: "User input evaluated as an expression language statement without sanitization"
+        data_flow_signal: "external input → NSPredicate(format:) / NSExpression with user data in format string position"
+        severity: "high"
+        languages: ["swift", "objc"]
+
+  - name: "Memory Safety Issues"
+    id: "CWE-1218"
+    entries:
+      - id: "CWE-120"
+        name: "Buffer Overflow (Classic)"
+        anti_pattern: "Fixed-size buffer written with data whose length is controlled by external input without bounds check"
+        data_flow_signal: "external input → strcpy/strcat/memcpy/sprintf with size from input → fixed-size stack/heap buffer"
+        severity: "critical"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-125"
+        name: "Out-of-bounds Read"
+        anti_pattern: "Array or buffer accessed at an index derived from external input without bounds validation"
+        data_flow_signal: "external input → index/offset → array subscript or pointer arithmetic without bounds check"
+        severity: "high"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-787"
+        name: "Out-of-bounds Write"
+        anti_pattern: "Write to memory location calculated from external input without validating it stays within buffer bounds"
+        data_flow_signal: "external input → offset/index → write to buffer[offset] without validating offset < buffer_size"
+        severity: "critical"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-416"
+        name: "Use After Free"
+        anti_pattern: "Pointer or reference used after the object it points to has been deallocated"
+        data_flow_signal: "free(ptr)/release/dealloc → subsequent dereference of same pointer without nullification"
+        severity: "critical"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-415"
+        name: "Double Free"
+        anti_pattern: "Memory freed twice causing heap corruption"
+        data_flow_signal: "free(ptr) → (no null assignment) → free(ptr) again on error/cleanup path"
+        severity: "critical"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-476"
+        name: "NULL Pointer Dereference"
+        anti_pattern: "Pointer dereferenced without null check after operation that may return NULL"
+        data_flow_signal: "malloc/calloc/fopen/dlsym → use returned pointer without NULL check"
+        severity: "high"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-122"
+        name: "Heap-based Buffer Overflow"
+        anti_pattern: "Heap-allocated buffer overwritten past its allocated size"
+        data_flow_signal: "malloc(N) → write more than N bytes via memcpy/loop/strcpy with external-controlled length"
+        severity: "critical"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-824"
+        name: "Access of Uninitialized Pointer"
+        anti_pattern: "Pointer variable used before being assigned a valid address"
+        data_flow_signal: "pointer declaration without init → conditional assignment (may be skipped) → dereference"
+        severity: "high"
+        languages: ["c", "cpp", "objc"]
+
+  - name: "Numeric Errors"
+    id: "CWE-189"
+    entries:
+      - id: "CWE-190"
+        name: "Integer Overflow"
+        anti_pattern: "Arithmetic on external input used for size/index calculation without overflow check"
+        data_flow_signal: "external input → multiply/add/shift → allocation size / array index / loop bound"
+        severity: "high"
+        languages: ["c", "cpp", "objc", "swift"]
+
+      - id: "CWE-191"
+        name: "Integer Underflow"
+        anti_pattern: "Subtraction on unsigned value derived from external input causes wraparound to large value"
+        data_flow_signal: "external input → unsigned subtraction → size_t/uint used for allocation or memcpy length"
+        severity: "high"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-681"
+        name: "Incorrect Conversion between Numeric Types"
+        anti_pattern: "Signed-to-unsigned or narrowing cast on external input loses information used for security decisions"
+        data_flow_signal: "external input (int64/int) → cast to unsigned/shorter type → size comparison or allocation"
+        severity: "medium"
+        languages: ["c", "cpp", "objc", "swift"]
+
+  - name: "File Handling Issues"
+    id: "CWE-1219"
+    entries:
+      - id: "CWE-22"
+        name: "Path Traversal"
+        anti_pattern: "User-controlled path component used to construct file path without canonicalization or prefix validation"
+        data_flow_signal: "external input → path append/concatenation (appendingPathComponent/strcat) → fopen/FileManager/open without checking for .. or realpath"
+        severity: "high"
+        languages: []
+
+      - id: "CWE-59"
+        name: "Link Following"
+        anti_pattern: "File operation on a user-supplied path that may be a symlink to a sensitive location"
+        data_flow_signal: "external input → file path → open/stat/unlink without O_NOFOLLOW or lstat check"
+        severity: "medium"
+        languages: []
+
+      - id: "CWE-377"
+        name: "Insecure Temporary File"
+        anti_pattern: "Temporary file created with predictable name or in world-writable directory without exclusive creation"
+        data_flow_signal: "tmpnam/tempnam/mktemp → open (non-exclusive) — race between name creation and open"
+        severity: "medium"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-434"
+        name: "Unrestricted File Upload"
+        anti_pattern: "Uploaded file saved to disk without validating file type, extension, or content"
+        data_flow_signal: "external input (file data) → write to disk without MIME/extension/magic-byte validation"
+        severity: "high"
+        languages: []
+
+  - name: "Cryptographic Issues"
+    id: "CWE-310"
+    entries:
+      - id: "CWE-328"
+        name: "Use of Weak Hash"
+        anti_pattern: "Security-sensitive data (passwords, tokens) hashed with MD5/SHA1 instead of modern algorithm"
+        data_flow_signal: "sensitive data → CC_MD5/CC_SHA1/MD5_Update/SHA1_Update/CommonCrypto MD5 → storage or comparison"
+        severity: "medium"
+        languages: []
+
+      - id: "CWE-338"
+        name: "Weak PRNG"
+        anti_pattern: "Security-relevant random value generated with non-cryptographic PRNG"
+        data_flow_signal: "rand()/srand()/drand48()/arc4random() (without _uniform) → token/key/nonce/session-id"
+        severity: "medium"
+        languages: []
+
+      - id: "CWE-295"
+        name: "Improper Certificate Validation"
+        anti_pattern: "TLS certificate validation disabled or custom trust evaluation always returns success"
+        data_flow_signal: "URLSession/NSURLConnection delegate → didReceiveChallenge → .useCredential without validation / SecTrustEvaluate ignored"
+        severity: "critical"
+        languages: ["swift", "objc"]
+
+      - id: "CWE-325"
+        name: "Missing Cryptographic Step"
+        anti_pattern: "Encryption or signing operation missing a required step (no IV, no MAC, no padding, ECB mode)"
+        data_flow_signal: "plaintext → CCCrypt/SecKey encrypt with kCCOptionECBMode or nil IV / signature without nonce"
+        severity: "high"
+        languages: []
+
+      - id: "CWE-327"
+        name: "Use of Broken Cryptographic Algorithm"
+        anti_pattern: "Deprecated crypto algorithm (DES, RC4, MD5-for-integrity) used for security-sensitive operation"
+        data_flow_signal: "data → kCCAlgorithmDES/kCCAlgorithmRC4/RC4/DES_ecb_encrypt → encrypted output used for protection"
+        severity: "high"
+        languages: []
+
+  - name: "Credentials Management Errors"
+    id: "CWE-255"
+    entries:
+      - id: "CWE-798"
+        name: "Hard-coded Credentials"
+        anti_pattern: "API key, password, or secret embedded as a string literal in source code"
+        data_flow_signal: "string literal matching key/password/secret/token pattern → authentication / API call / crypto operation"
+        severity: "high"
+        languages: []
+
+      - id: "CWE-312"
+        name: "Cleartext Storage of Sensitive Information"
+        anti_pattern: "Password, token, or PII stored in plaintext in UserDefaults, plist, file, or database"
+        data_flow_signal: "sensitive data → UserDefaults.set / NSKeyedArchiver / fwrite / sqlite3_bind_text without encryption"
+        severity: "high"
+        languages: ["swift", "objc"]
+
+      - id: "CWE-319"
+        name: "Cleartext Transmission of Sensitive Information"
+        anti_pattern: "Sensitive data sent over HTTP instead of HTTPS, or transmitted without TLS"
+        data_flow_signal: "sensitive data → URL with http:// scheme / unencrypted socket write / send() without TLS"
+        severity: "high"
+        languages: []
+
+      - id: "CWE-523"
+        name: "Unprotected Transport of Credentials"
+        anti_pattern: "Credentials transmitted without transport-layer encryption"
+        data_flow_signal: "credential/token → network request without TLS verification / ATS exception for cleartext"
+        severity: "high"
+        languages: []
+
+  - name: "Concurrency Issues"
+    id: "CWE-557"
+    entries:
+      - id: "CWE-367"
+        name: "TOCTOU Race Condition"
+        anti_pattern: "A value or resource state is checked then used in a separate operation without holding a lock"
+        data_flow_signal: "stat/access/check → conditional → open/use without lock held across both operations"
+        severity: "high"
+        languages: []
+
+      - id: "CWE-820"
+        name: "Missing Synchronization"
+        anti_pattern: "Shared mutable state accessed from multiple threads/queues without any synchronization"
+        data_flow_signal: "property/global write from thread A + read from thread B with no mutex/atomic/serial-queue/os_unfair_lock"
+        severity: "high"
+        languages: []
+
+      - id: "CWE-833"
+        name: "Deadlock"
+        anti_pattern: "Synchronous dispatch to the current queue, or nested lock acquisition in inconsistent order"
+        data_flow_signal: "dispatch_sync on current queue / DispatchQueue.sync(self) / pthread_mutex_lock(A) then lock(B) with reverse elsewhere"
+        severity: "critical"
+        languages: []
+
+      - id: "CWE-1322"
+        name: "Blocking Code in Non-blocking Context"
+        anti_pattern: "Synchronous I/O or blocking wait called on the main thread or an async context"
+        data_flow_signal: "main thread/main queue → synchronous read/recv/semaphore_wait/dispatch_semaphore_wait/sleep"
+        severity: "medium"
+        languages: []
+
+      - id: "CWE-364"
+        name: "Signal Handler Race Condition"
+        anti_pattern: "Signal handler accesses shared state or calls non-async-signal-safe functions"
+        data_flow_signal: "signal handler → malloc/free/printf/lock acquisition / global variable write without sig_atomic_t"
+        severity: "high"
+        languages: ["c", "cpp"]
+
+  - name: "Authentication Errors"
+    id: "CWE-1211"
+    entries:
+      - id: "CWE-306"
+        name: "Missing Authentication for Critical Function"
+        anti_pattern: "Security-critical operation accessible without authentication check"
+        data_flow_signal: "external request → critical operation without auth token validation / session check in path"
+        severity: "critical"
+        languages: []
+
+      - id: "CWE-287"
+        name: "Improper Authentication"
+        anti_pattern: "Authentication logic can be bypassed through alternate paths or weak comparisons"
+        data_flow_signal: "auth check uses strcmp/== instead of constant-time compare / early return allows bypass / timing side-channel"
+        severity: "critical"
+        languages: []
+
+  - name: "Authorization Errors"
+    id: "CWE-1212"
+    entries:
+      - id: "CWE-639"
+        name: "Authorization Bypass Through User-Controlled Key"
+        anti_pattern: "Access control decision based on a user-supplied identifier without verifying ownership"
+        data_flow_signal: "user-controlled ID → database query / resource access without ownership validation"
+        severity: "high"
+        languages: []
+
+      - id: "CWE-862"
+        name: "Missing Authorization"
+        anti_pattern: "Operation that should be restricted to certain roles/users has no authorization check"
+        data_flow_signal: "authenticated request → privileged operation without role/permission/entitlement check"
+        severity: "high"
+        languages: []
+
+  - name: "Information Management Errors"
+    id: "CWE-199"
+    entries:
+      - id: "CWE-209"
+        name: "Information Exposure Through Error Message"
+        anti_pattern: "Detailed error message (stack trace, SQL query, internal path) returned to user"
+        data_flow_signal: "exception/error with internal details → response body / UIAlertController / user-visible output"
+        severity: "medium"
+        languages: []
+
+      - id: "CWE-532"
+        name: "Information Exposure Through Log Files"
+        anti_pattern: "Sensitive data (password, token, PII) written to log output"
+        data_flow_signal: "sensitive data → NSLog/os_log/printf/syslog/os_log without %{private} or redaction"
+        severity: "medium"
+        languages: []
+
+  - name: "Resource Management Errors"
+    id: "CWE-399"
+    entries:
+      - id: "CWE-770"
+        name: "Allocation Without Limits"
+        anti_pattern: "Resource allocation (memory, connections, threads) driven by external input without bounds"
+        data_flow_signal: "external input (count/size) → malloc/calloc/alloca/dispatch_apply without upper-bound check"
+        severity: "medium"
+        languages: []
+
+      - id: "CWE-772"
+        name: "Missing Release of Resource"
+        anti_pattern: "Allocated resource (file descriptor, memory, handle) not freed on all code paths"
+        data_flow_signal: "open/malloc/fopen → early return/error path without corresponding close/free/fclose"
+        severity: "medium"
+        languages: ["c", "cpp", "objc"]
+
+      - id: "CWE-502"
+        name: "Deserialization of Untrusted Data"
+        anti_pattern: "Untrusted data deserialized without class allowlist or secure coding"
+        data_flow_signal: "external input → NSKeyedUnarchiver.unarchiveObject / NSCoding without requiresSecureCoding / NSSecureCoding"
+        severity: "high"
+        languages: ["swift", "objc"]
+
+      - id: "CWE-918"
+        name: "Server-Side Request Forgery (SSRF)"
+        anti_pattern: "User-controlled URL passed to an HTTP client without allowlist validation"
+        data_flow_signal: "external input → URL construction → URLSession/NSURLConnection/curl request without host/scheme allowlist"
+        severity: "high"
+        languages: []
+
+  - name: "Communication Channel Errors"
+    id: "CWE-417"
+    entries:
+      - id: "CWE-940"
+        name: "Improper Verification of Source"
+        anti_pattern: "IPC message or URL scheme handler processes request without verifying the sender"
+        data_flow_signal: "URL scheme callback / XPC message / mach_msg → action without sourceApplication / entitlement / audit_token check"
+        severity: "high"
+        languages: ["swift", "objc", "c"]
+
+      - id: "CWE-939"
+        name: "Improper Authorization in Custom URL Scheme"
+        anti_pattern: "Deep link handler performs sensitive action without verifying authorization"
+        data_flow_signal: "application(_:open:options:) / handleOpenURL → sensitive operation without auth check or user confirmation"
+        severity: "high"
+        languages: ["swift", "objc"]
+
+  - name: "Data Validation Issues"
+    id: "CWE-1215"
+    entries:
+      - id: "CWE-601"
+        name: "Open Redirect"
+        anti_pattern: "User-controlled URL used as redirect destination without allowlist validation"
+        data_flow_signal: "external input → redirect URL → openURL / HTTP 302 Location without scheme/host allowlist"
+        severity: "medium"
+        languages: []
+
+      - id: "CWE-129"
+        name: "Improper Validation of Array Index"
+        anti_pattern: "Array index from external input used without validating it is within valid range"
+        data_flow_signal: "external input → used as array subscript / pointer offset without 0 <= idx < count check"
+        severity: "high"
+        languages: ["c", "cpp", "objc", "swift"]
+
+  - name: "State Issues"
+    id: "CWE-371"
+    entries:
+      - id: "CWE-15"
+        name: "External Control of System Setting"
+        anti_pattern: "User input used to modify system configuration or environment variables"
+        data_flow_signal: "external input → setenv/putenv/ProcessInfo.environment/system config write"
+        severity: "medium"
+        languages: []
+
+      - id: "CWE-374"
+        name: "Passing Mutable Objects to Untrusted Method"
+        anti_pattern: "Mutable collection or object passed to external/untrusted code that may modify it unexpectedly"
+        data_flow_signal: "NSMutableArray/NSMutableDictionary/inout param → untrusted callee → caller uses assuming unchanged"
+        severity: "medium"
+        languages: ["swift", "objc"]

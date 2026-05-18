@@ -13,11 +13,13 @@ from .unified_issue_filter import UnifiedIssueFilter, create_unified_filter
 from .category_filter import CategoryBasedFilter
 from .llm_filter import LLMBasedFilter
 from .trace_relevance_filter import TraceRelevanceFilter
+from .non_actionable_issue_filter import NonActionableIssueFilter
 
 __all__ = [
     'UnifiedIssueFilter',
     'CategoryBasedFilter',
     'LLMBasedFilter',
     'TraceRelevanceFilter',
+    'NonActionableIssueFilter',
     'create_unified_filter'
 ]

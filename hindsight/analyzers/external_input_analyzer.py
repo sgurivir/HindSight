@@ -28,44 +28,13 @@ from ..core.constants import (
     EXTERNAL_INPUT_BATCH_SIZE,
     EXTERNAL_INPUT_TOKEN_BUDGET_RATIO,
     EXTERNAL_INPUT_CHARS_PER_TOKEN,
+    LLM_PROVIDER_RATE_WINDOW_SECONDS,
 )
+from ..core.async_infra import RateLimiter
 from ..core.mcp_tools.code_navigation_server import CodeNavigationServer
 from ..utils.log_util import get_logger
 
 logger = get_logger(__name__)
-
-
-class RateLimiter:
-    """Token-bucket rate limiter for async contexts."""
-
-    def __init__(self, max_requests_per_minute: int):
-        self._max_rpm = max_requests_per_minute
-        self._interval = 60.0 / max_requests_per_minute
-        self._semaphore = asyncio.Semaphore(max_requests_per_minute)
-        self._timestamps: asyncio.Queue = asyncio.Queue()
-
-    async def acquire(self) -> None:
-        """Wait until a request slot is available within the rate limit window."""
-        now = time.monotonic()
-
-        # Clean up timestamps older than 60s
-        while not self._timestamps.empty():
-            oldest = self._timestamps._queue[0]
-            if now - oldest >= 60.0:
-                self._timestamps.get_nowait()
-            else:
-                break
-
-        # If at capacity, wait until the oldest request exits the window
-        if self._timestamps.qsize() >= self._max_rpm:
-            oldest = self._timestamps._queue[0]
-            wait_time = 60.0 - (now - oldest)
-            if wait_time > 0:
-                logger.debug(f"Rate limit: waiting {wait_time:.1f}s")
-                await asyncio.sleep(wait_time)
-                self._timestamps.get_nowait()
-
-        self._timestamps.put_nowait(time.monotonic())
 
 
 class ExternalInputAnalyzer:
@@ -103,7 +72,8 @@ class ExternalInputAnalyzer:
         """
         self.mcp_server = mcp_server
         self.llm_request_fn = llm_request_fn
-        self.rate_limiter = RateLimiter(rate_limit)
+        self.rate_limiter = RateLimiter(max_requests=rate_limit,
+                                        window_seconds=LLM_PROVIDER_RATE_WINDOW_SECONDS)
         self.max_workers = max_workers
         self.max_tool_iterations = max_tool_iterations
         self.batch_size = batch_size
@@ -290,25 +260,28 @@ Wrap your response in a single ```json ... ``` code fence containing the array.
 
     # ─── Batching logic ──────────────────────────────────────────────────
 
-    def _prefetch_function_bodies(self, function_names: List[str]) -> Dict[str, str]:
-        """Pre-fetch function bodies from the MCP server for all functions."""
-        bodies: Dict[str, str] = {}
+    def _prefetch_function_bodies(self, function_names: List[str]) -> Dict[str, Optional[str]]:
+        """Pre-fetch function bodies from the MCP server for all functions.
+
+        Returns a dict mapping function_name -> body text, where None means
+        the source code could not be retrieved (symbol not found, file missing, etc.).
+        """
+        bodies: Dict[str, Optional[str]] = {}
         for name in function_names:
             raw = self.mcp_server.execute_tool("get_function_body", {"symbol_id": name})
             try:
                 parsed = json.loads(raw)
-                body = parsed.get("body", "")
-                if not body and "error" in parsed:
-                    body = f"[Error: {parsed['error']}]"
+                body = parsed.get("body", "") or None
             except (json.JSONDecodeError, TypeError):
-                body = raw if raw else "[No source available]"
+                body = raw if raw else None
             bodies[name] = body
         return bodies
 
-    def _create_batches(self, function_names: List[str], bodies: Dict[str, str]) -> List[List[Dict[str, str]]]:
+    def _create_batches(self, function_names: List[str], bodies: Dict[str, Optional[str]]) -> List[List[Dict[str, str]]]:
         """Split functions into batches respecting both batch_size and token budget.
 
         Each batch item is: {id, function_name, body}
+        Only includes functions that have available source code (non-None bodies).
         """
         system_prompt = self._build_batch_system_prompt()
         system_tokens = self._estimate_tokens(system_prompt)
@@ -324,7 +297,9 @@ Wrap your response in a single ```json ... ``` code fence containing the array.
         current_tokens = 0
 
         for name in function_names:
-            body = bodies.get(name, "[No source available]")
+            body = bodies.get(name)
+            if body is None:
+                continue
             func_tokens = self._estimate_tokens(body) + per_function_overhead
             short_id = uuid.uuid4().hex[:8]
 
@@ -663,7 +638,7 @@ Use the code navigation tools to inspect its source code and determine if it dir
             Dictionary mapping function_name -> (ext_input, reason) tuple
         """
         logger.info(f"Starting external input analysis for {len(function_names)} functions "
-                    f"(workers={self.max_workers}, rate_limit={self.rate_limiter._max_rpm}/min, "
+                    f"(workers={self.max_workers}, rate_limit={self.rate_limiter.max_requests_per_minute}/{self.rate_limiter.window_seconds}s, "
                     f"batch_size={self.batch_size})")
 
         # Pre-fetch all function bodies
@@ -671,16 +646,28 @@ Use the code navigation tools to inspect its source code and determine if it dir
         bodies = self._prefetch_function_bodies(function_names)
         logger.info(f"Pre-fetched {len(bodies)} function bodies")
 
-        # Create batches respecting token budget
+        # Immediately resolve functions with no source — skip LLM for these
+        results: Dict[str, Tuple[bool, str]] = {}
+        for name in function_names:
+            if bodies.get(name) is None:
+                results[name] = (False, "No source code available in analyzed repo")
+                if self._on_result_callback:
+                    self._on_result_callback(name, False, "No source code available in analyzed repo")
+
+        analyzable_count = len(function_names) - len(results)
+        if results:
+            logger.info(f"Skipped {len(results)} functions with no source code; "
+                        f"analyzing {analyzable_count} functions via LLM")
+
+        # Create batches respecting token budget (only functions with source)
         batches = self._create_batches(function_names, bodies)
-        logger.info(f"Created {len(batches)} batches (avg {len(function_names)/max(len(batches),1):.1f} functions/batch)")
+        logger.info(f"Created {len(batches)} batches (avg {analyzable_count/max(len(batches),1):.1f} functions/batch)")
 
         # Queue up batches
         queue: asyncio.Queue = asyncio.Queue()
         for batch in batches:
             queue.put_nowait(batch)
 
-        results: Dict[str, Tuple[bool, str]] = {}
         total = len(function_names)
         workers = [
             asyncio.create_task(self._batch_worker(queue, results, total))

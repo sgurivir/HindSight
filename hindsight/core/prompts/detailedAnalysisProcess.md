@@ -14,7 +14,7 @@ You have contextual tools available to explore the repository.
 ### Tool Decision Flow
 
 ```
-Need context? → getDirectoryListing (check size)
+Need context? → checkFileSize (check size)
 ├── Need quick context only? → getSummaryOfFile
 ├── Is it a small standalone file? → readFile
 └── Need to search/explore? → runTerminalCmd
@@ -23,23 +23,23 @@ Need context? → getDirectoryListing (check size)
 Each tool call \*\*must include a \*\*\`\` describing why it's needed.
 
 **CRITICAL TOOL USAGE PRIORITY:**
-1. **ALWAYS use `getDirectoryListing` FIRST** to check file sizes before reading any files
+1. **ALWAYS use `checkFileSize` FIRST** to check file sizes before reading any files
 2. Use `getSummaryOfFile` to quickly understand a file's purpose and context before deeper analysis
 3. Use `readFile` for reading source files, headers, config files, etc.
 4. Use `runTerminalCmd` for exploration and searching (including grep for finding files by content)
 
 
-**Example Usage**: Call the getDirectoryListing tool with the directory path and reason.
+**Example Usage**: Call the checkFileSize tool with the file path and reason.
 
 **Expected Output**:
 ```
-Directory listing for 'core/llm' (use this to understand file sizes before reading files):
-core/llm/
-|-- __init__.py Size : (120 chars)
-|-- codeAnalysis.py Size : (15420 chars)
-|-- llm.py Size : (8950 chars)
-|-- tools.py Size : (45600 chars)
-|-- ttl_manager.py Size : (3200 chars)
+{
+  "exists": true,
+  "file_path": "core/llm/tools.py",
+  "size_bytes": 45600,
+  "line_count": 1200,
+  "recommended_for_readFile": false
+}
 ```
 
 **File Size Guidelines**:
@@ -48,7 +48,7 @@ core/llm/
 - **Large files** (20,000 - 80,000 chars): Use getSummaryOfFile instead of readFile
 - **Very large files** (> 80,000 chars): Always use getSummaryOfFile, never readFile
 
-**CRITICAL**: Always use checkFileSize (or getDirectoryListing) before readFile or getFileContentByLines to avoid "file too large" errors and out-of-bounds line number errors that interrupt analysis. The checkFileSize tool returns line_count which should be used to validate line ranges for getFileContentByLines. If a file is not found, use `list_files` on the parent directory to discover actual filenames.
+**CRITICAL**: Always use checkFileSize before readFile or getFileContentByLines to avoid "file too large" errors and out-of-bounds line number errors that interrupt analysis. The checkFileSize tool returns line_count which should be used to validate line ranges for getFileContentByLines. If a file is not found, use `list_files` on the parent directory to discover actual filenames.
 
 ### getSummaryOfFile Tool (Context)
 **Purpose**: Retrieve file summary using ProjectSummaryGenerator for quick understanding of file purpose and context
@@ -121,27 +121,27 @@ All terminal commands MUST stay within the repository root. Commands that search
 
 ```
 Need to understand code?
-├── FIRST: Check file sizes → Use getDirectoryListing with path
+├── FIRST: Check file sizes → Use checkFileSize with path
 ├── Need quick context about a file?
 │   ├── YES → Use getSummaryOfFile with file path
 │   └── NO → Continue to next question
 ├── Is it a specific file (header, config, build file)?
-│   ├── YES → Check size first with getDirectoryListing, then readFile if small enough
+│   ├── YES → Check size first with checkFileSize, then readFile if small enough
 │   └── NO → Continue to next question
 ├── Need to search/explore/find class names?
 │   └── YES → Use runTerminalCmd
-└── If unsure → Use getDirectoryListing first, then getSummaryOfFile, then readFile if needed
+└── If unsure → Use checkFileSize first, then getSummaryOfFile, then readFile if needed
 ```
 
 **Common Scenarios:**
-- **Before any file reading** → `getDirectoryListing` with directory/file path
-- **Analyzing a function in a class** → `getDirectoryListing` first, then `readFile` with file path
-- **Understanding class behavior** → `getDirectoryListing` first, then `readFile` with file path
-- **Quick file context** → `getDirectoryListing` first, then `getSummaryOfFile` with file path
-- **Checking header files** → `getDirectoryListing` first, then `readFile` with header path (if small enough)
-- **Reading config/build files** → `getDirectoryListing` first, then `readFile` with file path (if small enough)
+- **Before any file reading** → `checkFileSize` with file path
+- **Analyzing a function in a class** → `checkFileSize` first, then `readFile` with file path
+- **Understanding class behavior** → `checkFileSize` first, then `readFile` with file path
+- **Quick file context** → `checkFileSize` first, then `getSummaryOfFile` with file path
+- **Checking header files** → `checkFileSize` first, then `readFile` with header path (if small enough)
+- **Reading config/build files** → `checkFileSize` first, then `readFile` with file path (if small enough)
 - **Finding class names** → `runTerminalCmd` with grep/find
-- **Exploring project structure** → `getDirectoryListing` with directory path or `runTerminalCmd` with ls/tree
+- **Exploring project structure** → `list_files` with directory path or `runTerminalCmd` with ls/tree
 
 **Every tool call must include a `reason`: why context is insufficient and what the tool will clarify.**
 Only use tools when needed to confirm safeguards, frequency, or severity.

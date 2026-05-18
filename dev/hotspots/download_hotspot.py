@@ -37,8 +37,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # API Configuration Constants
 BASE_URL = "https://spindistill.apple.com/api/v2/hotspots"
-COOKIE_COMMAND = "appleconnect serviceTicket -I 200005 -d -n"
-COOKIE_TTL_SECONDS = 3600
+OAUTH_CLIENT_ID = "tilsq8cij8xp4lym6ws5lpsrjpyhuv"
+OAUTH_SCOPES = "openid profile email phone dsid adsid accountname roles groups extended_profile offline_access"
+TOKEN_COMMAND = f'appleconnect getToken -t oauth -C {OAUTH_CLIENT_ID} -o "{OAUTH_SCOPES}" -G pkce'
+TOKEN_TTL_SECONDS = 3600
 REQUEST_TIMEOUT_SECONDS = 30
 JSON_INDENT_SPACES = 2
 SSL_VERIFY = False  # Disable SSL verification for internal Apple API
@@ -47,7 +49,7 @@ SSL_VERIFY = False  # Disable SSL verification for internal Apple API
 DEFAULT_OUTPUT_DIR = "/tmp"
 
 # Default parameter values
-DEFAULT_DATASET = "NapiliD_Seed_3_(23S5611c)"
+DEFAULT_DATASET = "NapiliF_Seed_3_(23T5558e)"
 DEFAULT_PROCESS = "locationd"
 DEFAULT_DEVICE = "N210"
 DEFAULT_CONTEXT_FILTER = "Unplugged"
@@ -60,9 +62,9 @@ class HotspotDownloader:
     A client for downloading hotspot data from Apple's SpinDistill API.
     """
 
-    # Cookie caching
-    _cached_cookie: Optional[str] = None
-    _cookie_timestamp: Optional[float] = None
+    # Token caching
+    _cached_token: Optional[str] = None
+    _token_timestamp: Optional[float] = None
 
     def __init__(self,
                  daemon: str,
@@ -96,22 +98,26 @@ class HotspotDownloader:
         self.ssl_verify = ssl_verify
 
     @staticmethod
-    def _execute_cookie_command() -> str:
-        """Execute the Apple Connect cookie command and return the cookie value."""
+    def _execute_token_command() -> str:
+        """Execute the OAuth token command and return the id-token."""
         try:
             result = subprocess.run(
-                COOKIE_COMMAND.split(),
+                TOKEN_COMMAND,
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                shell=True
             )
-            cookie = result.stdout.strip()
-            if not cookie:
-                raise ValueError("Empty cookie received from Apple Connect command")
-            return cookie
+            for line in result.stdout.strip().splitlines():
+                if line.startswith("oauth-id-token:"):
+                    token = line.split(" ", 1)[1].strip()
+                    if not token:
+                        raise ValueError("Empty token received from command")
+                    return token
+            raise ValueError("No oauth-id-token found in command output")
         except subprocess.CalledProcessError as e:
             raise RuntimeError(
-                f"Failed to get authentication cookie. "
+                f"Failed to get OAuth token. "
                 f"Ensure Apple Connect is installed and configured.\n"
                 f"Error: {e}"
             )
@@ -121,24 +127,22 @@ class HotspotDownloader:
                 "Please install Apple Connect and ensure it's in your PATH."
             )
         except Exception as e:
-            raise RuntimeError(f"Error executing cookie command: {e}")
+            raise RuntimeError(f"Error executing token command: {e}")
 
     @classmethod
-    def _get_cached_cookie(cls) -> str:
-        """Get cached cookie or fetch a new one if expired."""
+    def _get_cached_token(cls) -> str:
+        """Get cached token or fetch a new one if expired."""
         current_time = time.time()
 
-        # Check if we have a valid cached cookie
-        if (cls._cached_cookie and
-            cls._cookie_timestamp and
-            (current_time - cls._cookie_timestamp) < COOKIE_TTL_SECONDS):
-            return cls._cached_cookie
+        if (cls._cached_token and
+            cls._token_timestamp and
+            (current_time - cls._token_timestamp) < TOKEN_TTL_SECONDS):
+            return cls._cached_token
 
-        # Fetch new cookie and cache it
-        print("Authenticating with Apple Connect...")
-        cls._cached_cookie = cls._execute_cookie_command()
-        cls._cookie_timestamp = current_time
-        return cls._cached_cookie
+        print("Authenticating with Apple Connect (OAuth)...")
+        cls._cached_token = cls._execute_token_command()
+        cls._token_timestamp = current_time
+        return cls._cached_token
 
     def _ensure_output_directory(self) -> None:
         """Ensure the output directory exists."""
@@ -166,7 +170,6 @@ class HotspotDownloader:
                 verify=self.ssl_verify
             )
             response.raise_for_status()
-            return response.json()
         except requests.exceptions.Timeout:
             raise RuntimeError(f"Request timed out after {REQUEST_TIMEOUT_SECONDS} seconds")
         except requests.exceptions.ConnectionError:
@@ -175,11 +178,18 @@ class HotspotDownloader:
                 "Check your network connection and VPN status."
             )
         except requests.exceptions.HTTPError as e:
-            raise RuntimeError(f"HTTP error: {e}")
+            raise RuntimeError(f"HTTP error: {e}\nResponse body:\n{e.response.text[:500]}")
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Request failed: {e}")
-        except json.JSONDecodeError as e:
-            raise RuntimeError(f"Failed to parse JSON response: {e}")
+
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            preview = response.text[:500]
+            raise RuntimeError(
+                f"API returned non-JSON response (status {response.status_code}).\n"
+                f"Response preview:\n{preview}"
+            )
 
     def _build_data_url(self) -> str:
         """Build the data URL with configurable parameters."""
@@ -195,9 +205,9 @@ class HotspotDownloader:
         return f"{BASE_URL}/data?{urlencode(params)}"
 
     def _get_authentication_headers(self) -> Dict[str, str]:
-        """Get authentication headers with cookie."""
-        cookie = self._get_cached_cookie()
-        return {"Cookie": f"acack={cookie}"}
+        """Get authentication headers with OAuth Bearer token."""
+        token = self._get_cached_token()
+        return {"Authorization": f"Bearer {token}"}
 
     def download(self) -> str:
         """

@@ -13,10 +13,12 @@ Usage:
 import os
 import sys
 import json
+import asyncio
 import argparse
 import subprocess
 import tempfile
 import shutil
+import threading
 import traceback
 from pathlib import Path
 from datetime import datetime
@@ -32,7 +34,7 @@ from ..analyzers.analysis_runner_mixins import UnifiedIssueFilterMixin, ReportGe
 from ..issue_filter.unified_issue_filter import create_unified_filter
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
 from ..core.llm.diff_analysis import DiffAnalysis, DiffAnalysisConfig
-from ..core.constants import MAX_CHARACTERS_PER_DIFF_ANALYSIS, DEFAULT_NUM_BLOCKS_TO_ANALYZE, DEFAULT_LLM_MODEL, MAX_FILES_PER_DIFF_CHUNK, DEFAULT_LLM_API_END_POINT, MAX_SUPPORTED_FILE_COUNT, MAX_FUNCTION_BODY_LENGTH, DEFAULT_MAX_TOKENS
+from ..core.constants import MAX_CHARACTERS_PER_DIFF_ANALYSIS, DEFAULT_NUM_BLOCKS_TO_ANALYZE, DEFAULT_LLM_MODEL, MAX_FILES_PER_DIFF_CHUNK, DEFAULT_LLM_API_END_POINT, MAX_SUPPORTED_FILE_COUNT, MAX_FUNCTION_BODY_LENGTH, DEFAULT_MAX_TOKENS, DIFF_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT, LLM_PROVIDER_RATE_WINDOW_SECONDS
 from ..core.errors import AnalyzerErrorCode, AnalysisResult
 from ..core.proj_util.file_or_directory_summary_generator import FileOrDirectorySummaryGenerator
 from ..core.prompts.prompt_builder import PromptBuilder
@@ -45,6 +47,9 @@ from ..core.errors import AnalyzerErrorCode, AnalysisResult
 
 from ..results_store.code_analysis_publisher import CodeAnalysisResultsPublisher
 from ..results_store.code_analysys_results_local_fs_subscriber import CodeAnalysysResultsLocalFSSubscriber
+
+from ..core.async_infra import RateLimiter, run_worker_pool
+from ..core.mcp_tools.analysis_server import AnalysisMCPServer
 
 
 class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, BaseDiffAnalyzer):
@@ -520,54 +525,86 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                                      ast_artifacts: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Analyze each affected function using LLM with diff context.
-        
-        Similar to CodeAnalysisRunner._run_code_analysis() but with diff-specific prompts.
-        
+
+        Uses an async worker pool for parallel analysis. With max_workers=1,
+        behavior is identical to the previous sequential loop.
+
         Args:
             affected_functions: List of affected function info dicts
             all_changed_files: List of all changed files in the commit
             changed_lines_per_file: Changed lines per file from diff parsing
             ast_artifacts: AST artifacts for context
-            
+
         Returns:
             List of all issues found across all functions
         """
-        all_issues = []
         total_functions = len(affected_functions)
-        
+
         api_key = get_api_key_from_config(self.config)
         if not api_key:
             self.logger.error("No API key available for function analysis")
             return []
-        
+
         self._initialize_unified_issue_filter_for_diff(api_key)
 
         llm_provider_type = get_llm_provider_type(self.config)
         api_url = self.config.get('api_url') or self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT)
-        
-        diff_config = DiffAnalysisConfig(
-            api_key=api_key,
-            api_url=api_url,
-            model=self.config.get('model', DEFAULT_LLM_MODEL),
-            repo_path=str(self.repo_checkout_dir),
-            output_file="",  # Not used in two-stage flow
-            max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
-            config=self.config,
-            file_content_provider=getattr(self, 'file_content_provider', None),
+
+        # Determine worker count from config (default: DIFF_ANALYZER_DEFAULT_WORKERS)
+        max_workers = self.config.get('diff_analyzer_workers', DIFF_ANALYZER_DEFAULT_WORKERS)
+        rate_limit = self.config.get('diff_analyzer_rate_limit', LLM_PROVIDER_RATE_LIMIT)
+        rate_window = self.config.get('diff_analyzer_rate_window_seconds', LLM_PROVIDER_RATE_WINDOW_SECONDS)
+
+        self.logger.info(
+            f"Analyzing {total_functions} affected functions with "
+            f"max_workers={max_workers}, rate_limit={rate_limit} RPM"
         )
 
-        for i, func_info in enumerate(affected_functions, 1):
+        # Create the AnalysisMCPServer (full tools for Stage Da)
+        from ..utils.output_directory_provider import get_output_directory_provider
+        try:
+            output_provider = get_output_directory_provider()
+            artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
+        except RuntimeError:
+            artifacts_dir = None
+
+        ignore_dirs = set(self.config.get('exclude_directories', []))
+
+        directory_tree_util = None
+        try:
+            from ..utils.directory_tree_util import DirectoryTreeUtil
+            directory_tree_util = DirectoryTreeUtil()
+        except Exception:
+            pass
+
+        mcp_server = AnalysisMCPServer(
+            repo_path=str(self.repo_checkout_dir),
+            file_content_provider=getattr(self, 'file_content_provider', None),
+            artifacts_dir=artifacts_dir,
+            directory_tree_util=directory_tree_util,
+            ignore_dirs=ignore_dirs,
+        )
+
+        # Thread-safe collection of results
+        all_issues: List[Dict[str, Any]] = []
+        issues_lock = threading.Lock()
+
+        # Build indexed items: (index, func_info) for ordering prompt logging
+        indexed_functions = list(enumerate(affected_functions, 1))
+
+        # Define the async worker function for a single function
+        async def _analyze_one_function(item: Tuple[int, Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+            """Analyze a single affected function (runs in worker pool)."""
+            idx, func_info = item
             func_name = func_info.get('function', 'unknown')
             file_path = func_info.get('file', 'unknown')
-            
-            self.logger.info(f"Analyzing function {i}/{total_functions}: {func_name} in {file_path}")
-            
-            # Start issue-specific prompt logging for this function
-            # This creates a numbered subdirectory (e.g., prompts_sent/1/, prompts_sent/2/)
-            # to prevent prompts from being overwritten when analyzing multiple functions
+
+            self.logger.info(f"Analyzing function {idx}/{total_functions}: {func_name} in {file_path}")
+
+            # Issue-specific prompt logging
             from ..core.llm.llm import Claude
-            Claude.start_issue_logging(i)
-            
+            Claude.start_issue_logging(idx)
+
             try:
                 prompt_data = self._build_function_diff_prompt(
                     func_info,
@@ -575,55 +612,122 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                     changed_lines_per_file,
                     ast_artifacts
                 )
-                
+
                 if not prompt_data:
                     self.logger.warning(f"Could not build prompt for function {func_name}")
-                    continue
+                    return None
 
-                diff_analyzer = DiffAnalysis(diff_config)
-                self._last_analysis = diff_analyzer
+                # Each worker creates its own DiffAnalysis instance with the shared MCP server
+                diff_config = DiffAnalysisConfig(
+                    api_key=api_key,
+                    api_url=api_url,
+                    model=self.config.get('model', DEFAULT_LLM_MODEL),
+                    repo_path=str(self.repo_checkout_dir),
+                    output_file="",
+                    max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
+                    config=self.config,
+                    file_content_provider=getattr(self, 'file_content_provider', None),
+                    mcp_server=mcp_server,
+                )
 
-                # Stage Da: Collect diff context
-                diff_context_bundle = diff_analyzer.run_diff_context_collection(prompt_data)
-                if diff_context_bundle is None:
-                    self.logger.warning(f"Stage Da failed for {func_name} - skipping Stage Db")
-                    continue
+                # Run the synchronous LLM calls in an executor thread
+                loop = asyncio.get_running_loop()
+                issues = await loop.run_in_executor(
+                    None,
+                    self._run_single_function_analysis,
+                    diff_config, prompt_data, func_name
+                )
 
-                # Stage Db: Analyze from context
-                issues = diff_analyzer.run_diff_analysis_from_context(diff_context_bundle)
+                # Track tokens
+                # Note: token tracking happens inside _run_single_function_analysis
 
-                if self.token_tracker and hasattr(diff_analyzer, 'get_token_totals'):
-                    try:
-                        input_tokens, output_tokens = diff_analyzer.get_token_totals()
-                        if input_tokens > 0 or output_tokens > 0:
-                            self.token_tracker.add_token_usage(input_tokens, output_tokens)
-                            self.logger.debug(f"Function {func_name} token usage: {input_tokens} input, {output_tokens} output")
-                    except Exception as e:
-                        self.logger.warning(f"Failed to record token usage for {func_name}: {e}")
-                
                 if issues:
                     if self.unified_issue_filter:
                         filtered_issues = self.unified_issue_filter.filter_issues(issues)
                         if len(filtered_issues) != len(issues):
                             self.logger.info(f"Function {func_name}: filtered {len(issues) - len(filtered_issues)} issues")
                         issues = filtered_issues
-                    
-                    all_issues.extend(issues)
+
+                    with issues_lock:
+                        all_issues.extend(issues)
                     self.logger.info(f"Function {func_name}: found {len(issues)} issues")
                 else:
                     self.logger.info(f"Function {func_name}: no issues found")
-                    
+
+                return issues
+
             except Exception as e:
                 self.logger.error(f"Error analyzing function {func_name}: {e}")
                 self.logger.error(f"Full traceback: {traceback.format_exc()}")
-                continue
+                return None
             finally:
-                # End issue-specific prompt logging for this function
-                # This resets the issue tracking so the next function gets its own directory
                 Claude.end_issue_logging()
-        
+
+        # Define error handler for the worker pool
+        def _on_error(item: Tuple[int, Dict[str, Any]], exc: Exception) -> None:
+            idx, func_info = item
+            func_name = func_info.get('function', 'unknown')
+            self.logger.error(f"Worker pool error for function {func_name}: {exc}")
+
+        # Run the async worker pool
+        rate_limiter = RateLimiter(max_requests=rate_limit, window_seconds=rate_window)
+
+        async def _run_pool():
+            await run_worker_pool(
+                items=indexed_functions,
+                worker_fn=_analyze_one_function,
+                max_workers=max_workers,
+                rate_limiter=rate_limiter,
+                on_error=_on_error,
+            )
+
+        asyncio.run(_run_pool())
+
         self.logger.info(f"Function-level analysis complete: {len(all_issues)} total issues from {total_functions} functions")
         return all_issues
+
+    def _run_single_function_analysis(
+        self,
+        diff_config: 'DiffAnalysisConfig',
+        prompt_data: Dict[str, Any],
+        func_name: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Run Stage Da + Stage Db for a single function (synchronous, thread-safe).
+
+        This method is called from run_in_executor and performs the actual LLM calls.
+
+        Args:
+            diff_config: DiffAnalysisConfig with mcp_server set
+            prompt_data: Prompt data for the function
+            func_name: Function name (for logging)
+
+        Returns:
+            List of issues or None on failure
+        """
+        diff_analyzer = DiffAnalysis(diff_config)
+        self._last_analysis = diff_analyzer
+
+        # Stage Da: Collect diff context
+        diff_context_bundle = diff_analyzer.run_diff_context_collection(prompt_data)
+        if diff_context_bundle is None:
+            self.logger.warning(f"Stage Da failed for {func_name} - skipping Stage Db")
+            return None
+
+        # Stage Db: Analyze from context
+        issues = diff_analyzer.run_diff_analysis_from_context(diff_context_bundle)
+
+        # Track token usage (thread-safe via token_tracker's internal lock or external lock)
+        if self.token_tracker and hasattr(diff_analyzer, 'get_token_totals'):
+            try:
+                input_tokens, output_tokens = diff_analyzer.get_token_totals()
+                if input_tokens > 0 or output_tokens > 0:
+                    self.token_tracker.add_token_usage(input_tokens, output_tokens)
+                    self.logger.debug(f"Function {func_name} token usage: {input_tokens} input, {output_tokens} output")
+            except Exception as e:
+                self.logger.warning(f"Failed to record token usage for {func_name}: {e}")
+
+        return issues
 
     def _build_function_diff_prompt(self, func_info: Dict[str, Any],
                                      all_changed_files: List[str],
@@ -988,6 +1092,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
 
                 deduper = IssueDeduper(
                     artifacts_dir=artifacts_dir,
+                    analyzer_type="diff_analysis",
                     threshold=self.config.get('dedupe_threshold', 0.85)
                 )
                 
@@ -1208,7 +1313,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             # Step 2.5.0: Setup conversation logging directory EARLY (before DirectoryClassifier uses LLM)
             # This must happen before any LLM calls to ensure conversation logging is available
             from ..core.llm.llm import Claude
-            Claude.setup_prompts_logging()
+            Claude.setup_prompts_logging("diff_analysis")
             Claude.clear_older_prompts()
             self.logger.info("Setup conversation logging directory and cleared older prompts (early setup before DirectoryClassifier)")
 
