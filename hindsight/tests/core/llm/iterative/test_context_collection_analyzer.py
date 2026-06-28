@@ -220,13 +220,37 @@ class TestContextCollectionAnalyzerGetFallbackGuidance:
     def test_fallback_guidance_mentions_primary_function(self):
         """Test that fallback guidance mentions the required structure."""
         guidance = self.analyzer.get_fallback_guidance()
-        
+
         assert "primary_function" in guidance
         assert "JSON" in guidance
 
     def test_fallback_guidance_mentions_object_not_array(self):
         """Test that fallback guidance clarifies object vs array."""
         guidance = self.analyzer.get_fallback_guidance()
-        
+
         # Should mention that we need an object, not an array
         assert "object" in guidance.lower() or "{" in guidance
+
+    def test_fallback_guidance_includes_schema_and_correct_example(self):
+        """Guidance must surface the canonical schema and a CORRECT example."""
+        guidance = self.analyzer.get_fallback_guidance()
+
+        assert "Required schema" in guidance
+        assert "CORRECT" in guidance
+        # Schema fields should be enumerated
+        for field in ("schema_version", "callees", "callers", "data_types",
+                      "constants_and_globals", "collection_notes"):
+            assert field in guidance, f"missing required field {field!r} in guidance"
+
+    def test_fallback_guidance_includes_wrong_example(self):
+        """Guidance must show a WRONG example (missing wrapper)."""
+        guidance = self.analyzer.get_fallback_guidance()
+
+        assert "WRONG" in guidance
+
+    def test_fallback_guidance_embeds_validation_reason(self):
+        """When given a validation reason, the guidance must repeat it verbatim."""
+        reason = "got a JSON dict with top-level keys ['function_name', 'class_name']"
+        guidance = self.analyzer.get_fallback_guidance(validation_reason=reason)
+
+        assert reason in guidance, "validation_reason must appear verbatim in guidance"

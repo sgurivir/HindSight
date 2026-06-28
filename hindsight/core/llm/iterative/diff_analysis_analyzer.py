@@ -127,19 +127,59 @@ class DiffAnalysisAnalyzer(BaseIterativeAnalyzer):
         # All items must be dicts (issue objects)
         return all(isinstance(item, dict) for item in parsed_json)
     
-    def get_fallback_guidance(self) -> str:
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
         """
         Get diff analysis-specific guidance for JSON output.
-        
+
+        Args:
+            validation_reason: Optional description of what was wrong with the
+                previous response. Embedded verbatim so the LLM knows exactly
+                what to fix.
+
         Returns:
-            Guidance message for producing an issues array
+            Guidance message that includes the canonical issue-array schema
+            and CORRECT examples (one issue + empty array).
         """
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid issues array. "
-            "You MUST respond with ONLY a valid JSON array of issue objects. "
+            "CRITICAL: Your previous response did not contain a valid diff issues array.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON ARRAY of issue objects. "
+            "Each item must be a JSON OBJECT (dict), not a string. "
+            "Focus on issues in CHANGED lines (marked with `+` prefix in the diff). "
+            "If no issues are found in the changed lines, return exactly `[]` — empty is VALID.\n\n"
+            "### Required schema (each item)\n"
+            "```json\n"
+            "{\n"
+            '  "file_path": "string — path/to/file.ext",\n'
+            '  "file_name": "string — file.ext",\n'
+            '  "function_name": "string — functionName",\n'
+            '  "line_number": "string — \\"123\\" (must reference a changed/`+` line)",\n'
+            '  "severity": "string — high | medium | low",\n'
+            '  "issue": "string — brief description",\n'
+            '  "description": "string — detailed explanation tied to the diff change",\n'
+            '  "suggestion": "string — how to fix",\n'
+            '  "category": "string — e.g. logicBug | concurrency | memory | api",\n'
+            '  "issueType": "string — e.g. logicBug | concurrency | memory | api"\n'
+            "}\n"
+            "```\n\n"
+            "### CORRECT example (one issue introduced by the diff)\n"
+            "```json\n"
+            '[{"file_path": "src/Auth.swift", "file_name": "Auth.swift", '
+            '"function_name": "Auth.signIn", "line_number": "57", "severity": "high", '
+            '"issue": "Token comparison made non-constant-time by new fast-path", '
+            '"description": "Newly added `if token == expected` short-circuits and leaks timing.", '
+            '"suggestion": "Use a constant-time comparator on every code path.", '
+            '"category": "concurrency", "issueType": "concurrency"}]\n'
+            "```\n\n"
+            "### CORRECT example (no issues in the diff)\n"
+            "```json\n"
+            "[]\n"
+            "```\n\n"
             "Your response MUST start with `[` and end with `]`. "
-            "Each item in the array must be a JSON object (dict) representing a diff issue. "
-            "Focus on issues in changed lines (marked with + prefix). "
-            "If no issues found, return exactly: [] "
-            "No markdown, no prose, no explanatory text. Return the JSON array now."
+            "Return JSON ONLY — no markdown fences, no prose, no analysis text outside the array."
         )

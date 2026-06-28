@@ -192,6 +192,39 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             'results_dir': os.path.join(trace_analysis_dir, "trace_analysis")
         }
 
+    def _is_callstack_cached(self, callstack_index: int, callstack: list) -> bool:
+        """Check whether this callstack already has analysis results cached.
+
+        Returns True if cached (the LLM analysis can be skipped), False otherwise.
+        Logs the same skip messages as the inline check inside
+        _analyze_single_callstack so visibility is preserved.
+        """
+        try:
+            from ..core.trace_util.trace_analysis_prompt_builder import TraceAnalysisPromptBuilder
+            temp_builder = TraceAnalysisPromptBuilder()
+            callstack_text = temp_builder._convert_callstack_to_text_format(callstack)
+
+            trace_id = f"trace_{callstack_index+1:04d}"
+
+            with self._registry_lock:
+                if self.analyzed_records_registry and callstack_text and self.analyzed_records_registry.is_analyzed(callstack_text):
+                    self.logger.info(f"Skipping {trace_id} as it has already been analyzed")
+                    return True
+
+            if self.results_publisher:
+                callstack_list = []
+                if callstack_text:
+                    callstack_list = [line.strip() for line in callstack_text.split('\n') if line.strip()]
+
+                if self.results_publisher.check_existing_trace(trace_id, callstack_list):
+                    self.logger.info(f"Skipping {trace_id} - trace already exists in prior result stores")
+                    return True
+        except Exception as e:
+            self.logger.warning(f"Cache check failed for callstack {callstack_index}: {e}")
+            return False
+
+        return False
+
     def _analyze_single_callstack(self, callstack_index: int, callstack: list, prompt_content: str, callstack_data: dict, trace_analysis_out_dir: str) -> bool:
         """
         Analyze a single callstack directly without using prompt files.
@@ -725,9 +758,23 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
         async def _analyze_callstack_async(
             item: Tuple[int, list, str, dict],
         ) -> bool:
-            """Async worker: analyze a single callstack in a thread executor."""
+            """Async worker: analyze a single callstack in a thread executor.
+
+            The rate limiter is acquired only when an LLM call will actually run.
+            Cached callstacks bypass it so they don't burn rate-limit slots.
+            """
             callstack_index, callstack, prompt_content, callstack_data = item
             loop = asyncio.get_running_loop()
+
+            # Cache check is a local lookup — no rate limiting.
+            is_cached = await loop.run_in_executor(
+                None, runner_self._is_callstack_cached, callstack_index, callstack
+            )
+            if is_cached:
+                return True
+
+            # Cache miss — gate the LLM call behind the rate limiter.
+            await rate_limiter.acquire()
 
             def _sync_analyze() -> bool:
                 return runner_self._analyze_single_callstack(
@@ -777,7 +824,6 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                 items=work_items,
                 worker_fn=_analyze_callstack_async,
                 max_workers=TRACE_ANALYZER_DEFAULT_WORKERS,
-                rate_limiter=rate_limiter,
                 on_result=_on_result,
                 on_error=_on_error,
             )

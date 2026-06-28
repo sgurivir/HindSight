@@ -995,3 +995,128 @@ YOUR ENTIRE RESPONSE MUST BE VALID JSON - START WITH [ AND END WITH ]
             logger.error(f"Diff Analysis: Unexpected error: {e}")
             self.claude.log_complete_conversation(final_result=f"Error: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # Diff call-tree analysis (one LLM run per tree of affected functions).
+    # ------------------------------------------------------------------
+
+    def run_diff_call_tree_analysis(
+        self,
+        tree_dict: Dict[str, Any],
+        diff_context: Dict[str, Any],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Analyze an entire diff call tree in a single LLM run.
+
+        Replaces per-function Stage Da+Db for the diff pipeline. The
+        orchestrator clusters affected functions into trees rooted at the
+        highest affected ancestor, fills each node with diff-marked source,
+        and hands the whole bundle here.
+
+        Args:
+            tree_dict: Output of ``CallTree.to_dict()`` (schema 2.0). Each
+                node's ``source`` is diff-marked (`+ ` / `- ` / `  ` prefixes)
+                and carries ``is_modified`` + ``changed_lines`` keys.
+            diff_context: ``{"all_changed_files": [...], "changed_lines_per_file": {...}}``
+
+        Returns:
+            List of issue dicts on success, ``None`` on failure.
+        """
+        from ..prompts.prompt_builder import PromptBuilder
+
+        root = (tree_dict.get("root") or {}).get("function", "unknown")
+        logger.info(f"Diff Call-Tree Analysis: Starting for root {root}")
+        start_time = time.time()
+
+        user_provided_prompts = None
+        if self.config.config and isinstance(self.config.config, dict):
+            user_provided_prompts = self.config.config.get("user_provided_prompts")
+
+        try:
+            system_prompt, user_prompt = PromptBuilder.build_diff_call_tree_prompt(
+                tree_dict=tree_dict,
+                diff_context=diff_context,
+                config=self.config.config,
+                user_provided_prompts=user_provided_prompts,
+            )
+        except Exception as e:
+            logger.error(f"Diff Call-Tree Analysis: Failed to build prompt: {e}")
+            return None
+
+        if not self.claude.check_token_limit(system_prompt, user_prompt):
+            logger.error(
+                "Diff Call-Tree Analysis: Input exceeds token limits for root %s "
+                "(%d nodes, %d total source chars) — aborting",
+                root,
+                (tree_dict.get("stats") or {}).get("node_count", 0),
+                (tree_dict.get("stats") or {}).get("total_chars", 0),
+            )
+            return None
+
+        self.claude.start_conversation("diff_call_tree_analysis", root)
+
+        supported_tools = [
+            "readFile",
+            "getFileContentByLines",
+            "getFileContent",
+            "checkFileSize",
+            "getSummaryOfFile",
+            "list_files",
+            "inspectDirectoryHierarchy",
+            "runTerminalCmd",
+        ]
+
+        # Reuse DiffAnalysisAnalyzer for stage-isolated JSON extraction —
+        # it correctly identifies issue arrays in mixed conversation output.
+        analyzer = DiffAnalysisAnalyzer(claude=self.claude)
+
+        try:
+            raw_result = analyzer.run_iterative_analysis(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                tools_executor=self,
+                supported_tools=supported_tools,
+                max_iterations=MAX_TOOL_ITERATIONS,
+                token_usage_callback=self._extract_and_log_token_usage,
+            )
+        except Exception as e:
+            logger.error(f"Diff Call-Tree Analysis: Iterative analysis raised: {e}")
+            self.claude.log_complete_conversation(final_result=f"Error: {e}")
+            return None
+
+        elapsed = time.time() - start_time
+        logger.info(f"Diff Call-Tree Analysis: Completed in {elapsed:.2f}s")
+
+        if not raw_result:
+            logger.error(f"Diff Call-Tree Analysis: No result from LLM for root {root}")
+            return None
+
+        try:
+            issues = json.loads(raw_result)
+        except json.JSONDecodeError as e:
+            logger.error(f"Diff Call-Tree Analysis: Invalid JSON: {e}")
+            return None
+
+        if not isinstance(issues, list):
+            if isinstance(issues, dict) and "results" in issues:
+                issues = issues["results"]
+            elif isinstance(issues, dict):
+                logger.warning("Diff Call-Tree Analysis: LLM returned a single dict; wrapping")
+                issues = [issues]
+            else:
+                logger.error(
+                    f"Diff Call-Tree Analysis: Expected list, got {type(issues)}"
+                )
+                return None
+
+        valid_issues = [i for i in issues if isinstance(i, dict)]
+        if len(valid_issues) != len(issues):
+            logger.warning(
+                f"Diff Call-Tree Analysis: Filtered out {len(issues) - len(valid_issues)} non-dict issues"
+            )
+
+        self.claude.log_complete_conversation(final_result=json.dumps(valid_issues))
+        self.tools.log_tool_usage_summary()
+        self._log_final_token_summary()
+
+        logger.info(f"Diff Call-Tree Analysis: Found {len(valid_issues)} issues for root {root}")
+        return valid_issues

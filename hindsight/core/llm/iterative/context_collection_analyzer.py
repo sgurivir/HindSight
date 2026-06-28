@@ -114,24 +114,73 @@ class ContextCollectionAnalyzer(BaseIterativeAnalyzer):
             return False
         return 'primary_function' in parsed_json
     
-    def get_fallback_guidance(self) -> str:
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
         """
         Get context collection-specific guidance for JSON output.
 
+        Args:
+            validation_reason: Optional description of what was wrong with the
+                previous response. Embedded verbatim so the LLM knows exactly
+                what to fix.
+
         Returns:
-            Guidance message for producing a context bundle
+            Guidance message that includes the canonical schema, a CORRECT
+            example, and a WRONG example highlighting the most common mistake
+            (omitting the `primary_function` wrapper).
         """
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid context bundle. "
-            "You MUST respond with ONLY a valid JSON object matching this EXACT structure:\n\n"
-            '{"schema_version": "1.0", "primary_function": {"function_name": "ClassName::methodName()", '
-            '"class_name": "ClassName", "file_path": "relative/path/to/File.swift", '
-            '"file_name": "File.swift", "language": "swift", '
-            '"start_line": 45, "end_line": 80, "source": "func methodName() { ... }"}, '
-            '"callees": [], "callers": [], "data_types": [], '
-            '"constants_and_globals": [], "collection_notes": []}\n\n'
-            "The 'primary_function' key wrapping the function data is MANDATORY. "
-            "Do NOT put function_name, file_path, or source at the top level. "
+            "CRITICAL: Your previous response did not contain a valid context bundle.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON OBJECT matching the EXACT schema below. "
+            "The `primary_function` key wrapping the function data is MANDATORY — do NOT put "
+            "`function_name`, `file_path`, `start_line`, etc. at the top level.\n\n"
+            "### Required schema\n"
+            "```json\n"
+            "{\n"
+            '  "schema_version": "1.0",\n'
+            '  "primary_function": {\n'
+            '    "function_name": "string — exact function/method name",\n'
+            '    "class_name": "string | null — enclosing class/struct, null if free function",\n'
+            '    "file_path": "string — relative path from repo root",\n'
+            '    "file_name": "string — filename with extension",\n'
+            '    "language": "string — e.g. swift, kotlin, python, cpp, java",\n'
+            '    "start_line": "integer — first line of the function in the source file",\n'
+            '    "end_line": "integer — last line of the function in the source file",\n'
+            '    "source": "string — full verbatim source of the function"\n'
+            "  },\n"
+            '  "callees": [ { "function_name": "string", "class_name": "string | null", '
+            '"file_path": "string", "file_name": "string", "start_line": 0, "end_line": 0, '
+            '"source": "string", "call_sites": [ { "line": 0, "expression": "string" } ] } ],\n'
+            '  "callers": [ { "function_name": "string", "class_name": "string | null", '
+            '"file_path": "string", "file_name": "string", "start_line": 0, "end_line": 0, '
+            '"source": "string" } ],\n'
+            '  "data_types": [ { "type_name": "string", "kind": "string", '
+            '"file_path": "string", "file_name": "string", "start_line": 0, "end_line": 0, '
+            '"source": "string" } ],\n'
+            '  "constants_and_globals": [ { "name": "string", "file_path": "string", '
+            '"file_name": "string", "line": 0, "source": "string" } ],\n'
+            '  "collection_notes": [ "string" ]\n'
+            "}\n"
+            "```\n\n"
+            "### CORRECT minimal example\n"
+            "```json\n"
+            '{"schema_version": "1.0", "primary_function": {"function_name": "MyClass::doWork", '
+            '"class_name": "MyClass", "file_path": "src/MyClass.swift", "file_name": "MyClass.swift", '
+            '"language": "swift", "start_line": 45, "end_line": 80, '
+            '"source": "func doWork() { ... }"}, '
+            '"callees": [], "callers": [], "data_types": [], "constants_and_globals": [], '
+            '"collection_notes": []}\n'
+            "```\n\n"
+            "### WRONG (do NOT do this — missing `primary_function` wrapper)\n"
+            "```json\n"
+            '{"function_name": "MyClass::doWork", "file_path": "src/MyClass.swift", '
+            '"start_line": 45, "end_line": 80, "source": "..."}\n'
+            "```\n\n"
             "Your response MUST start with `{` and end with `}`. "
-            "No markdown, no arrays, no prose. Return the JSON object now."
+            "Return JSON ONLY — no markdown fences, no arrays, no prose, no analysis."
         )

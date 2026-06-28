@@ -121,18 +121,43 @@ class TrivialFilterAnalyzer(BaseIterativeAnalyzer):
         
         return True
     
-    def get_fallback_guidance(self) -> str:
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
         """
         Get trivial filter-specific guidance for JSON output.
-        
+
+        Args:
+            validation_reason: Optional description of what was wrong with the
+                previous response.
+
         Returns:
-            Guidance message for producing a verdict dict
+            Guidance message that includes the canonical schema and CORRECT
+            examples for both verdicts.
         """
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid verdict. "
-            "You MUST respond with ONLY a valid JSON object containing your decision. "
-            "Your response MUST be a JSON object with 'result' (boolean) key. "
-            "Example for trivial issue: {\"result\": true} "
-            "Example for non-trivial issue: {\"result\": false} "
-            "No markdown, no prose, no explanatory text. Return the JSON object now."
+            "CRITICAL: Your previous response did not contain a valid verdict.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON OBJECT representing your decision. "
+            "It MUST contain a boolean `result`.\n\n"
+            "### Required schema\n"
+            "```json\n"
+            '{ "result": true }\n'
+            "```\n\n"
+            "Semantics:\n"
+            "- `result: true`  → the issue is TRIVIAL (filter it out).\n"
+            "- `result: false` → the issue is NOT trivial (keep it for further analysis).\n\n"
+            "### CORRECT example (trivial)\n"
+            "```json\n"
+            '{"result": true}\n'
+            "```\n\n"
+            "### CORRECT example (not trivial)\n"
+            "```json\n"
+            '{"result": false}\n'
+            "```\n\n"
+            "Your response MUST start with `{` and end with `}`. "
+            "Return JSON ONLY — no markdown fences, no prose."
         )

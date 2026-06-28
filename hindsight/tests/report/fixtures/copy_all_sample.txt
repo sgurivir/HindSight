@@ -1,0 +1,59 @@
+Title:
+Unsafe force-unwrap of optional response data crashes on malformed server reply
+
+Severity: critical
+Category: stability
+File: src/Network/Client.swift
+Function: sendRequest
+Lines: 120-145
+
+Impact:
+Calling .data! on a URLSession response that may be nil will trap and
+crash the process. This affects every code path that reaches sendRequest
+under a flaky network or when the server returns a 204 No Content.
+
+Evidence:
+let payload = response.data!.parsed()
+
+Potential Solution:
+Replace the force-unwrap with a guard let and surface a typed error to
+callers so the network layer fails gracefully instead of crashing.
+======================
+Title:
+Synchronous JSON decode on the main queue causes UI hitches
+
+Severity: high
+Category: performance
+File: src/Network/Decoder.swift
+Function: decodeResponse
+Lines: 47
+
+Impact:
+decodeResponse runs JSONDecoder().decode on the main queue. Large
+payloads (>200KB) consistently exceed the 16ms budget and produce
+visible scroll hitches in production traces.
+
+Evidence:
+return try JSONDecoder().decode(T.self, from: data)
+
+Potential Solution:
+Hop to a background queue for decoding and dispatch the result back to
+main only for UI updates.
+======================
+Title:
+DateFormatter constructed inside a tight loop
+
+Severity: medium
+Category: performance
+File: src/UI/SettingsView.swift
+Function: renderRows
+Lines: 88-104
+
+Impact:
+renderRows allocates a fresh DateFormatter per row. Constructing a
+DateFormatter is documented as expensive; profiling shows it accounts
+for 12% of the view's render time.
+
+Potential Solution:
+Cache the formatter as a static property on the view and reuse it
+across rows.

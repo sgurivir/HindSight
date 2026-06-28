@@ -22,7 +22,7 @@ import threading
 import traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
@@ -34,7 +34,8 @@ from ..analyzers.analysis_runner_mixins import UnifiedIssueFilterMixin, ReportGe
 from ..issue_filter.unified_issue_filter import create_unified_filter
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
 from ..core.llm.diff_analysis import DiffAnalysis, DiffAnalysisConfig
-from ..core.constants import MAX_CHARACTERS_PER_DIFF_ANALYSIS, DEFAULT_NUM_BLOCKS_TO_ANALYZE, DEFAULT_LLM_MODEL, MAX_FILES_PER_DIFF_CHUNK, DEFAULT_LLM_API_END_POINT, MAX_SUPPORTED_FILE_COUNT, MAX_FUNCTION_BODY_LENGTH, DEFAULT_MAX_TOKENS, DIFF_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT, LLM_PROVIDER_RATE_WINDOW_SECONDS
+from ..core.constants import MAX_CHARACTERS_PER_DIFF_ANALYSIS, DEFAULT_NUM_BLOCKS_TO_ANALYZE, DEFAULT_LLM_MODEL, MAX_FILES_PER_DIFF_CHUNK, DEFAULT_LLM_API_END_POINT, MAX_SUPPORTED_FILE_COUNT, MAX_FUNCTION_BODY_LENGTH, DEFAULT_MAX_TOKENS, DIFF_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT, LLM_PROVIDER_RATE_WINDOW_SECONDS, CALL_TREE_ANALYSIS_ENABLED, CALL_TREE_ANALYSIS_MAX_DEPTH, CALL_TREE_ANALYSIS_MAX_CHARS, CALL_TREE_ANALYSIS_MAX_NODES
+from ..core.call_tree import CallTreeBuilder, RootSelector
 from ..core.errors import AnalyzerErrorCode, AnalysisResult
 from ..core.proj_util.file_or_directory_summary_generator import FileOrDirectorySummaryGenerator
 from ..core.prompts.prompt_builder import PromptBuilder
@@ -523,6 +524,21 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                                      all_changed_files: List[str],
                                      changed_lines_per_file: Dict[str, Dict[str, List[int]]],
                                      ast_artifacts: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Dispatch between call-tree and legacy per-function analysis."""
+        if self.config.get('call_tree_analysis_enabled', CALL_TREE_ANALYSIS_ENABLED):
+            self.logger.info("Diff analysis: using call-tree pipeline (one LLM run per root)")
+            return self._analyze_affected_functions_as_call_trees(
+                affected_functions, all_changed_files, changed_lines_per_file, ast_artifacts
+            )
+        self.logger.info("Diff analysis: using legacy per-function pipeline")
+        return self._analyze_affected_functions_legacy(
+            affected_functions, all_changed_files, changed_lines_per_file, ast_artifacts
+        )
+
+    def _analyze_affected_functions_legacy(self, affected_functions: List[Dict[str, Any]],
+                                     all_changed_files: List[str],
+                                     changed_lines_per_file: Dict[str, Dict[str, List[int]]],
+                                     ast_artifacts: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Analyze each affected function using LLM with diff context.
 
@@ -728,6 +744,309 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                 self.logger.warning(f"Failed to record token usage for {func_name}: {e}")
 
         return issues
+
+    # ==================================================================
+    # Call-tree-at-once diff pipeline
+    # ==================================================================
+
+    def _analyze_affected_functions_as_call_trees(
+        self,
+        affected_functions: List[Dict[str, Any]],
+        all_changed_files: List[str],
+        changed_lines_per_file: Dict[str, Dict[str, List[int]]],
+        ast_artifacts: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Diff analysis using call trees rooted at the highest affected ancestor.
+
+        Affected functions are clustered into trees — each root is the highest
+        affected function in a chain. Each tree is analyzed in a single LLM run
+        with diff-marked source bodies. Issues are attributed to ``defect_function``
+        so dedup / FP filter / report generator continue to work unchanged.
+        """
+        if not affected_functions:
+            return []
+
+        api_key = get_api_key_from_config(self.config)
+        if not api_key:
+            self.logger.error("No API key available for call-tree diff analysis")
+            return []
+
+        self._initialize_unified_issue_filter_for_diff(api_key)
+
+        # Build a builder from the diff's per-commit call graph (only changed
+        # files have AST, so callers/callees outside that set will appear as
+        # out-of-tree markers — that's expected and desired).
+        call_graph = ast_artifacts.get('call_graph', []) or []
+        builder = CallTreeBuilder(
+            nested_call_graph=call_graph,
+            repo_path=str(self.repo_checkout_dir),
+            max_depth=self.config.get('call_tree_max_depth', CALL_TREE_ANALYSIS_MAX_DEPTH),
+            max_chars=self.config.get('call_tree_max_chars', CALL_TREE_ANALYSIS_MAX_CHARS),
+            max_nodes=self.config.get('call_tree_max_nodes', CALL_TREE_ANALYSIS_MAX_NODES),
+        )
+
+        affected_set: Set[str] = {f.get('function', '') for f in affected_functions if f.get('function')}
+        # Map function name -> affected_function dict so we can recover
+        # changed_lines / affected_reason later.
+        affected_by_name: Dict[str, Dict[str, Any]] = {
+            f.get('function', ''): f for f in affected_functions if f.get('function')
+        }
+
+        selector = RootSelector(builder)
+        selection = selector.select_for_diff(affected_set)
+        roots = selection.roots
+
+        if not roots:
+            self.logger.warning("Diff call-tree analysis: no roots after selection")
+            return []
+
+        total_roots = len(roots)
+        self.logger.info(
+            f"Diff call-tree analysis: {len(affected_set)} affected functions → {total_roots} trees"
+        )
+
+        # MCP server (shared across workers, matches legacy path).
+        from ..utils.output_directory_provider import get_output_directory_provider
+        try:
+            output_provider = get_output_directory_provider()
+            artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
+        except RuntimeError:
+            artifacts_dir = None
+        ignore_dirs = set(self.config.get('exclude_directories', []) or [])
+        try:
+            from ..utils.directory_tree_util import DirectoryTreeUtil
+            directory_tree_util = DirectoryTreeUtil()
+        except Exception:
+            directory_tree_util = None
+        mcp_server = AnalysisMCPServer(
+            repo_path=str(self.repo_checkout_dir),
+            file_content_provider=getattr(self, 'file_content_provider', None),
+            artifacts_dir=artifacts_dir,
+            directory_tree_util=directory_tree_util,
+            ignore_dirs=ignore_dirs,
+        )
+
+        llm_provider_type = get_llm_provider_type(self.config)
+        api_url = self.config.get('api_url') or self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT)
+
+        max_workers = self.config.get('diff_analyzer_workers', DIFF_ANALYZER_DEFAULT_WORKERS)
+        rate_limit = self.config.get('diff_analyzer_rate_limit', LLM_PROVIDER_RATE_LIMIT)
+        rate_window = self.config.get('diff_analyzer_rate_window_seconds', LLM_PROVIDER_RATE_WINDOW_SECONDS)
+        self.logger.info(
+            f"Diff call-tree analysis: {total_roots} trees, max_workers={max_workers}, rate_limit={rate_limit} RPM"
+        )
+
+        all_issues: List[Dict[str, Any]] = []
+        issues_lock = threading.Lock()
+        indexed_roots = list(enumerate(roots, 1))
+
+        diff_context_payload = {
+            "all_changed_files": all_changed_files,
+            "changed_lines_per_file": changed_lines_per_file,
+        }
+
+        async def _analyze_one_root(item: Tuple[int, str]) -> Optional[List[Dict[str, Any]]]:
+            idx, root_name = item
+            self.logger.info(f"[{idx}/{total_roots}] Diff call-tree analysis for root: {root_name}")
+
+            from ..core.llm.llm import Claude
+            Claude.start_issue_logging(idx)
+
+            try:
+                tree = builder.build(root_name)
+                if tree is None:
+                    self.logger.warning(f"[{idx}/{total_roots}] Could not build tree for {root_name}")
+                    return None
+
+                # Replace each node's source with a diff-marked version, and add
+                # is_modified / changed_lines fields per node.
+                tree_dict = tree.to_dict()
+                self._inject_diff_markers_into_tree(
+                    tree_dict, changed_lines_per_file, affected_by_name
+                )
+
+                diff_config = DiffAnalysisConfig(
+                    api_key=api_key,
+                    api_url=api_url,
+                    model=self.config.get('model', DEFAULT_LLM_MODEL),
+                    repo_path=str(self.repo_checkout_dir),
+                    output_file="",
+                    max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
+                    config=self.config,
+                    file_content_provider=getattr(self, 'file_content_provider', None),
+                    mcp_server=mcp_server,
+                )
+
+                loop = asyncio.get_running_loop()
+                issues = await loop.run_in_executor(
+                    None,
+                    self._run_single_call_tree_analysis,
+                    diff_config, tree_dict, diff_context_payload, root_name,
+                )
+
+                if not issues:
+                    self.logger.info(f"[{idx}/{total_roots}] Root {root_name}: no issues")
+                    return issues or []
+
+                # Apply unified FP / dedup filter.
+                if self.unified_issue_filter:
+                    filtered = self.unified_issue_filter.filter_issues(issues)
+                    if len(filtered) != len(issues):
+                        self.logger.info(
+                            f"[{idx}/{total_roots}] Root {root_name}: filtered "
+                            f"{len(issues) - len(filtered)} issues"
+                        )
+                    issues = filtered
+
+                # Schema-compatibility shim — ensure legacy fields are populated.
+                normalized: List[Dict[str, Any]] = []
+                for raw in issues:
+                    if not isinstance(raw, dict):
+                        continue
+                    out = dict(raw)
+                    if 'function_name' not in out:
+                        out['function_name'] = out.get('defect_function') or root_name
+                    if 'file_path' not in out:
+                        out['file_path'] = out.get('defect_file', '')
+                    if 'file_name' not in out and out.get('file_path'):
+                        out['file_name'] = os.path.basename(out['file_path'])
+                    if 'line_number' not in out:
+                        out['line_number'] = str(out.get('defect_line_number', ''))
+                    if 'issueType' not in out:
+                        out['issueType'] = out.get('category', 'logicBug')
+                    if 'severity' not in out:
+                        out['severity'] = 'medium'
+                    normalized.append(out)
+
+                with issues_lock:
+                    all_issues.extend(normalized)
+
+                self.logger.info(f"[{idx}/{total_roots}] Root {root_name}: {len(normalized)} issues")
+                return normalized
+
+            except Exception as e:
+                self.logger.error(f"[{idx}/{total_roots}] Error analyzing root {root_name}: {e}")
+                self.logger.error(f"Full traceback: {traceback.format_exc()}")
+                return None
+            finally:
+                Claude.end_issue_logging()
+
+        def _on_error(item: Tuple[int, str], exc: Exception) -> None:
+            idx, root_name = item
+            self.logger.error(f"[{idx}/{total_roots}] Worker error for {root_name}: {exc}")
+
+        rate_limiter = RateLimiter(max_requests=rate_limit, window_seconds=rate_window)
+
+        async def _run_pool():
+            await run_worker_pool(
+                items=indexed_roots,
+                worker_fn=_analyze_one_root,
+                max_workers=max_workers,
+                rate_limiter=rate_limiter,
+                on_error=_on_error,
+            )
+
+        asyncio.run(_run_pool())
+
+        self.logger.info(
+            f"Diff call-tree analysis complete: {len(all_issues)} total issues from {total_roots} trees"
+        )
+        return all_issues
+
+    def _run_single_call_tree_analysis(
+        self,
+        diff_config: 'DiffAnalysisConfig',
+        tree_dict: Dict[str, Any],
+        diff_context: Dict[str, Any],
+        root_name: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Synchronous worker that runs ``run_diff_call_tree_analysis`` once."""
+        diff_analyzer = DiffAnalysis(diff_config)
+        self._last_analysis = diff_analyzer
+
+        issues = diff_analyzer.run_diff_call_tree_analysis(tree_dict, diff_context)
+
+        if self.token_tracker and hasattr(diff_analyzer, 'get_token_totals'):
+            try:
+                input_tokens, output_tokens = diff_analyzer.get_token_totals()
+                if input_tokens > 0 or output_tokens > 0:
+                    self.token_tracker.add_token_usage(input_tokens, output_tokens)
+            except Exception as e:
+                self.logger.warning(f"Token usage record failed for root {root_name}: {e}")
+
+        return issues
+
+    def _inject_diff_markers_into_tree(
+        self,
+        tree_dict: Dict[str, Any],
+        changed_lines_per_file: Dict[str, Dict[str, List[int]]],
+        affected_by_name: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Rewrite each node's ``source`` with diff markers (`+ ` / `- ` / `  `)
+        and annotate ``is_modified`` + ``changed_lines`` per node.
+
+        Operates in-place on the dict produced by ``CallTree.to_dict()``.
+        Stubbed nodes (no source) are left alone but still get
+        ``is_modified`` / ``changed_lines`` from the affected-function map so
+        the LLM knows what changed.
+        """
+        for node in tree_dict.get("nodes", []):
+            file_path = node.get("file", "")
+            start_line = int(node.get("start_line") or 0)
+            end_line = int(node.get("end_line") or 0)
+
+            file_changes = changed_lines_per_file.get(file_path, {}) or {}
+            added = set(file_changes.get("added", []) or [])
+            removed = set(file_changes.get("removed", []) or [])
+
+            in_range_added = sorted(l for l in added if start_line <= l <= end_line)
+            node["is_modified"] = bool(in_range_added)
+            node["changed_lines"] = in_range_added
+
+            # Prefer the AffectedFunctionDetector's view if it was tracked.
+            aff = affected_by_name.get(node.get("function"))
+            if aff:
+                node["affected_reason"] = aff.get("affected_reason", "modified")
+                # Override changed_lines with the detector's per-function list
+                # if it provided one (more precise than file-level intersection).
+                if aff.get("changed_lines"):
+                    node["changed_lines"] = aff["changed_lines"]
+                    node["is_modified"] = bool(aff["changed_lines"])
+
+            # Rewrite source with diff markers.
+            original_source = node.get("source")
+            if not original_source:
+                continue
+            try:
+                new_lines: List[str] = []
+                for raw_line in original_source.split("\n"):
+                    # Source lines from CallTreeBuilder look like "  123 | content".
+                    # Extract the line number; default to "  " marker when we can't.
+                    pipe_idx = raw_line.find("|")
+                    if pipe_idx == -1:
+                        new_lines.append(f"   {raw_line}")
+                        continue
+                    line_no_str = raw_line[:pipe_idx].strip()
+                    try:
+                        line_no = int(line_no_str)
+                    except ValueError:
+                        new_lines.append(f"   {raw_line}")
+                        continue
+                    if line_no in added:
+                        marker = "+ "
+                    elif line_no in removed:
+                        marker = "- "
+                    else:
+                        marker = "  "
+                    new_lines.append(f"{marker}{raw_line}")
+                node["source"] = "\n".join(new_lines)
+            except Exception as e:
+                self.logger.debug(f"Failed to inject diff markers into {node.get('function')}: {e}")
+                # Leave the original source as-is on failure.
+
+    # ==================================================================
+    # End call-tree pipeline
+    # ==================================================================
 
     def _build_function_diff_prompt(self, func_info: Dict[str, Any],
                                      all_changed_files: List[str],

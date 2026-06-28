@@ -120,13 +120,13 @@ class NonActionableIssueFilter:
         Check if an issue is non-actionable based on heuristic patterns.
 
         Args:
-            issue: Issue dictionary with fields like 'impact', 'potentialSolution', 'issue'
+            issue: Issue dictionary with fields like 'description', 'suggestion', 'issue'
 
         Returns:
             Tuple of (should_drop, reason_string)
         """
-        impact = str(issue.get('impact', '') or '').strip()
-        solution = str(issue.get('potentialSolution', '') or '').strip()
+        impact = str(issue.get('description', '') or '').strip()
+        solution = str(issue.get('suggestion', '') or '').strip()
         issue_text = str(issue.get('issue', '') or '').strip()
 
         # Check 1: Impact field indicates no real impact
@@ -138,10 +138,6 @@ class NonActionableIssueFilter:
         for pattern in _SOLUTION_NON_ACTIONABLE_PATTERNS:
             if pattern.search(solution):
                 return True, f"Solution field matches non-actionable pattern: '{solution[:100]}'"
-
-        # Check 3: Both impact and solution are empty/whitespace
-        if not impact and not solution:
-            return True, "Both impact and potentialSolution fields are empty"
 
         # Check 4: Issue text itself indicates no problem
         for pattern in _ISSUE_NON_ACTIONABLE_PATTERNS:
@@ -164,8 +160,10 @@ class NonActionableIssueFilter:
 
             record = {
                 "timestamp": datetime.now().isoformat(),
+                "filter_level": "Level 1.5 - Non-actionable Heuristic Filter",
+                "filter_type": "Non-actionable heuristic filtering",
                 "reason": reason,
-                "dropped_issue": issue,
+                "original_issue": issue,
             }
 
             with open(filepath, 'w', encoding='utf-8') as f:

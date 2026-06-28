@@ -1691,12 +1691,33 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
                 const issueDescription = (issue.description || issue.issue || 'No description available').replace(/<br\s*\/?>/gi, '\\n');
                 const impactText = (issue.Impact || issue.impact || 'No impact information available').replace(/<br\s*\/?>/gi, '\\n');
                 const solutionText = (issue['Potential solution'] || issue.potentialSolution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
+                const evidenceText = (issue.evidence || '').replace(/<br\s*\/?>/gi, '\\n');
 
-                return `Title:\\n${{issueDescription}}${{normalizedCostText}}
+                const severityMeta = issue.severity || issue.kind || 'unknown';
+                const categoryMeta = issue.category || 'unknown';
+                const linesMeta = issue.line_number || issue.lines || issue.lineNumber || 'N/A';
 
-Impact:\\n${{impactText}}
+                let output = `Title:\\n${{issueDescription}}${{normalizedCostText}}
+
+Severity: ${{severityMeta}}
+Category: ${{categoryMeta}}
+File: ${{filePath}}
+Function: ${{functionName}}
+Lines: ${{linesMeta}}
+
+Impact:\\n${{impactText}}`;
+
+                if (evidenceText) {{
+                    output += `
+
+Evidence:\\n${{evidenceText}}`;
+                }}
+
+                output += `
 
 Potential Solution:\\n${{solutionText}}${{callstackSection}}`;
+
+                return output;
             }}).join(separator);
 
             navigator.clipboard.writeText(formattedIssues).then(() => {{
@@ -1769,10 +1790,31 @@ Potential Solution:\\n${{solutionText}}${{callstackSection}}`;
             const issueDescription = (issue.description || issue.issue || 'No description available').replace(/<br\s*\/?>/gi, '\\n');
             const impactText = (issue.Impact || issue.impact || 'No impact information available').replace(/<br\s*\/?>/gi, '\\n');
             const solutionText = (issue['Potential solution'] || issue.potentialSolution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
+            const evidenceText = (issue.evidence || '').replace(/<br\s*\/?>/gi, '\\n');
 
-            const content = `Title:\\n${{issueDescription}}${{normalizedCostText}}
+            const severityMeta = issue.severity || issue.kind || 'unknown';
+            const categoryMeta = issue.category || 'unknown';
+            const fileMeta = filePath;
+            const functionMeta = functionName;
+            const linesMeta = issue.line_number || issue.lines || issue.lineNumber || 'N/A';
 
-Impact:\\n${{impactText}}
+            let content = `Title:\\n${{issueDescription}}${{normalizedCostText}}
+
+Severity: ${{severityMeta}}
+Category: ${{categoryMeta}}
+File: ${{fileMeta}}
+Function: ${{functionMeta}}
+Lines: ${{linesMeta}}
+
+Impact:\\n${{impactText}}`;
+
+            if (evidenceText) {{
+                content += `
+
+Evidence:\\n${{evidenceText}}`;
+            }}
+
+            content += `
 
 Potential Solution:\\n${{solutionText}}${{callstackSection}}`;
 

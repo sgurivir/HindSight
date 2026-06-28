@@ -740,3 +740,134 @@ Based on the tool results above, complete your analysis. Remember:
             return None
 
     # Removed _run_iterative_analysis and _execute_claude_tool_use - now using unified methods in llm.py
+
+    # ------------------------------------------------------------------
+    # Call-tree-at-once analysis (one LLM run per root, whole subtree in prompt).
+    # ------------------------------------------------------------------
+
+    def run_call_tree_analysis(self, tree_dict: Dict[str, Any]) -> Optional[list]:
+        """Analyze an entire call tree in a single LLM run.
+
+        Replaces the per-function Stage 4a + 4b for the call-tree pipeline.
+        The orchestrator builds the tree deterministically (no LLM needed for
+        collection); this method runs a single analysis stage with the FULL
+        tool set so the LLM can fetch stubbed bodies or inspect out-of-tree
+        callers on demand.
+
+        Args:
+            tree_dict: Output of ``CallTree.to_dict()`` — schema_version 2.0
+                bundle with ``root``, ``nodes``, ``truncation``, ``stats``.
+
+        Returns:
+            List of issue dicts on success, ``None`` on failure (the worker
+            pool treats ``None`` as a hard failure and ``[]`` as "no issues").
+        """
+        root = (tree_dict.get("root") or {}).get("function", "unknown")
+        logger.info(f"Call-Tree Analysis: Starting for root {root}")
+        start_time = time.time()
+
+        user_provided_prompts = None
+        if self.config.config and isinstance(self.config.config, dict):
+            user_provided_prompts = self.config.config.get("user_provided_prompts")
+
+        try:
+            system_prompt, user_prompt = PromptBuilder.build_call_tree_prompt(
+                tree_dict=tree_dict,
+                config=self.config.config,
+                user_provided_prompts=user_provided_prompts,
+            )
+        except Exception as e:
+            logger.error(f"Call-Tree Analysis: Failed to build prompt: {e}")
+            return None
+
+        if not self.claude.check_token_limit(system_prompt, user_prompt):
+            logger.error(
+                "Call-Tree Analysis: Input exceeds token limits for root %s "
+                "(%d nodes, %d total source chars) — aborting",
+                root,
+                (tree_dict.get("stats") or {}).get("node_count", 0),
+                (tree_dict.get("stats") or {}).get("total_chars", 0),
+            )
+            return None
+
+        self.claude.start_conversation("call_tree_analysis", root)
+
+        # Full tool set — the LLM may need to fetch stubbed bodies, inspect
+        # out-of-tree callers, or grep for a hypothesis. Stage 4b's reduced
+        # tool set is too restrictive for whole-tree review.
+        supported_tools = [
+            "readFile",
+            "getFileContentByLines",
+            "getFileContent",
+            "checkFileSize",
+            "getSummaryOfFile",
+            "list_files",
+            "inspectDirectoryHierarchy",
+            "runTerminalCmd",
+        ]
+
+        analyzer = CodeAnalysisAnalyzer(self.claude)
+        try:
+            raw_result = analyzer.run_iterative_analysis(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                tools_executor=self,
+                supported_tools=supported_tools,
+                context_guidance_template="""
+Based on the tool results above, complete the call-tree analysis. Remember:
+1. Apply the four-case cross-function rubric — every reported defect needs an
+   in-tree caller whose behaviour is provably affected, with a line cite.
+2. Your response MUST be ONLY a valid JSON array starting with `[` and
+   ending with `]`. If nothing qualifies, return exactly `[]`.
+
+{user_prompt}
+""",
+                token_usage_callback=self._extract_and_log_token_usage,
+            )
+        except Exception as e:
+            logger.error(f"Call-Tree Analysis: Iterative analysis raised: {e}")
+            self.claude.log_complete_conversation(final_result=f"Error: {e}")
+            return None
+
+        elapsed = time.time() - start_time
+        logger.info(f"Call-Tree Analysis: Completed in {elapsed:.2f}s")
+
+        if not raw_result:
+            logger.error("Call-Tree Analysis: No result from LLM")
+            self.claude.log_complete_conversation(final_result="no_result")
+            return None
+
+        from ...utils.json_util import validate_and_format_json
+        is_valid, processed = validate_and_format_json(raw_result)
+
+        try:
+            issues = json.loads(processed if is_valid else raw_result)
+        except json.JSONDecodeError as e:
+            logger.error(f"Call-Tree Analysis: Failed to parse result as JSON: {e}")
+            self.claude.log_complete_conversation(final_result=f"JSON parse failed: {e}")
+            return None
+
+        if not isinstance(issues, list):
+            if isinstance(issues, dict) and "results" in issues:
+                issues = issues["results"]
+            elif isinstance(issues, dict):
+                logger.warning("Call-Tree Analysis: LLM returned a single dict; wrapping")
+                issues = [issues]
+            else:
+                logger.warning(
+                    f"Call-Tree Analysis: Expected list, got {type(issues)}; treating as empty"
+                )
+                issues = []
+
+        valid_issues = [i for i in issues if isinstance(i, dict)]
+        if len(valid_issues) != len(issues):
+            logger.warning(
+                f"Call-Tree Analysis: Filtered out {len(issues) - len(valid_issues)} non-dict issues"
+            )
+
+        self.claude.log_complete_conversation(final_result=json.dumps(valid_issues))
+        self.tools.log_tool_usage_summary()
+        self._log_final_token_summary()
+
+        logger.info(f"Call-Tree Analysis: Found {len(valid_issues)} issues for root {root}")
+        return valid_issues

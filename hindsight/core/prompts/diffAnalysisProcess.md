@@ -59,6 +59,7 @@ All terminal commands MUST stay within the repository root (`.`). Commands searc
 ```
 
 - Each tool call must be in its **own** fenced block.
+- You may include multiple tool calls in one response.
 - Parameters are **flat** (top-level keys alongside `"tool"`).
 
 ---
@@ -181,7 +182,7 @@ No explanatory text, no reasoning, no markdown, no code blocks — ONLY the JSON
   "line_number": "string — e.g. '45' or '45-48'; prefer a '+' line number for PR comment placement",
   "severity": "string — critical | high | medium | low",
   "issue": "string — brief one-sentence summary of the issue",
-  "description": "string — detailed explanation including: which + line introduced the issue, what conditions trigger it, and what the impact is",
+  "description": "string — concise explanation in 1–3 sentences: which added/changed line introduced the issue, the trigger condition, and the impact. No restated code, no preamble, no rephrasing of the `issue` field.",
   "suggestion": "string — specific, actionable fix recommendation",
   "category": "string — logicBug | performance",
   "issueType": "string — same value as category"

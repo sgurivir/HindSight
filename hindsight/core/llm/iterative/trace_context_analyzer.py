@@ -51,13 +51,28 @@ class TraceContextAnalyzer(BaseIterativeAnalyzer):
         """Validate context bundle has required structure."""
         return isinstance(parsed_json, dict) and "call_path" in parsed_json
 
-    def get_fallback_guidance(self) -> str:
-        """Get trace context collection-specific guidance."""
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
+        """Get trace context collection-specific guidance, with full schema and example."""
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid trace context bundle. "
-            "You MUST respond with ONLY a valid JSON object containing a 'call_path' key. "
-            "The 'call_path' value must be a list of function names representing the callstack.\n\n"
-            'Example: {"call_path": ["FuncA", "FuncB", "FuncC"]}\n\n'
+            "CRITICAL: Your previous response did not contain a valid trace context bundle.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON OBJECT containing a `call_path` key. "
+            "`call_path` MUST be a list of function-name strings (the trace callstack, "
+            "ordered top-most caller → leaf).\n\n"
+            "### Required schema\n"
+            "```json\n"
+            '{ "call_path": ["string", "string", "string"] }\n'
+            "```\n\n"
+            "### CORRECT example\n"
+            "```json\n"
+            '{"call_path": ["AppDelegate.applicationDidFinishLaunching", '
+            '"WindowController.show", "ViewController.viewDidLoad"]}\n'
+            "```\n\n"
             "Your response MUST start with `{` and end with `}`. "
-            "No markdown, no arrays, no prose. Return the JSON object now."
+            "Return JSON ONLY — no markdown fences, no arrays, no prose."
         )

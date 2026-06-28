@@ -184,6 +184,10 @@ You have limited tools available during analysis (context was already collected)
 {"tool": "store_learning", "entity_key": "dispatch_queue_drain_pattern", "summary": "Unnecessary queue hop adds latency", "confidence": 0.85, "reason": "Persist callstack pattern learning"}
 ```
 
+- Each tool call must be in its **own** fenced block.
+- You may include multiple tool calls in one response.
+- Parameters are **flat** (top-level keys alongside `"tool"`).
+
 ---
 
 ## ISSUE CATEGORIES
@@ -281,13 +285,19 @@ Do NOT invent issues to avoid returning an empty array. An empty result is a val
     "file_path": "relative/path/to/filename.swift",
     "functionName": "exact function name",
     "line": "line number or range (e.g. '45' or '45-60')",
-    "issue": "Clear, specific description of the performance problem",
+    "issue": "brief one-sentence summary of the performance problem",
     "category": "performance | memoryManagement | concurrency | resourceManagement",
     "issueType": "specific type of issue",
-    "impact": "Description of the potential performance impact",
-    "potentialSolution": "Specific, actionable solution with file names and line numbers"
+    "description": "detailed explanation of why this is a performance problem, what conditions trigger it, and what the impact is",
+    "suggestion": "specific, actionable fix recommendation with file names and line numbers"
   }
 ]
+```
+
+### Worked Example
+
+```json
+[{"severity":"high","analysisType":"function_optimization","file":"DataProcessor.swift","file_path":"src/core/DataProcessor.swift","functionName":"DataProcessor.aggregate","line":"87-104","issue":"O(n²) scan over samples dominates the trace's hot path","category":"performance","issueType":"performance","description":"Lines 87-104 iterate over every sample and re-scan the full buffer for each one, turning aggregation into O(n²). The trace shows this call accounts for ~62% of the parent's CPU time; at the observed sample rate (n≈4k/batch) it amplifies latency by ~10× versus a single pass.","suggestion":"Replace the inner loop at lines 91-98 with a single pass that accumulates the running sum into a dictionary keyed by sensor id, then emit totals after the outer loop."}]
 ```
 
 ### Required Fields
@@ -300,19 +310,19 @@ Do NOT invent issues to avoid returning an empty array. An empty result is a val
 - `file_path`: Complete relative path from repository root
 - `functionName`: Exact name of the function with the issue
 - `line`: Line number or range where the issue occurs
-- `issue`: Clear description of the problem
+- `issue`: Brief one-sentence summary of the problem
 - `category`: One of the categories listed above
 - `issueType`: Specific type of issue
-- `impact`: Description of potential consequences
-- `potentialSolution`: Specific solution with file names and line numbers
+- `description`: Detailed explanation including conditions that trigger it and impact
+- `suggestion`: Specific, actionable fix recommendation with file names and line numbers
 
 ### FORMATTING INSTRUCTIONS
 
-For `issue`, `impact`, and `potentialSolution` fields:
+For `issue`, `description`, and `suggestion` fields:
 - Use HTML line breaks (`<br>`) for multi-item lists
 - Format as: "1) First item<br>2) Second item<br>3) Third item"
 
-The `potentialSolution` field MUST include specific file names and line numbers:
+The `suggestion` field MUST include specific file names and line numbers:
 - "In file MyClass.cpp at line 45, replace the loop with..."
 - "Modify MyHeader.h lines 12-15 to change..."
 

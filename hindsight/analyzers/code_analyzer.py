@@ -62,7 +62,7 @@ import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .analysis_runner import AnalysisRunner
 from .analysis_runner_mixins import UnifiedIssueFilterMixin, ReportGeneratorMixin
@@ -79,7 +79,12 @@ from ..core.constants import (DEFAULT_LOGS_DIR, DEFAULT_MAX_TOKENS,
                               MERGED_SYMBOLS_FILE, NESTED_CALL_GRAPH_FILE,
                               PROCESSED_OUTPUT_DIR, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT,
                               CODE_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT,
-                              LLM_PROVIDER_RATE_WINDOW_SECONDS)
+                              LLM_PROVIDER_RATE_WINDOW_SECONDS,
+                              CALL_TREE_ANALYSIS_ENABLED,
+                              CALL_TREE_ANALYSIS_MAX_DEPTH,
+                              CALL_TREE_ANALYSIS_MAX_CHARS,
+                              CALL_TREE_ANALYSIS_MAX_NODES)
+from ..core.call_tree import CallTreeBuilder, RootSelector
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
 from ..core.lang_util.filter_by_file_util import FilterByFileUtil
 from ..core.ast_index import RepoAstIndex
@@ -258,6 +263,56 @@ class CodeAnalyzer(LLMBasedAnalyzer):
     def finalize(self) -> None:
         """Cleanup after analysis."""
         pass
+
+    def analyze_call_tree(self, tree_dict: Dict[str, Any], mcp_server=None) -> Optional[list]:
+        """Analyze an entire call tree in a single LLM run.
+
+        Args:
+            tree_dict: Output of ``CallTree.to_dict()`` (schema 2.0).
+            mcp_server: Optional AnalysisMCPServer for unified tool dispatch.
+
+        Returns:
+            List of issue dicts on success, ``None`` on failure, ``[]`` for
+            "no issues found".
+        """
+        if not self._initialized:
+            raise RuntimeError("Analyzer not initialized. Call initialize() first.")
+
+        try:
+            self._wait_for_rate_limit()
+
+            analysis_config = AnalysisConfig(
+                json_file_path="",                       # not used in call-tree mode
+                api_key=self.api_key,
+                api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
+                model=self.config.get('model', DEFAULT_LLM_MODEL),
+                repo_path=self.repo_path,
+                output_file="",
+                max_tokens=DEFAULT_MAX_TOKENS,
+                processed_cache_file=None,
+                config=self.config,
+                file_content_provider=self.file_content_provider,
+                file_filter=self.config.get('file_filter', []),
+                min_function_body_length=self.config.get('min_function_body_length', 7),
+            )
+
+            code_analysis = CodeAnalysis(analysis_config, mcp_server=mcp_server)
+            code_analysis.ast_index = self.ast_index
+            self._last_analysis = code_analysis
+
+            issues = code_analysis.run_call_tree_analysis(tree_dict)
+            if issues is None:
+                return None
+
+            return [
+                self._post_process_analysis_result(item) if isinstance(item, dict) else item
+                for item in issues
+            ]
+        except Exception as e:
+            root = (tree_dict.get("root") or {}).get("function", "unknown")
+            self.logger.error(f"Error during call-tree analysis for root {root}: {e}")
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            return None
 
     def set_publisher(self, publisher) -> None:
         """
@@ -1075,6 +1130,22 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         self.logger.info(f"Initialized publisher-subscriber system for report generation: {repo_name}")
 
     def _run_code_analysis(self, config: dict, output_base_dir: str, api_key: str = None) -> tuple:
+        """Run code analysis.
+
+        Dispatches between the call-tree pipeline (one LLM run per filter-relative
+        root, whole subtree in prompt) and the legacy per-function pipeline based
+        on ``CALL_TREE_ANALYSIS_ENABLED`` in ``hindsight.core.constants``. The
+        legacy path remains available as a fallback while the new approach is
+        validated.
+        """
+        if config.get('call_tree_analysis_enabled', CALL_TREE_ANALYSIS_ENABLED):
+            self.logger.info("Code analysis: using call-tree pipeline (one LLM run per root)")
+            return self._run_call_tree_code_analysis(config, output_base_dir, api_key)
+
+        self.logger.info("Code analysis: using legacy per-function pipeline")
+        return self._run_code_analysis_legacy(config, output_base_dir, api_key)
+
+    def _run_code_analysis_legacy(self, config: dict, output_base_dir: str, api_key: str = None) -> tuple:
         """Run code analysis with on-demand file generation from call graph."""
         self.logger.info("Starting on-demand code analysis...")
 
@@ -1254,90 +1325,93 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         failed_analyses = 0
 
         # --- Define the per-function analysis work ---
-        def _process_single_function(func_data: Dict, index: int) -> bool:
-            """Process a single function entry: cache check, analysis, publish.
+        def _extract_function_metadata(func_data: Dict):
+            func_entry = func_data['func_entry']
+            function_length = func_data['length']
+            function_name = func_entry.get('function', 'unknown')
+            primary_file = func_entry.get('context', {}).get('file', 'unknown')
+            func_context = func_entry.get('context', {})
+            function_checksum = HashUtil.checksum_for_function_source(
+                repo_path, primary_file, func_context.get('start', 0), func_context.get('end', 0)
+            )
+            return func_entry, function_length, function_name, primary_file, function_checksum
+
+        def _check_cache_and_handle_hit(func_data: Dict, index: int) -> Optional[bool]:
+            """Check the result cache; on hit, republish and return True/False.
+
+            Returns None on cache miss — caller must run the LLM analysis path.
+            """
+            nonlocal successful_analyses
+
+            _, function_length, function_name, primary_file, function_checksum = _extract_function_metadata(func_data)
+
+            if not self.results_publisher:
+                self.logger.debug(f"[{index}/{total_functions}] No results publisher available - will analyze {function_name}")
+                return None
+
+            self.logger.debug(f"[{index}/{total_functions}] Checking cache for function='{function_name}', file='{primary_file}', checksum='{function_checksum}'")
+            existing_result = self.results_publisher.check_existing_result(
+                primary_file,
+                function_name,
+                function_checksum
+            )
+
+            if not existing_result:
+                self.logger.debug(f"[{index}/{total_functions}] NO existing result found for {function_name} - will analyze")
+                return None
+
+            self.logger.info(f"[{index}/{total_functions}] ANALYSIS SKIPPED - Same checksum found for {function_name}")
+            self.logger.info(f"[{index}/{total_functions}] Function: {function_name} | File: {primary_file} | Checksum: {function_checksum}")
+            self.logger.info(f"[{index}/{total_functions}] Content unchanged ({function_length} lines) - reusing existing analysis result")
+
+            repo_name = os.path.basename(repo_path.rstrip('/'))
+            try:
+                normalized_result = CodeAnalysisResultValidator.normalize_result(
+                    existing_result,
+                    file_path=primary_file,
+                    function=function_name,
+                    checksum=function_checksum
+                )
+
+                validation_errors = normalized_result.validate()
+                if validation_errors:
+                    self.logger.warning(f"[{index}/{total_functions}] Existing result validation failed: {validation_errors}")
+                    existing_results_list = []
+                else:
+                    existing_results_list = [issue.to_dict() for issue in normalized_result.results]
+
+                if self.unified_issue_filter and existing_results_list:
+                    original_count = len(existing_results_list)
+                    existing_results_list = self.unified_issue_filter.category_filter.filter_issues(existing_results_list)
+                    if len(existing_results_list) != original_count:
+                        dropped_count = original_count - len(existing_results_list)
+                        self.logger.info(f"[{index}/{total_functions}] Applied Level 1 category filter to cached results: dropped {dropped_count} issues, keeping {len(existing_results_list)}")
+
+                with _publisher_lock:
+                    self.results_publisher.add_result(
+                        repo_name=repo_name,
+                        file_path=primary_file,
+                        function=function_name,
+                        function_checksum=function_checksum,
+                        results=existing_results_list
+                    )
+                self.logger.info(f"[{index}/{total_functions}] Republished existing result with {len(existing_results_list)} issues to current analysis")
+
+            except Exception as e:
+                self.logger.warning(f"[{index}/{total_functions}] Failed to normalize existing result: {e}, skipping republish")
+
+            with _counters_lock:
+                successful_analyses += 1
+            return True
+
+        def _run_llm_analysis(func_data: Dict, index: int) -> bool:
+            """Run the LLM analysis path. Assumes cache miss already verified.
 
             Returns True on success, False on failure.
             """
             nonlocal successful_analyses, failed_analyses
 
-            func_entry = func_data['func_entry']
-            function_length = func_data['length']
-
-            # Extract function information for analysis
-            function_name = func_entry.get('function', 'unknown')
-            primary_file = func_entry.get('context', {}).get('file', 'unknown')
-
-            # Compute function checksum on-the-fly from the actual source file on disk
-            func_context = func_entry.get('context', {})
-            function_checksum = HashUtil.checksum_for_function_source(
-                repo_path, primary_file, func_context.get('start', 0), func_context.get('end', 0)
-            )
-
-            # Check if already processed using publisher with concurrent lookup across all prior result stores
-            if self.results_publisher:
-                self.logger.debug(f"[{index}/{total_functions}] Checking cache for function='{function_name}', file='{primary_file}', checksum='{function_checksum}'")
-
-                existing_result = self.results_publisher.check_existing_result(
-                    primary_file,
-                    function_name,
-                    function_checksum
-                )
-
-                if existing_result:
-                    self.logger.info(f"[{index}/{total_functions}] ANALYSIS SKIPPED - Same checksum found for {function_name}")
-                    self.logger.info(f"[{index}/{total_functions}] Function: {function_name} | File: {primary_file} | Checksum: {function_checksum}")
-                    self.logger.info(f"[{index}/{total_functions}] Content unchanged ({function_length} lines) - reusing existing analysis result")
-
-                    # Republish the existing result to the current analysis session
-                    repo_name = os.path.basename(repo_path.rstrip('/'))
-                    if self.results_publisher and existing_result:
-                        # Use centralized schema to normalize the existing result
-                        try:
-                            normalized_result = CodeAnalysisResultValidator.normalize_result(
-                                existing_result,
-                                file_path=primary_file,
-                                function=function_name,
-                                checksum=function_checksum
-                            )
-
-                            # Validate the normalized result
-                            validation_errors = normalized_result.validate()
-                            if validation_errors:
-                                self.logger.warning(f"[{index}/{total_functions}] Existing result validation failed: {validation_errors}")
-                                existing_results_list = []
-                            else:
-                                existing_results_list = [issue.to_dict() for issue in normalized_result.results]
-
-                            # Apply Level 1 (Category) filtering to cached results
-                            if self.unified_issue_filter and existing_results_list:
-                                original_count = len(existing_results_list)
-                                existing_results_list = self.unified_issue_filter.category_filter.filter_issues(existing_results_list)
-                                if len(existing_results_list) != original_count:
-                                    dropped_count = original_count - len(existing_results_list)
-                                    self.logger.info(f"[{index}/{total_functions}] Applied Level 1 category filter to cached results: dropped {dropped_count} issues, keeping {len(existing_results_list)}")
-
-                            # Republish the existing result to the current analysis
-                            with _publisher_lock:
-                                self.results_publisher.add_result(
-                                    repo_name=repo_name,
-                                    file_path=primary_file,
-                                    function=function_name,
-                                    function_checksum=function_checksum,
-                                    results=existing_results_list
-                                )
-                            self.logger.info(f"[{index}/{total_functions}] Republished existing result with {len(existing_results_list)} issues to current analysis")
-
-                        except Exception as e:
-                            self.logger.warning(f"[{index}/{total_functions}] Failed to normalize existing result: {e}, skipping republish")
-
-                    with _counters_lock:
-                        successful_analyses += 1
-                    return True
-                else:
-                    self.logger.debug(f"[{index}/{total_functions}] NO existing result found for {function_name} - will analyze")
-            else:
-                self.logger.debug(f"[{index}/{total_functions}] No results publisher available - will analyze {function_name}")
+            func_entry, function_length, function_name, primary_file, function_checksum = _extract_function_metadata(func_data)
 
             # Generate temporary function file on-demand
             temp_file_path = self._generate_temp_function_file(func_entry, repo_path)
@@ -1515,18 +1589,30 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         indexed_items = list(enumerate(filtered_functions, 1))
 
         async def _async_analyze_function(item):
-            """Async worker function that wraps the synchronous per-function analysis."""
+            """Async worker function that wraps the synchronous per-function analysis.
+
+            The rate limiter is acquired only on the LLM-analysis path. Cache hits
+            bypass it so they don't burn rate-limit slots while waiting for nothing.
+            """
             index, func_data = item
 
             # Check for cancellation
             if not self._should_continue():
                 return False
 
-            # Run the synchronous analysis in a thread executor to avoid blocking
-            # the event loop (the LLM calls and file I/O are blocking)
             loop = asyncio.get_running_loop()
+
+            # Cache check is fast (local SQLite/index lookup) — no rate limiting.
+            cache_result = await loop.run_in_executor(
+                None, _check_cache_and_handle_hit, func_data, index
+            )
+            if cache_result is not None:
+                return cache_result
+
+            # Cache miss — gate the LLM call behind the rate limiter.
+            await rate_limiter.acquire()
             return await loop.run_in_executor(
-                None, _process_single_function, func_data, index
+                None, _run_llm_analysis, func_data, index
             )
 
         def _on_error(item, exc):
@@ -1543,7 +1629,6 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 items=indexed_items,
                 worker_fn=_async_analyze_function,
                 max_workers=max_workers,
-                rate_limiter=rate_limiter,
                 on_error=_on_error,
             )
         )
@@ -1562,6 +1647,359 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             self.token_tracker.log_summary()
 
         return successful_analyses, failed_analyses
+
+    # ==================================================================
+    # Call-tree-at-once pipeline
+    # ==================================================================
+
+    def _run_call_tree_code_analysis(self, config: dict, output_base_dir: str, api_key: str = None) -> tuple:
+        """Call-tree-at-once code analysis.
+
+        Each filter-relative root is analyzed as a single LLM run, with the
+        entire subtree (root + reachable callees, cycle-safe, within budget)
+        in the prompt. Replaces the per-function Stage 4a + Stage 4b iteration.
+        """
+        self.logger.info("Starting call-tree code analysis...")
+
+        if not self.token_tracker:
+            llm_provider_type = get_llm_provider_type(config)
+            self.token_tracker = TokenTracker(llm_provider_type)
+            self.logger.info(f"Auto-initialized centralized token tracker for provider: {llm_provider_type}")
+
+        self._initialize_publisher_subscriber(config, output_base_dir)
+
+        if not api_key:
+            self.logger.info("API key not available from startup — retrying Apple Connect token fetch...")
+            api_key = get_api_key_from_config(config)
+
+        self._initialize_unified_issue_filter(api_key, config)
+
+        if not hasattr(self, 'call_graph_data') or not self.call_graph_data:
+            self.logger.error("No call graph data available for call-tree analysis")
+            return 0, 0
+
+        repo_path = config['path_to_repo']
+        self._current_repo_path = repo_path
+
+        results_dir = self.get_results_directory()
+        code_analysis_dir = f"{results_dir}/code_analysis"
+        os.makedirs(code_analysis_dir, exist_ok=True)
+        config['analysis_dir'] = code_analysis_dir
+
+        # 1. Build the "interesting set" using the existing filter logic.
+        #    Same filters as the legacy path — file/dir/function filters,
+        #    min/max body length, etc.
+        interesting: List[str] = []
+        for file_entry in self.call_graph_data:
+            for func_entry in file_entry.get('functions', []) or []:
+                if 'context' not in func_entry:
+                    func_entry['context'] = {}
+                if 'file' not in func_entry['context']:
+                    func_entry['context']['file'] = file_entry.get('file', '')
+                if self._should_analyze_function(func_entry, config):
+                    name = func_entry.get('function', '')
+                    if name:
+                        interesting.append(name)
+
+        if not interesting:
+            self.logger.warning("Call-tree analysis: no functions passed filtering criteria")
+            return 0, 0
+
+        self.logger.info(f"Call-tree analysis: {len(interesting)} functions passed filters")
+
+        # 2. Build the call-tree builder and selector.
+        builder = CallTreeBuilder(
+            nested_call_graph=self.call_graph_data,
+            repo_path=repo_path,
+            max_depth=config.get('call_tree_max_depth', CALL_TREE_ANALYSIS_MAX_DEPTH),
+            max_chars=config.get('call_tree_max_chars', CALL_TREE_ANALYSIS_MAX_CHARS),
+            max_nodes=config.get('call_tree_max_nodes', CALL_TREE_ANALYSIS_MAX_NODES),
+        )
+        selector = RootSelector(builder)
+        selection = selector.select_for_code(interesting)
+
+        if selection.skipped_orphans:
+            self.logger.info(
+                f"Call-tree analysis: skipped {len(selection.skipped_orphans)} orphan utility "
+                f"functions (no in-set caller, no callees): "
+                f"{selection.skipped_orphans[:5]}{'...' if len(selection.skipped_orphans) > 5 else ''}"
+            )
+
+        roots = selection.roots
+        total_roots = len(roots)
+        if total_roots == 0:
+            self.logger.warning("Call-tree analysis: no roots after selection")
+            return 0, 0
+
+        # Honour num_functions_to_analyze as a rough cap on roots.
+        num_to_analyze = config.get('num_functions_to_analyze', DEFAULT_NUM_FUNCTIONS_TO_ANALYZE)
+        if num_to_analyze and num_to_analyze < total_roots:
+            self.logger.info(f"Call-tree analysis: capping roots at {num_to_analyze} (of {total_roots})")
+            roots = roots[:num_to_analyze]
+            total_roots = len(roots)
+
+        self.logger.info(f"Call-tree analysis: {total_roots} roots will be analyzed")
+
+        # 3. Initialize the analyzer + MCP server (same shape as legacy path).
+        llm_provider_type = get_llm_provider_type(config)
+        analyzer = CodeAnalyzer()
+        self.logger.info(f"Using CodeAnalyzer (call-tree mode) llm_provider_type={llm_provider_type}")
+
+        analyzer_config = {
+            'api_key': api_key,
+            'repo_path': repo_path,
+            'file_content_provider': self.get_file_content_provider() if hasattr(self, 'get_file_content_provider') else None,
+            'api_end_point': config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
+            'model': config.get('model', DEFAULT_LLM_MODEL),
+            'output_base_dir': output_base_dir,
+            'user_provided_prompts': self.user_provided_prompts,
+        }
+        analyzer_config.update(config)
+        analyzer.initialize(analyzer_config)
+        self.analyzer_instance = analyzer
+
+        if hasattr(analyzer, 'set_publisher') and self.results_publisher:
+            analyzer.set_publisher(self.results_publisher)
+
+        if not api_key:
+            self.logger.warning("No API key available — skipping call-tree analysis")
+            return 0, 0
+
+        # Build MCP server (same fields as legacy path).
+        try:
+            output_provider = get_output_directory_provider()
+            mcp_output_base_dir = output_provider.get_custom_base_dir()
+        except RuntimeError:
+            mcp_output_base_dir = None
+
+        mcp_ignore_dirs = set()
+        for dir_name in config.get('exclude_directories', []) or []:
+            mcp_ignore_dirs.add(dir_name)
+            mcp_ignore_dirs.add(dir_name.upper())
+            mcp_ignore_dirs.add(dir_name.lower())
+
+        mcp_file_content_provider = self.get_file_content_provider() if hasattr(self, 'get_file_content_provider') else None
+        try:
+            output_provider = get_output_directory_provider()
+            mcp_artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
+        except RuntimeError:
+            mcp_artifacts_dir = None
+
+        mcp_directory_tree_util = getattr(self, 'directory_tree_util', None)
+        mcp_server = AnalysisMCPServer(
+            repo_path=repo_path,
+            file_content_provider=mcp_file_content_provider,
+            artifacts_dir=mcp_artifacts_dir,
+            directory_tree_util=mcp_directory_tree_util,
+            ignore_dirs=mcp_ignore_dirs,
+            call_graph_data=self.call_graph_data,
+        )
+
+        max_workers = config.get('code_analyzer_workers', CODE_ANALYZER_DEFAULT_WORKERS)
+        rate_limit = config.get('code_analyzer_rate_limit', LLM_PROVIDER_RATE_LIMIT)
+        rate_window = config.get('code_analyzer_rate_window_seconds', LLM_PROVIDER_RATE_WINDOW_SECONDS)
+        self.logger.info(f"Call-tree analysis: max_workers={max_workers}, rate_limit={rate_limit} per {rate_window}s")
+
+        _publisher_lock = threading.Lock()
+        _counters_lock = threading.Lock()
+        successful_analyses = 0
+        failed_analyses = 0
+
+        # 4. Per-root work function.
+        def _analyze_one_root(root_name: str, index: int) -> bool:
+            """Build the tree, run analysis, fan out issues per defect_function."""
+            nonlocal successful_analyses, failed_analyses
+
+            tree = builder.build(root_name)
+            if tree is None:
+                self.logger.warning(f"[{index}/{total_roots}] Could not build tree for root {root_name}")
+                with _counters_lock:
+                    failed_analyses += 1
+                return False
+
+            self.logger.info(
+                f"[{index}/{total_roots}] Analyzing tree rooted at {root_name}: "
+                f"{tree.node_count()} nodes ({len(tree.stubbed_function_names())} stubbed), "
+                f"{tree.total_chars} chars"
+            )
+
+            tree_dict = tree.to_dict()
+            self._start_function_analysis_tracking(root_name)
+
+            result = analyzer.analyze_call_tree(tree_dict, mcp_server=mcp_server)
+            if result is None:
+                self._record_function_analysis_result(
+                    functions_analyzed=1, success=False, function_data=root_name
+                )
+                with _counters_lock:
+                    failed_analyses += 1
+                self.logger.error(f"[{index}/{total_roots}] Call-tree analysis failed for root {root_name}")
+                return False
+
+            # 5. Group issues by defect_function so the publisher can store them
+            #    under the function that actually contains the defect (matches the
+            #    existing storage key shape: file_path + function + checksum).
+            self._publish_call_tree_issues(
+                tree=tree,
+                issues=result,
+                repo_path=repo_path,
+                publisher_lock=_publisher_lock,
+                index=index,
+                total_roots=total_roots,
+            )
+
+            if hasattr(analyzer, '_last_analysis') and analyzer._last_analysis:
+                self.token_tracker.record_tokens_from_analysis(analyzer._last_analysis)
+
+            self._record_function_analysis_result(
+                functions_analyzed=1, success=True, function_data=root_name
+            )
+            with _counters_lock:
+                successful_analyses += 1
+            self.logger.info(
+                f"[{index}/{total_roots}] Root {root_name}: tree analyzed, {len(result)} raw issues"
+            )
+            return True
+
+        # 6. Worker pool.
+        rate_limiter = RateLimiter(max_requests=rate_limit, window_seconds=rate_window)
+        indexed_roots = list(enumerate(roots, 1))
+
+        async def _async_analyze_root(item):
+            index, root_name = item
+            if not self._should_continue():
+                return False
+            await rate_limiter.acquire()
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _analyze_one_root, root_name, index)
+
+        def _on_error(item, exc):
+            index, root_name = item
+            self.logger.error(f"[{index}/{total_roots}] Worker error for root {root_name}: {exc}")
+            with _counters_lock:
+                nonlocal failed_analyses
+                failed_analyses += 1
+
+        asyncio.run(
+            run_worker_pool(
+                items=indexed_roots,
+                worker_fn=_async_analyze_root,
+                max_workers=max_workers,
+                on_error=_on_error,
+            )
+        )
+
+        try:
+            analyzer.finalize()
+        except Exception as e:
+            self.logger.warning(f"Error finalizing analyzer: {e}")
+
+        self.logger.info(
+            f"Call-tree analysis complete. Roots succeeded: {successful_analyses}, failed: {failed_analyses}"
+        )
+        if self.token_tracker and (successful_analyses > 0 or failed_analyses > 0):
+            self.token_tracker.log_summary()
+
+        return successful_analyses, failed_analyses
+
+    def _publish_call_tree_issues(
+        self,
+        tree,                                # CallTree instance
+        issues: List[Dict[str, Any]],
+        repo_path: str,
+        publisher_lock: threading.Lock,
+        index: int,
+        total_roots: int,
+    ) -> None:
+        """Group call-tree issues by ``defect_function`` and publish each group
+        under the existing per-function storage key so downstream filters,
+        dedup, and the report generator continue to work unchanged.
+
+        Issues without a recognizable ``defect_function`` are attached to the
+        root.
+        """
+        if not issues:
+            # Even with zero issues we publish an empty entry for the root so
+            # the cache records "this root was analyzed → no defects".
+            repo_name = os.path.basename(repo_path.rstrip('/'))
+            with publisher_lock:
+                self.results_publisher.add_result(
+                    repo_name=repo_name,
+                    file_path=tree.root_file,
+                    function=tree.root,
+                    function_checksum=tree.root_checksum,
+                    results=[]
+                )
+            return
+
+        # Map function-name -> (file, checksum) from the tree so we can attach
+        # each issue to its defect-site function record.
+        node_lookup: Dict[str, Tuple[str, str]] = {
+            n.function: (n.file, n.checksum) for n in tree.nodes
+        }
+
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for raw in issues:
+            if not isinstance(raw, dict):
+                continue
+            defect_fn = (
+                raw.get('defect_function')
+                or raw.get('function_name')
+                or tree.root
+            )
+            # Legacy schema compatibility: ensure file_path/function_name/line_number
+            # are populated from the new field names if the LLM only emitted the new shape.
+            normalized = dict(raw)
+            if 'function_name' not in normalized:
+                normalized['function_name'] = defect_fn
+            if 'file_path' not in normalized:
+                normalized['file_path'] = raw.get('defect_file', '')
+            if 'file_name' not in normalized and normalized.get('file_path'):
+                normalized['file_name'] = os.path.basename(normalized['file_path'])
+            if 'line_number' not in normalized:
+                normalized['line_number'] = str(raw.get('defect_line_number', ''))
+            if 'issueType' not in normalized:
+                normalized['issueType'] = normalized.get('category', 'logicBug')
+            if 'severity' not in normalized:
+                normalized['severity'] = 'medium'
+
+            groups.setdefault(defect_fn, []).append(normalized)
+
+        repo_name = os.path.basename(repo_path.rstrip('/'))
+        for defect_fn, fn_issues in groups.items():
+            file_path, checksum = node_lookup.get(defect_fn, (tree.root_file, tree.root_checksum))
+            # If the defect_function isn't a tree node (LLM cited an
+            # out-of-tree function), fall back to attaching to the root.
+            if defect_fn not in node_lookup:
+                self.logger.info(
+                    f"[{index}/{total_roots}] defect_function {defect_fn!r} not in tree, "
+                    f"attributing to root {tree.root}"
+                )
+                defect_fn = tree.root
+
+            # Apply unified filter per function group (matches legacy path).
+            if self.unified_issue_filter and fn_issues:
+                filtered = self.unified_issue_filter.filter_issues(fn_issues, None)
+                if len(filtered) != len(fn_issues):
+                    self.logger.info(
+                        f"[{index}/{total_roots}] Unified filter dropped "
+                        f"{len(fn_issues) - len(filtered)} issues for {defect_fn}, "
+                        f"kept {len(filtered)}"
+                    )
+                fn_issues = filtered
+
+            with publisher_lock:
+                self.results_publisher.add_result(
+                    repo_name=repo_name,
+                    file_path=file_path,
+                    function=defect_fn,
+                    function_checksum=checksum,
+                    results=fn_issues,
+                )
+
+    # ==================================================================
+    # End call-tree pipeline
+    # ==================================================================
 
     def pull_results_from_directory(self, artifacts_dir: str) -> Dict[str, Any]:
         """
@@ -2180,23 +2618,31 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 self.logger.debug(f"No dropped issues directory found at: {dropped_issues_base_dir}")
                 return []
             
-            # Iterate through all level directories (level1_*, level2_*, level3_*)
-            for level_dir_name in sorted(os.listdir(dropped_issues_base_dir)):
-                level_dir_path = os.path.join(dropped_issues_base_dir, level_dir_name)
-                
-                if not os.path.isdir(level_dir_path):
+            # Filters may write dropped-issue JSONs either directly into
+            # dropped_issues/ or nested in level{1,2,3}_* subdirectories.
+            # Walk both layouts so no dropped issues are silently omitted.
+            for entry_name in sorted(os.listdir(dropped_issues_base_dir)):
+                entry_path = os.path.join(dropped_issues_base_dir, entry_name)
+
+                if os.path.isfile(entry_path) and entry_name.endswith('.json'):
+                    try:
+                        with open(entry_path, 'r', encoding='utf-8') as f:
+                            dropped_issues.append(json.load(f))
+                    except (json.JSONDecodeError, IOError) as e:
+                        self.logger.warning(f"Failed to read dropped issue file {entry_path}: {e}")
                     continue
-                
-                # Read all JSON files in this level directory
-                for filename in os.listdir(level_dir_path):
+
+                if not os.path.isdir(entry_path):
+                    continue
+
+                for filename in os.listdir(entry_path):
                     if not filename.endswith('.json'):
                         continue
-                    
-                    file_path = os.path.join(level_dir_path, filename)
+
+                    file_path = os.path.join(entry_path, filename)
                     try:
                         with open(file_path, 'r', encoding='utf-8') as f:
-                            dropped_issue = json.load(f)
-                            dropped_issues.append(dropped_issue)
+                            dropped_issues.append(json.load(f))
                     except (json.JSONDecodeError, IOError) as e:
                         self.logger.warning(f"Failed to read dropped issue file {file_path}: {e}")
                         continue
@@ -3018,6 +3464,59 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             self.logger.error(f"Error printing dropped issues statistics: {e}")
 
 
+def _default_text_file_output(project_name: str) -> str:
+    """Default HTML output path for the text-file re-rendering flow."""
+    safe_name = project_name.replace(" ", "_")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.expanduser(
+        f"~/llm_artifacts/from_text/repo_analysis_{safe_name}_{timestamp}_from_text.html"
+    )
+
+
+def _run_generate_from_text_file(args) -> None:
+    """Re-render an HTML report from a Copy-All text dump.
+
+    Pure rendering path — no LLM, no AST, no artifacts cache. Exits the
+    process via sys.exit(1) on user-facing errors so the CLI keeps a single
+    failure mode regardless of where the error originates.
+    """
+    if args.generate_report_from_existing_issues:
+        logger.error(
+            "--generate-from-text-file and --generate-report-from-existing-issues are mutually exclusive"
+        )
+        sys.exit(1)
+    if not os.path.isfile(args.generate_from_text_file):
+        logger.error("Input text file not found: %s", args.generate_from_text_file)
+        sys.exit(1)
+
+    from ..report.text_file_issue_parser import parse_issues_text_file
+
+    try:
+        issues = parse_issues_text_file(args.generate_from_text_file)
+    except ValueError as e:
+        logger.error("Failed to parse text file: %s", e)
+        sys.exit(1)
+
+    if not issues:
+        logger.error("No issues found in %s", args.generate_from_text_file)
+        sys.exit(1)
+
+    project_name = (
+        args.text_file_project_name
+        or os.path.basename(args.repo.rstrip("/"))
+    )
+    out_path = args.text_file_output or _default_text_file_output(project_name)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    report_path = generate_html_report(
+        issues,
+        output_file=out_path,
+        project_name=project_name,
+        analysis_type="Code Analysis",
+    )
+    logger.info("HTML report written to: %s", report_path)
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -3068,13 +3567,11 @@ EXAMPLES:
     )
     parser.add_argument(
         "--config", "-c",
-        required=True,
-        help="Path to configuration file"
+        help="Path to configuration file (required unless --generate-from-text-file is used)"
     )
     parser.add_argument(
         "--repo", "-r",
-        required=True,
-        help="Path to repository directory"
+        help="Path to repository directory (required unless --generate-from-text-file is used)"
     )
     parser.add_argument(
         "--out-dir", "-o",
@@ -3095,6 +3592,25 @@ EXAMPLES:
         "--generate-report-from-existing-issues",
         action="store_true",
         help="Generate report from existing analysis files without running analysis. Requires --config to locate artifacts."
+    )
+    parser.add_argument(
+        "--generate-from-text-file",
+        metavar="PATH",
+        help="Path to a text file produced by the report's 'Copy All' button. "
+             "Re-renders an HTML report from the text without running analysis. "
+             "Mutually exclusive with --generate-report-from-existing-issues."
+    )
+    parser.add_argument(
+        "--text-file-project-name",
+        metavar="NAME",
+        help="Optional repository label for the regenerated report header. "
+             "If omitted, derived from the --repo directory name."
+    )
+    parser.add_argument(
+        "--text-file-output",
+        metavar="PATH",
+        help="Optional output HTML path. Default: ~/llm_artifacts/from_text/"
+             "repo_analysis_<project>_<timestamp>_from_text.html"
     )
     parser.add_argument(
         "--issue-dedupe",
@@ -3180,6 +3696,23 @@ EXAMPLES:
     )
 
     args = parser.parse_args()
+
+    # --generate-from-text-file is a pure re-rendering path. It does not need
+    # --config, but it does need --repo so the report header shows the correct
+    # repository name. Exits before any analysis infra is set up.
+    if args.generate_from_text_file:
+        if not args.repo:
+            logger.error("Error: --repo is required when using --generate-from-text-file")
+            sys.exit(1)
+        _run_generate_from_text_file(args)
+        sys.exit(0)
+
+    if not args.config:
+        logger.error("Error: --config is required (unless using --generate-from-text-file)")
+        sys.exit(1)
+    if not args.repo:
+        logger.error("Error: --repo is required (unless using --generate-from-text-file)")
+        sys.exit(1)
 
     # Create runner instance
     runner = CodeAnalysisRunner()

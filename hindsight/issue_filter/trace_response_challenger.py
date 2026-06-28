@@ -34,15 +34,15 @@ class TraceResponseChallenger:
     It acts as a senior software engineer reviewing execution traces to determine if issues are worth pursuing.
     """
     
-    def __init__(self, api_key: str, config: dict, dropped_issues_dir: Optional[str] = None, capture_evidence: bool = True, file_content_provider=None):
+    def __init__(self, api_key: str, config: dict, dropped_issues_dir: Optional[str] = None, capture_evidence: bool = False, file_content_provider=None):
         """
         Initialize the Trace Response Challenger.
-        
+
         Args:
             api_key: API key for LLM provider
             config: Configuration dictionary (same format as used by analyzers)
             dropped_issues_dir: Directory to save dropped issues (optional)
-            capture_evidence: Whether to capture validation evidence (default: True)
+            capture_evidence: Whether to attach challenger reasoning to each kept issue (default: False — challenger artifacts are still persisted to disk).
             file_content_provider: FileContentProvider instance for file resolution (optional)
         """
         self.logger = get_logger(__name__)

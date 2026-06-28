@@ -124,18 +124,46 @@ class ResponseChallengerAnalyzer(BaseIterativeAnalyzer):
         
         return True
     
-    def get_fallback_guidance(self) -> str:
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
         """
         Get response challenger-specific guidance for JSON output.
-        
+
+        Args:
+            validation_reason: Optional description of what was wrong with the
+                previous response.
+
         Returns:
-            Guidance message for producing a verdict dict
+            Guidance message that includes the canonical schema and CORRECT
+            examples for both verdicts.
         """
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid verdict. "
-            "You MUST respond with ONLY a valid JSON object containing your decision. "
-            "Your response MUST be a JSON object with 'result' (boolean) and 'reason' (string) keys. "
-            "Example for filtering out: {\"result\": true, \"reason\": \"This is a false positive because...\"} "
-            "Example for keeping: {\"result\": false, \"reason\": \"This is a legitimate issue because...\"} "
-            "No markdown, no prose, no explanatory text. Return the JSON object now."
+            "CRITICAL: Your previous response did not contain a valid verdict.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON OBJECT representing your decision. "
+            "It MUST contain a boolean `result` and a string `reason`.\n\n"
+            "### Required schema\n"
+            "```json\n"
+            "{\n"
+            '  "result": true,\n'
+            '  "reason": "string — brief justification (one or two sentences)"\n'
+            "}\n"
+            "```\n\n"
+            "Semantics:\n"
+            "- `result: true`  → filter out the issue (false positive / not worth fixing).\n"
+            "- `result: false` → keep the issue (legitimate, actionable bug or optimization).\n\n"
+            "### CORRECT example (filter out)\n"
+            "```json\n"
+            '{"result": true, "reason": "This is a false positive: the value is validated by the caller."}\n'
+            "```\n\n"
+            "### CORRECT example (keep)\n"
+            "```json\n"
+            '{"result": false, "reason": "This is a real concurrency bug — the lock is released before mutation completes."}\n'
+            "```\n\n"
+            "Your response MUST start with `{` and end with `}`. "
+            "Return JSON ONLY — no markdown fences, no prose."
         )

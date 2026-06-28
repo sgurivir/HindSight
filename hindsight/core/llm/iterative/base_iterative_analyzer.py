@@ -138,13 +138,23 @@ class BaseIterativeAnalyzer(ABC):
         pass
     
     @abstractmethod
-    def get_fallback_guidance(self) -> str:
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
         """
         Get stage-specific guidance message for JSON output.
-        
-        This message is sent to the LLM when no valid JSON is found,
-        to guide it toward producing the correct output format.
-        
+
+        This message is sent to the LLM when no valid JSON is found or when
+        validation rejects the parsed JSON. Implementations MUST embed the
+        canonical schema and at least one CORRECT example so the LLM can
+        re-emit a well-formed response without ambiguity.
+
+        Args:
+            validation_reason: Optional human-readable description of why the
+                previous response failed (e.g., "got dict missing
+                'primary_function' key", "got list of strings, expected list
+                of dicts", "no JSON object found in the response"). When
+                provided, implementations should include it verbatim so the
+                LLM knows exactly what to fix.
+
         Returns:
             Guidance message string
         """
@@ -313,25 +323,39 @@ class BaseIterativeAnalyzer(ABC):
                 # Use stage-specific extract_json() instead of generic clean_json_response()
                 cleaned_response = self.extract_json(assistant_content)
 
+                # Track WHY the response failed so we can give the LLM specific guidance.
+                validation_reason: Optional[str] = None
+
                 # Check if we have valid JSON content after extraction
                 has_valid_json = False
                 if cleaned_response and cleaned_response.strip():
                     try:
                         parsed_json = json.loads(cleaned_response)
-                        
+
                         # Skip validation if this looks like a tool call JSON (not final output)
                         is_tool_call_json = isinstance(parsed_json, dict) and 'tool' in parsed_json
-                        
+
                         if is_tool_call_json:
                             logger.info(f"[{stage_name}] Found tool-call JSON in iteration {iteration} (has 'tool' key) — not treating as final output")
+                            validation_reason = (
+                                "your response was a single tool-call JSON object instead of a final structured answer"
+                            )
                         elif self.validate_json(parsed_json):
                             has_valid_json = True
                             logger.info(f"[{stage_name}] Found valid JSON in response after extraction in iteration {iteration}")
                         else:
-                            # Debug logging: show what structure was received vs what was expected
-                            self._log_json_validation_failure(parsed_json, iteration)
-                    except json.JSONDecodeError:
+                            # Capture a precise reason and log diagnostics
+                            validation_reason = self._describe_validation_failure(parsed_json)
+                            logger.info(
+                                f"[{stage_name}] JSON failed shape validator in iteration {iteration} — {validation_reason}"
+                            )
+                    except json.JSONDecodeError as e:
                         logger.info(f"[{stage_name}] No valid JSON found after extraction in iteration {iteration}")
+                        validation_reason = (
+                            f"the JSON in your response could not be parsed (JSONDecodeError: {e.msg} at line {e.lineno} col {e.colno})"
+                        )
+                else:
+                    validation_reason = "no JSON object or array was found in your response"
 
                 # If we have valid JSON or this is the last possible iteration, complete analysis
                 if has_valid_json or iteration >= max_iterations:
@@ -354,8 +378,8 @@ class BaseIterativeAnalyzer(ABC):
                         return final_response
                 else:
                     # No valid JSON found and not at max iterations - continue iteration
-                    # Use stage-specific fallback guidance
-                    guidance_message = self.get_fallback_guidance()
+                    # Use stage-specific fallback guidance, scoped to the failure mode
+                    guidance_message = self.get_fallback_guidance(validation_reason=validation_reason)
                     self.conversation_state.add_user_message(guidance_message)
                     logger.info(f"[{stage_name}] No structured output found, continuing iteration {iteration + 1}")
                     continue
@@ -389,23 +413,36 @@ class BaseIterativeAnalyzer(ABC):
                 return final_response
         return None
     
-    def _log_json_validation_failure(self, parsed_json: Any, iteration: int) -> None:
-        """Log details about JSON validation failure for debugging."""
-        stage_name = self.__class__.__name__
-        json_type = type(parsed_json).__name__
-        
+    def _describe_validation_failure(self, parsed_json: Any) -> str:
+        """
+        Build a short, human-readable description of why parsed JSON failed
+        the stage-specific shape validator.
+
+        Used both for diagnostic logging and as the `validation_reason`
+        passed back into `get_fallback_guidance()` so the LLM is told
+        exactly what was wrong with its previous response.
+        """
         if isinstance(parsed_json, dict):
-            top_keys = list(parsed_json.keys())[:5]
-            logger.info(f"[{stage_name}] Found JSON but failed shape validator in iteration {iteration} — "
-                       f"got dict with keys: {top_keys} — continuing")
-        elif isinstance(parsed_json, list):
+            top_keys = list(parsed_json.keys())[:8]
+            return f"got a JSON dict with top-level keys {top_keys} that did not match the required schema"
+        if isinstance(parsed_json, list):
             list_len = len(parsed_json)
             first_item_type = type(parsed_json[0]).__name__ if parsed_json else 'empty'
-            logger.info(f"[{stage_name}] Found JSON but failed shape validator in iteration {iteration} — "
-                       f"got list with {list_len} items, first item type: {first_item_type} — continuing")
-        else:
-            logger.info(f"[{stage_name}] Found JSON but failed shape validator in iteration {iteration} — "
-                       f"got {json_type} — continuing")
+            return (
+                f"got a JSON list with {list_len} items (first item type: {first_item_type}) "
+                f"that did not match the required schema"
+            )
+        return f"got a JSON value of type {type(parsed_json).__name__} instead of the expected object/array shape"
+
+    def _log_json_validation_failure(self, parsed_json: Any, iteration: int) -> None:
+        """Log details about JSON validation failure for debugging.
+
+        Retained as a thin shim for any external callers; the run loop now
+        uses :meth:`_describe_validation_failure` directly.
+        """
+        stage_name = self.__class__.__name__
+        reason = self._describe_validation_failure(parsed_json)
+        logger.info(f"[{stage_name}] Found JSON but failed shape validator in iteration {iteration} — {reason} — continuing")
     
     def _extract_json_tool_requests(self, content: str) -> List[Dict[str, Any]]:
         """

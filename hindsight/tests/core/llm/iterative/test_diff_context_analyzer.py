@@ -248,16 +248,37 @@ class TestDiffContextAnalyzerGetFallbackGuidance:
         
         self.analyzer = DiffContextAnalyzer(claude=self.mock_claude)
 
-    def test_fallback_guidance_mentions_changed_functions(self):
-        """Test that fallback guidance mentions the required structure."""
+    def test_fallback_guidance_mentions_primary_function(self):
+        """Guidance must point at the actual schema's wrapper key (primary_function)."""
         guidance = self.analyzer.get_fallback_guidance()
-        
-        assert "changed_functions" in guidance
+
+        # The diff context schema (diffContextCollectionProcess.md) wraps the bundle
+        # under `primary_function` — guidance should echo that, not the legacy
+        # 'changed_functions' name.
+        assert "primary_function" in guidance
         assert "JSON" in guidance
 
     def test_fallback_guidance_mentions_object_not_array(self):
         """Test that fallback guidance clarifies object vs array."""
         guidance = self.analyzer.get_fallback_guidance()
-        
+
         # Should mention that we need an object, not an array
         assert "object" in guidance.lower() or "{" in guidance
+
+    def test_fallback_guidance_includes_schema_and_examples(self):
+        """Guidance must surface the canonical schema and CORRECT + WRONG examples."""
+        guidance = self.analyzer.get_fallback_guidance()
+
+        assert "Required schema" in guidance
+        assert "CORRECT" in guidance
+        assert "WRONG" in guidance
+        for field in ("schema_version", "callees", "callers", "data_types",
+                      "diff_context", "is_modified", "changed_lines"):
+            assert field in guidance, f"missing required field {field!r} in guidance"
+
+    def test_fallback_guidance_embeds_validation_reason(self):
+        """When given a validation reason, the guidance must repeat it verbatim."""
+        reason = "got a JSON dict with top-level keys ['function_name']"
+        guidance = self.analyzer.get_fallback_guidance(validation_reason=reason)
+
+        assert reason in guidance

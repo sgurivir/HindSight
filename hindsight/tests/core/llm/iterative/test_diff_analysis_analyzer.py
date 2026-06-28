@@ -260,12 +260,30 @@ class TestDiffAnalysisAnalyzerGetFallbackGuidance:
     def test_fallback_guidance_mentions_array(self):
         """Test that fallback guidance mentions the required array structure."""
         guidance = self.analyzer.get_fallback_guidance()
-        
+
         assert "array" in guidance.lower() or "[" in guidance
 
     def test_fallback_guidance_mentions_issue_objects(self):
         """Test that fallback guidance clarifies issue objects."""
         guidance = self.analyzer.get_fallback_guidance()
-        
+
         # Should mention that we need issue objects, not strings
         assert "issue" in guidance.lower() or "object" in guidance.lower()
+
+    def test_fallback_guidance_includes_schema_and_examples(self):
+        """Guidance must surface the canonical issue schema + examples (single + empty)."""
+        guidance = self.analyzer.get_fallback_guidance()
+
+        assert "Required schema" in guidance
+        assert "CORRECT" in guidance
+        for field in ("file_path", "function_name", "line_number", "severity",
+                      "issue", "description", "suggestion", "category", "issueType"):
+            assert field in guidance, f"missing required field {field!r} in guidance"
+        assert "[]" in guidance, "guidance must show empty-array shape"
+
+    def test_fallback_guidance_embeds_validation_reason(self):
+        """When given a validation reason, the guidance must repeat it verbatim."""
+        reason = "got a JSON dict with top-level keys ['file_path']"
+        guidance = self.analyzer.get_fallback_guidance(validation_reason=reason)
+
+        assert reason in guidance

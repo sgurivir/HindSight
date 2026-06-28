@@ -1,0 +1,18 @@
+{
+    "project_name": "UserStudies",
+    "description": "UserStudies",
+    
+    "api_end_point": "https://floodgate.g.apple.com/api/openai/v1/chat/completions",
+    "model": "anthropic.claude-opus-4-7",
+    "llm_provider_type": "aws_bedrock",
+    "credentials": "",
+
+    "exclude_directories": ["PrivateHeaders","proto","ProtocolBuffers","UserStudies-release-8.4","UserStudiesIntegrationTests","UserStudiesTestbed","UserStudiesTester","UserStudiesTesterTests","UserStudiesTesterUITests","UserStudiesTestsShared","UserStudiesUnitTests"
+    ],
+    "include_directories": [],
+    "exclude_files": [],
+    
+    "min_function_body_length": 5,
+    
+    "user_prompts": [ ""]
+}

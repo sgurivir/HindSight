@@ -119,27 +119,27 @@ class TracePromptBuilder:
     - `file_path`: Complete path of the file relative to the repository
     - `functionName`: Exact name of the function with the issue
     - `line`: Line number or range where the issue occurs
-    - `issue`: Clear, specific description of the problem found
+    - `issue`: Brief one-sentence summary of the problem
     - `category`: Must be one of "performance", "memoryManagement", "concurrency", "errorHandling", "resourceManagement", "codeQuality", "logicBug", "minorOptimizationConsiderations"
     - `issueType`: The specific type of issue (use the category value if no more specific type applies)
-    - `impact`: Description of the potential impact or consequences
-    - `potentialSolution`: Specific, actionable solution or recommendation
+    - `description`: Detailed explanation of why this is a problem, what conditions trigger it, and what the impact is
+    - `suggestion`: Specific, actionable recommendation with file names and line numbers
 
     **CRITICAL HTML FORMATTING INSTRUCTIONS**:
-    
-    For the `issue`, `impact`, and `potentialSolution` fields:
+
+    For the `issue`, `description`, and `suggestion` fields:
     - When listing multiple items, use HTML line breaks for proper formatting
     - Start each numbered item on a new line using `<br>` tags
     - Format numbered lists as: "1) First item<br>2) Second item<br>3) Third item"
     - This ensures proper display in HTML reports
-    
+
     **Example of proper formatting**:
     ```
-    "potentialSolution": "Consider these optimizations:<br>1) In file MyClass.cpp at line 45, replace the loop with a more efficient algorithm<br>2) Modify MyHeader.h lines 12-15 to use inline functions<br>3) Update MyFile.m line 78 by adding caching"
+    "suggestion": "Consider these optimizations:<br>1) In file MyClass.cpp at line 45, replace the loop with a more efficient algorithm<br>2) Modify MyHeader.h lines 12-15 to use inline functions<br>3) Update MyFile.m line 78 by adding caching"
     ```
 
-    **MUST INSTRUCTION FOR POTENTIAL SOLUTION**:
-    The "potentialSolution" field MUST ALWAYS include specific file names and line numbers where the changes should be made. Format examples:
+    **MUST INSTRUCTION FOR SUGGESTION**:
+    The "suggestion" field MUST ALWAYS include specific file names and line numbers where the changes should be made. Format examples:
     - "In file MyClass.cpp at line 45, replace the loop with..."
     - "Modify MyHeader.h lines 12-15 to change..."
     - "Update MyFile.m line 78 by adding..."

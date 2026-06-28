@@ -41,21 +41,21 @@ class UnifiedIssueFilter:
                  additional_allowed_categories: List[str] = None,
                  dropped_issues_dir: Optional[str] = None,
                  enable_llm_filtering: bool = True,
-                 capture_evidence: bool = True,
+                 capture_evidence: bool = False,
                  file_content_provider=None,
                  directory_tree_util=None,
                  repo_path: Optional[str] = None,
                  artifacts_dir: Optional[str] = None):
         """
         Initialize the unified issue filter.
-        
+
         Args:
             api_key: API key for LLM provider (required for Level 2 and Level 3 filtering)
             config: Configuration dictionary (same format as used by analyzers)
             additional_allowed_categories: Additional categories to allow beyond defaults (logicBug, performance)
             dropped_issues_dir: Directory to save dropped issues (optional)
             enable_llm_filtering: Whether to enable Level 2 LLM and Level 3 Response Challenger filtering (default: True)
-            capture_evidence: Whether to capture validation evidence (default: True)
+            capture_evidence: Whether to attach Level 3 challenger reasoning to each kept issue (default: False — challenger artifacts are still persisted to disk regardless).
             file_content_provider: FileContentProvider instance for file resolution (optional)
             directory_tree_util: DirectoryTreeUtil instance for directory listing (optional)
             repo_path: Path to the repository (optional, for runTerminalCmd tool)
@@ -300,7 +300,7 @@ def create_unified_filter(api_key: str, config: dict,
                          additional_allowed_categories: List[str] = None,
                          dropped_issues_dir: Optional[str] = None,
                          enable_llm_filtering: bool = True,
-                         capture_evidence: bool = True,
+                         capture_evidence: bool = False,
                          file_content_provider=None,
                          directory_tree_util=None,
                          repo_path: Optional[str] = None,
@@ -316,7 +316,7 @@ def create_unified_filter(api_key: str, config: dict,
         additional_allowed_categories: Additional categories to allow beyond defaults (logicBug, performance)
         dropped_issues_dir: Directory to save dropped issues (optional)
         enable_llm_filtering: Whether to enable Level 2 LLM and Level 3 Response Challenger filtering (default: True)
-        capture_evidence: Whether to capture validation evidence (default: True)
+        capture_evidence: Whether to attach Level 3 challenger reasoning to each kept issue (default: False)
         file_content_provider: FileContentProvider instance for file resolution (optional)
         directory_tree_util: DirectoryTreeUtil instance for directory listing (optional)
         repo_path: Path to the repository (optional, for runTerminalCmd tool)

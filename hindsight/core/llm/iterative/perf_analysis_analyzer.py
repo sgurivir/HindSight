@@ -81,14 +81,42 @@ class PerfAnalysisAnalyzer(BaseIterativeAnalyzer):
             return True
         return all(isinstance(item, dict) for item in parsed_json)
 
-    def get_fallback_guidance(self) -> str:
-        """Get perf analysis-specific guidance."""
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
+        """Get perf analysis-specific guidance, with full schema and example."""
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid performance issues array. "
-            "You MUST respond with ONLY a valid JSON array of issue objects. "
+            "CRITICAL: Your previous response did not contain a valid performance issues array.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON ARRAY of performance-issue objects. "
+            "Each item must be a JSON OBJECT (dict), not a string. "
+            "If no performance issues are found, return exactly `[]` — empty is VALID.\n\n"
+            "### Required schema (each item)\n"
+            "```json\n"
+            "{\n"
+            '  "file_path": "string", "function_name": "string", "line_number": "string",\n'
+            '  "severity": "string — high | medium | low",\n'
+            '  "issue": "string", "description": "string", "suggestion": "string",\n'
+            '  "category": "string — e.g. allocation | io | sync | loop | cache",\n'
+            '  "issueType": "string — same vocabulary as category"\n'
+            "}\n"
+            "```\n\n"
+            "### CORRECT example\n"
+            "```json\n"
+            '[{"file_path": "src/Renderer.swift", "function_name": "Renderer.draw", '
+            '"line_number": "120", "severity": "medium", '
+            '"issue": "O(n) work inside main-thread layout pass", '
+            '"description": "draw() walks every cell on every call.", '
+            '"suggestion": "Cache visible cell list and invalidate on data change.", '
+            '"category": "loop", "issueType": "loop"}]\n'
+            "```\n\n"
+            "### CORRECT example (no perf issues)\n"
+            "```json\n"
+            "[]\n"
+            "```\n\n"
             "Your response MUST start with `[` and end with `]`. "
-            "Each item must be a JSON object with keys: file_path, function_name, line_number, "
-            "severity, issue, description, suggestion, category, issueType. "
-            "If no performance issues found, return exactly: [] "
-            "No markdown, no prose. Return the JSON array now."
+            "Return JSON ONLY — no markdown fences, no prose."
         )

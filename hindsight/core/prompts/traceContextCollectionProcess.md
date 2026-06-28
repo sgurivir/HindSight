@@ -138,6 +138,10 @@ If the knowledge base has relevant entries, incorporate that information into yo
 {"tool": "lookup_knowledge", "query": "function_name_here", "reason": "Check for prior analysis learnings about this function"}
 ```
 
+- Each tool call must be in its **own** fenced block.
+- You may include multiple tool calls in one response.
+- Parameters are **flat** (top-level keys alongside `"tool"`).
+
 ---
 
 ## LINE NUMBER RULE (CRITICAL)

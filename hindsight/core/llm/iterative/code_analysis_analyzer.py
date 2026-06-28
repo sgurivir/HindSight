@@ -124,18 +124,58 @@ class CodeAnalysisAnalyzer(BaseIterativeAnalyzer):
         # All items must be dicts (issue objects)
         return all(isinstance(item, dict) for item in parsed_json)
     
-    def get_fallback_guidance(self) -> str:
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
         """
         Get code analysis-specific guidance for JSON output.
-        
+
+        Args:
+            validation_reason: Optional description of what was wrong with the
+                previous response. Embedded verbatim so the LLM knows exactly
+                what to fix.
+
         Returns:
-            Guidance message for producing an issues array
+            Guidance message that includes the canonical issue-array schema
+            and a CORRECT example.
         """
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid issues array. "
-            "You MUST respond with ONLY a valid JSON array of issue objects. "
+            "CRITICAL: Your previous response did not contain a valid issues array.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON ARRAY of issue objects. "
+            "Each item must be a JSON OBJECT (dict), not a string. "
+            "If no issues are found, return exactly `[]` — an empty array is a VALID answer.\n\n"
+            "### Required schema (each item)\n"
+            "```json\n"
+            "{\n"
+            '  "file_path": "string — path/to/file.ext",\n'
+            '  "file_name": "string — file.ext",\n'
+            '  "function_name": "string — functionName",\n'
+            '  "line_number": "string — \\"123\\" or \\"45-48\\"",\n'
+            '  "severity": "string — high | medium | low",\n'
+            '  "issue": "string — brief description",\n'
+            '  "description": "string — detailed explanation",\n'
+            '  "suggestion": "string — how to fix",\n'
+            '  "category": "string — e.g. logicBug | concurrency | memory | api",\n'
+            '  "issueType": "string — e.g. logicBug | concurrency | memory | api"\n'
+            "}\n"
+            "```\n\n"
+            "### CORRECT example (one issue)\n"
+            "```json\n"
+            '[{"file_path": "src/Cache.swift", "file_name": "Cache.swift", '
+            '"function_name": "Cache.evict", "line_number": "82", "severity": "high", '
+            '"issue": "Use-after-free on evicted entry", '
+            '"description": "evict() returns the entry then deallocates it; the caller dereferences the returned pointer.", '
+            '"suggestion": "Return a copy or extend the lifetime via a strong reference until the caller is done.", '
+            '"category": "memory", "issueType": "memory"}]\n'
+            "```\n\n"
+            "### CORRECT example (no issues found)\n"
+            "```json\n"
+            "[]\n"
+            "```\n\n"
             "Your response MUST start with `[` and end with `]`. "
-            "Each item in the array must be a JSON object (dict) representing an issue. "
-            "If no issues found, return exactly: [] "
-            "No markdown, no prose, no explanatory text. Return the JSON array now."
+            "Return JSON ONLY — no markdown fences, no prose, no analysis text outside the array."
         )

@@ -1,17 +1,14 @@
 {
-    "project_name": "Almanac Apps",
-    "description": "Almanac Apps",
+    "project_name": "Conversation Intelligence",
+    "description": "conversationIntelligence",
     
     "api_end_point": "https://floodgate.g.apple.com/api/openai/v1/chat/completions",
     "model": "anthropic.claude-opus-4-7",
     "llm_provider_type": "aws_bedrock",
     "credentials": "",
     
-    
-
-    "exclude_directories": ["AlmanacProxy"
-    ],
-    "include_directories": ["StudyApp"],
+    "exclude_directories": ["conversationtool", "TapToRadar", "Tests"],
+    "include_directories": [],
     "exclude_files": [],
     
     "min_function_body_length": 7,

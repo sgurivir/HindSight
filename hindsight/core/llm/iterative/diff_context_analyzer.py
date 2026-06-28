@@ -131,17 +131,76 @@ class DiffContextAnalyzer(BaseIterativeAnalyzer):
         
         return False
     
-    def get_fallback_guidance(self) -> str:
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
         """
         Get diff context collection-specific guidance for JSON output.
-        
+
+        Args:
+            validation_reason: Optional description of what was wrong with the
+                previous response. Embedded verbatim so the LLM knows exactly
+                what to fix.
+
         Returns:
-            Guidance message for producing a diff context bundle
+            Guidance message that includes the canonical schema and a CORRECT
+            example, plus a WRONG example highlighting the missing-wrapper
+            failure mode.
         """
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid diff context bundle. "
-            "You MUST respond with ONLY a valid JSON diff context bundle object. "
+            "CRITICAL: Your previous response did not contain a valid diff context bundle.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON OBJECT matching the schema below. "
+            "The bundle MUST have a top-level `primary_function` key (the diff's primary "
+            "function), wrapping all of the function metadata.\n\n"
+            "### Required schema\n"
+            "```json\n"
+            "{\n"
+            '  "schema_version": "1.0",\n'
+            '  "primary_function": {\n'
+            '    "function_name": "string", "class_name": "string | null",\n'
+            '    "file_path": "string", "file_name": "string", "language": "string",\n'
+            '    "start_line": 0, "end_line": 0,\n'
+            '    "source": "string — full verbatim source with +/-/space markers per line",\n'
+            '    "changed_lines": [ { "line": 0, "marker": "+ | -", "code": "string" } ],\n'
+            '    "is_modified": true\n'
+            "  },\n"
+            '  "callees": [ { "function_name": "string", "file_path": "string", '
+            '"start_line": 0, "end_line": 0, "source": "string", "is_modified": false, '
+            '"changed_lines": [], "affected_reason": "string", '
+            '"call_sites": [ { "line": 0, "expression": "string" } ] } ],\n'
+            '  "callers": [ { "function_name": "string", "file_path": "string", '
+            '"start_line": 0, "end_line": 0, "source": "string", "is_modified": false, '
+            '"changed_lines": [], "affected_reason": "string" } ],\n'
+            '  "data_types": [ { "type_name": "string", "kind": "string", '
+            '"file_path": "string", "start_line": 0, "end_line": 0, "source": "string" } ],\n'
+            '  "constants_and_globals": [ { "name": "string", "file_path": "string", '
+            '"line": 0, "source": "string" } ],\n'
+            '  "diff_context": { "total_lines_added": 0, "total_lines_removed": 0, '
+            '"files_changed_in_diff": [ "string" ] },\n'
+            '  "collection_notes": [ "string" ]\n'
+            "}\n"
+            "```\n\n"
+            "### CORRECT minimal example\n"
+            "```json\n"
+            '{"schema_version": "1.0", "primary_function": {"function_name": "Auth.signIn", '
+            '"class_name": "Auth", "file_path": "src/Auth.swift", "file_name": "Auth.swift", '
+            '"language": "swift", "start_line": 50, "end_line": 70, '
+            '"source": " 50: func signIn(...) {\\n+51:   if token == expected { ... }\\n}", '
+            '"changed_lines": [{"line": 51, "marker": "+", "code": "if token == expected { ... }"}], '
+            '"is_modified": true}, '
+            '"callees": [], "callers": [], "data_types": [], "constants_and_globals": [], '
+            '"diff_context": {"total_lines_added": 1, "total_lines_removed": 0, '
+            '"files_changed_in_diff": ["src/Auth.swift"]}, "collection_notes": []}\n'
+            "```\n\n"
+            "### WRONG (do NOT do this — missing `primary_function` wrapper)\n"
+            "```json\n"
+            '{"function_name": "Auth.signIn", "file_path": "src/Auth.swift", '
+            '"start_line": 50, "end_line": 70, "source": "..."}\n'
+            "```\n\n"
             "Your response MUST start with `{` and end with `}`. "
-            "The JSON object MUST contain a 'changed_functions' key. "
-            "No markdown, no arrays, no prose. Return the JSON object now."
+            "Return JSON ONLY — no markdown fences, no arrays, no prose."
         )

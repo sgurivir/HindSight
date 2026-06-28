@@ -60,6 +60,8 @@ CONTEXT_COLLECTION_PROCESS_FILE = "contextCollectionProcess.md"
 ANALYSIS_PROCESS_FILE = "analysisProcess.md"
 DIFF_CONTEXT_COLLECTION_PROCESS_FILE = "diffContextCollectionProcess.md"
 DIFF_ANALYSIS_PROCESS_FILE = "diffAnalysisProcess.md"
+CALL_TREE_ANALYSIS_PROCESS_FILE = "callTreeAnalysisProcess.md"
+DIFF_CALL_TREE_ANALYSIS_PROCESS_FILE = "diffCallTreeAnalysisProcess.md"
 
 # Get logger using logUtil
 logger = get_logger(__name__)
@@ -1022,6 +1024,163 @@ class PromptBuilder:
             return (
                 FALLBACK_ANALYSIS_FROM_CONTEXT_WITH_FORMAT,
                 f"Analyze this code:\n{json.dumps(context_bundle, indent=2)}"
+            )
+
+    # ------------------------------------------------------------------
+    # Call-tree-at-once prompts (one LLM run per root, whole subtree in prompt).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def build_call_tree_prompt(
+        tree_dict: Dict[str, Any],
+        config: Optional[Dict[str, Any]] = None,
+        user_provided_prompts: Optional[List[str]] = None,
+    ) -> Tuple[str, str]:
+        """Build (system_prompt, user_prompt) for the call-tree analysis stage.
+
+        ``tree_dict`` is the dict produced by ``CallTree.to_dict()``. The
+        system prompt is ``callTreeAnalysisProcess.md`` plus optional project
+        context + user-provided prompts. The user prompt embeds the entire
+        tree as a single JSON object and reminds the LLM of the JSON-array
+        output contract.
+        """
+        try:
+            process_content = _read_package_file(CALL_TREE_ANALYSIS_PROCESS_FILE)
+            if not process_content:
+                logger.warning(f"{CALL_TREE_ANALYSIS_PROCESS_FILE} not found, using fallback")
+                process_content = FALLBACK_ANALYSIS_FROM_CONTEXT_SYSTEM
+
+            system_prompt = process_content
+
+            if config:
+                project_name = config.get("project_name", "")
+                project_description = config.get("description", "")
+                if project_name or project_description:
+                    system_prompt += "\n\n## Project Context\n\n"
+                    if project_name:
+                        system_prompt += f"**Project Name**: {project_name}\n\n"
+                    if project_description:
+                        system_prompt += f"**Project Description**: {project_description}\n\n"
+
+            if user_provided_prompts and any(p.strip() for p in user_provided_prompts):
+                system_prompt += "\n\n## Additional Analysis Instructions\n\n"
+                for i, prompt in enumerate(user_provided_prompts, 1):
+                    if prompt.strip():
+                        system_prompt += f"{i}. {prompt.strip()}\n\n"
+
+            root = tree_dict.get("root", {}) or {}
+            root_function = root.get("function", "unknown")
+            root_file = root.get("file", "unknown")
+            node_count = (tree_dict.get("stats") or {}).get("node_count", "?")
+
+            user_prompt = (
+                "## Call Tree for Analysis\n\n"
+                f"**Root function**: `{root_function}` in `{root_file}`\n"
+                f"**Nodes in tree**: {node_count}\n\n"
+                "The JSON below contains the entire call tree to analyze. Line numbers in "
+                "`source` fields are original source-file line numbers — cite them directly. "
+                "Nodes without a `source` field are stubs — fetch them with "
+                "`getFileContentByLines` if you need their body to confirm a defect.\n\n"
+                "```json\n"
+                f"{json.dumps(tree_dict, indent=2, ensure_ascii=False)}\n"
+                "```\n\n"
+                "Analyze the tree using the cross-function reporting rubric in the system "
+                "prompt. Return ONLY a JSON array of issue objects, starting with `[` and "
+                "ending with `]`. If no defects meet the rubric, return exactly `[]`."
+            )
+
+            logger.info(
+                "Built call-tree prompts - System: %d chars, User: %d chars",
+                len(system_prompt), len(user_prompt),
+            )
+            return system_prompt, user_prompt
+
+        except Exception as e:
+            logger.error(f"Error building call-tree prompt: {e}")
+            return (
+                FALLBACK_ANALYSIS_FROM_CONTEXT_WITH_FORMAT,
+                f"Analyze this call tree:\n{json.dumps(tree_dict, indent=2)}",
+            )
+
+    @staticmethod
+    def build_diff_call_tree_prompt(
+        tree_dict: Dict[str, Any],
+        diff_context: Dict[str, Any],
+        config: Optional[Dict[str, Any]] = None,
+        user_provided_prompts: Optional[List[str]] = None,
+    ) -> Tuple[str, str]:
+        """Build (system_prompt, user_prompt) for the diff call-tree analysis stage.
+
+        Same shape as ``build_call_tree_prompt`` but layered with the diff
+        rubric and diff context (changed files, changed lines per file). The
+        ``tree_dict`` is expected to carry diff-marked source bodies (added
+        lines prefixed with ``+ ``, removed with ``- ``, context with ``  ``)
+        and an ``is_modified`` / ``changed_lines`` field per node.
+        """
+        try:
+            process_content = _read_package_file(DIFF_CALL_TREE_ANALYSIS_PROCESS_FILE)
+            if not process_content:
+                logger.warning(f"{DIFF_CALL_TREE_ANALYSIS_PROCESS_FILE} not found, using fallback")
+                process_content = FALLBACK_ANALYSIS_FROM_CONTEXT_SYSTEM
+
+            system_prompt = process_content
+
+            if config:
+                project_name = config.get("project_name", "")
+                project_description = config.get("description", "")
+                if project_name or project_description:
+                    system_prompt += "\n\n## Project Context\n\n"
+                    if project_name:
+                        system_prompt += f"**Project Name**: {project_name}\n\n"
+                    if project_description:
+                        system_prompt += f"**Project Description**: {project_description}\n\n"
+
+            if user_provided_prompts and any(p.strip() for p in user_provided_prompts):
+                system_prompt += "\n\n## Additional Analysis Instructions\n\n"
+                for i, prompt in enumerate(user_provided_prompts, 1):
+                    if prompt.strip():
+                        system_prompt += f"{i}. {prompt.strip()}\n\n"
+
+            # Splice diff_context into the tree dict so the LLM sees them as
+            # one bundle (matches the input schema in diffCallTreeAnalysisProcess.md).
+            bundle = dict(tree_dict)
+            bundle["diff_context"] = diff_context
+
+            root = tree_dict.get("root", {}) or {}
+            root_function = root.get("function", "unknown")
+            root_file = root.get("file", "unknown")
+            node_count = (tree_dict.get("stats") or {}).get("node_count", "?")
+            n_changed_files = len((diff_context or {}).get("all_changed_files", []) or [])
+
+            user_prompt = (
+                "## Diff Call Tree for Analysis\n\n"
+                f"**Root (highest modified function in this chain)**: `{root_function}` in `{root_file}`\n"
+                f"**Nodes in tree**: {node_count}\n"
+                f"**Changed files in commit**: {n_changed_files}\n\n"
+                "The JSON below contains the call tree (with diff-marked source) and the "
+                "diff context. Lines beginning with `+ ` were added, `- ` were removed, "
+                "`  ` are unchanged context. Cite original source line numbers in your output. "
+                "Nodes without a `source` field are stubs — fetch them with "
+                "`getFileContentByLines` if you need their body to confirm a defect.\n\n"
+                "```json\n"
+                f"{json.dumps(bundle, indent=2, ensure_ascii=False)}\n"
+                "```\n\n"
+                "Apply the diff-mode rubric (defect must be on a changed line OR reached by "
+                "changed code, AND must affect an in-tree caller). Return ONLY a JSON array "
+                "of issue objects. If nothing qualifies, return exactly `[]`."
+            )
+
+            logger.info(
+                "Built diff call-tree prompts - System: %d chars, User: %d chars",
+                len(system_prompt), len(user_prompt),
+            )
+            return system_prompt, user_prompt
+
+        except Exception as e:
+            logger.error(f"Error building diff call-tree prompt: {e}")
+            return (
+                FALLBACK_ANALYSIS_FROM_CONTEXT_WITH_FORMAT,
+                f"Analyze this diff call tree:\n{json.dumps(tree_dict, indent=2)}",
             )
 
     # Large file handling and nested content handling removed - ProjectSummaryGenerator no longer used

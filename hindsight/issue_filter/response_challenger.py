@@ -39,15 +39,15 @@ class LLMResponseChallenger:
     It acts as a senior software engineer reviewing the code to determine if issues are worth pursuing.
     """
     
-    def __init__(self, api_key: str, config: dict, dropped_issues_dir: Optional[str] = None, capture_evidence: bool = True, file_content_provider=None, directory_tree_util=None, repo_path: Optional[str] = None, artifacts_dir: Optional[str] = None):
+    def __init__(self, api_key: str, config: dict, dropped_issues_dir: Optional[str] = None, capture_evidence: bool = False, file_content_provider=None, directory_tree_util=None, repo_path: Optional[str] = None, artifacts_dir: Optional[str] = None):
         """
         Initialize the LLM Response Challenger.
-        
+
         Args:
             api_key: API key for LLM provider
             config: Configuration dictionary (same format as used by analyzers)
             dropped_issues_dir: Directory to save dropped issues (optional)
-            capture_evidence: Whether to capture validation evidence (default: True)
+            capture_evidence: Whether to attach the challenger's free-text reasoning to each kept issue's `evidence` field for HTML rendering. Default False — the reasoning is already persisted to artifacts under response_challenger/ for audit, and surfacing it in the report duplicates the analyzer's `description` text.
             file_content_provider: FileContentProvider instance for file resolution (optional)
             directory_tree_util: DirectoryTreeUtil instance for directory listing (optional)
             repo_path: Path to the repository (optional, for runTerminalCmd tool)

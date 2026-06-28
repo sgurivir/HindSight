@@ -81,13 +81,41 @@ class TraceAnalysisAnalyzer(BaseIterativeAnalyzer):
             return True
         return all(isinstance(item, dict) for item in parsed_json)
 
-    def get_fallback_guidance(self) -> str:
-        """Get trace analysis-specific guidance."""
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
+        """Get trace analysis-specific guidance, with full schema and example."""
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid trace issues array. "
-            "You MUST respond with ONLY a valid JSON array of issue objects. "
+            "CRITICAL: Your previous response did not contain a valid trace issues array.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON ARRAY of trace-issue objects. "
+            "Each item must be a JSON OBJECT (dict), not a string. "
+            "If no issues are found in the trace, return exactly `[]` — empty is VALID.\n\n"
+            "### Required schema (each item)\n"
+            "```json\n"
+            "{\n"
+            '  "function_name": "string", "file_path": "string", "line_number": "string",\n'
+            '  "severity": "string — high | medium | low",\n'
+            '  "issue": "string", "description": "string", "suggestion": "string",\n'
+            '  "category": "string", "issueType": "string"\n'
+            "}\n"
+            "```\n\n"
+            "### CORRECT example\n"
+            "```json\n"
+            '[{"function_name": "DBManager.fetchAll", "file_path": "src/DBManager.swift", '
+            '"line_number": "88", "severity": "high", '
+            '"issue": "Synchronous DB fetch on the main thread", '
+            '"description": "fetchAll() blocks the main thread for ~120ms.", '
+            '"suggestion": "Move to background queue and surface results asynchronously.", '
+            '"category": "io", "issueType": "io"}]\n'
+            "```\n\n"
+            "### CORRECT example (no issues)\n"
+            "```json\n"
+            "[]\n"
+            "```\n\n"
             "Your response MUST start with `[` and end with `]`. "
-            "Each item must be a JSON object describing a performance issue found in the trace. "
-            "If no issues found, return exactly: [] "
-            "No markdown, no prose. Return the JSON array now."
+            "Return JSON ONLY — no markdown fences, no prose."
         )

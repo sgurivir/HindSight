@@ -66,16 +66,53 @@ class PerfContextAnalyzer(BaseIterativeAnalyzer):
             return False
         return "functions" in parsed_json or "call_path" in parsed_json
 
-    def get_fallback_guidance(self) -> str:
-        """Get perf context collection-specific guidance."""
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
+        """Get perf context collection-specific guidance, with full schema and example."""
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid performance context bundle. "
-            "You MUST respond with ONLY a valid JSON object matching this structure:\n\n"
-            '{"call_path": ["FuncA", "FuncB", "FuncC"], '
-            '"functions": {"FuncA": {"body": "...", "file": "...", "line": 42}, ...}, '
-            '"data_types_used": {...}, '
-            '"resource_patterns": {"allocations": [], "io_operations": [], "synchronization": [], "loops": []}, '
-            '"additional_context": {}}\n\n'
+            "CRITICAL: Your previous response did not contain a valid performance context bundle.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON OBJECT matching the schema below. "
+            "The bundle MUST include `call_path` (list of function names) AND `functions` "
+            "(map keyed by name).\n\n"
+            "### Required schema\n"
+            "```json\n"
+            "{\n"
+            '  "call_path": ["FuncA", "FuncB", "FuncC"],\n'
+            '  "functions": {\n'
+            '    "FuncA": {\n'
+            '      "body": "string — full source",\n'
+            '      "file": "string", "line": 0,\n'
+            '      "data_types_used": ["TypeA"],\n'
+            '      "resource_patterns": {\n'
+            '        "allocations": [], "io_operations": [], "synchronization": [],\n'
+            '        "loops": [], "caching": []\n'
+            "      },\n"
+            '      "threading_context": "string"\n'
+            "    }\n"
+            "  },\n"
+            '  "data_types_used": { "TypeA": { "definition_summary": "string", "file": "string" } },\n'
+            '  "data_flow": { "FuncA→FuncB": "string" },\n'
+            '  "constants_and_globals": ["string"],\n'
+            '  "additional_context": {}\n'
+            "}\n"
+            "```\n\n"
+            "### CORRECT minimal example\n"
+            "```json\n"
+            '{"call_path": ["A", "B"], '
+            '"functions": {"A": {"body": "func A() { B() }", "file": "src/A.swift", "line": 10, '
+            '"data_types_used": [], "resource_patterns": {"allocations": [], "io_operations": [], '
+            '"synchronization": [], "loops": [], "caching": []}, "threading_context": "main"}, '
+            '"B": {"body": "func B() {}", "file": "src/B.swift", "line": 20, '
+            '"data_types_used": [], "resource_patterns": {"allocations": [], "io_operations": [], '
+            '"synchronization": [], "loops": [], "caching": []}, "threading_context": "main"}}, '
+            '"data_types_used": {}, "data_flow": {}, '
+            '"constants_and_globals": [], "additional_context": {}}\n'
+            "```\n\n"
             "Your response MUST start with `{` and end with `}`. "
-            "No markdown, no arrays, no prose. Return the JSON object now."
+            "Return JSON ONLY — no markdown fences, no arrays, no prose."
         )

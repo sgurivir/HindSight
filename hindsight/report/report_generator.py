@@ -1015,7 +1015,7 @@ def generate_html_report(issues, output_file=DEFAULT_HTML_REPORT, project_name=N
                         </details>
 
                         ${{issue.evidence ? `
-                        <details class="callout callout--evidence" open>
+                        <details class="callout callout--evidence">
                             <summary>Evidence</summary>
                             <p>${{issue.evidence}}</p>
                         </details>
@@ -1431,7 +1431,20 @@ def generate_html_report(issues, output_file=DEFAULT_HTML_REPORT, project_name=N
             const evidence = (issue.evidence || '').replace(/<br\s*\/?>/gi, '\\n');
             const solution = (issue.suggestion || issue.potential_solution || issue.solution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
 
+            // Metadata block — preserved so that --generate-from-text-file can reconstruct the report
+            const severityMeta = issue.severity || 'unknown';
+            const categoryMeta = issue.category || 'unknown';
+            const fileMeta = issue.original_file_path || issue.file_path || issue.file || 'Unknown';
+            const functionMeta = issue.function_name || issue.functionName || issue.function || 'Unknown';
+            const linesMeta = issue.line_number || issue.lines || issue.lineNumber || 'N/A';
+
             let content = `Title:\\n${{issueDescription}}
+
+Severity: ${{severityMeta}}
+Category: ${{categoryMeta}}
+File: ${{fileMeta}}
+Function: ${{functionMeta}}
+Lines: ${{linesMeta}}
 
 Impact:\\n${{impact}}`;
 
@@ -1505,8 +1518,18 @@ Potential Solution:\\n${{solution}}`;
                 const evidence = (issue.evidence || '').replace(/<br\s*\/?>/gi, '\\n');
                 const solution = (issue.suggestion || issue.potential_solution || issue.solution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
 
+                const severityMeta = issue.severity || 'unknown';
+                const categoryMeta = issue.category || 'unknown';
+                const functionMeta = issue.function_name || issue.functionName || issue.function || 'Unknown';
+
                 // Build the output, only including evidence if it exists
                 let output = `Title:\\n${{issueText}}
+
+Severity: ${{severityMeta}}
+Category: ${{categoryMeta}}
+File: ${{filePath}}
+Function: ${{functionMeta}}
+Lines: ${{lineNumber}}
 
 Impact:\\n${{impact}}`;
 
@@ -2425,7 +2448,11 @@ def calculate_dropped_issues_stats(dropped_issues):
     # Extract original issues and build tree
     extracted_issues = []
     for dropped_issue in dropped_issues:
-        original_issue = dropped_issue.get('original_issue') or (dropped_issue.get('results', [{}])[0] if dropped_issue.get('results') else {})
+        original_issue = (
+            dropped_issue.get('original_issue')
+            or dropped_issue.get('dropped_issue')
+            or (dropped_issue.get('results', [{}])[0] if dropped_issue.get('results') else {})
+        )
         if original_issue:
             extracted_issues.append(original_issue)
     

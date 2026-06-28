@@ -60,11 +60,36 @@ class TraceSolutionValidatorAnalyzer(BaseIterativeAnalyzer):
             return False
         return isinstance(parsed_json.get('valid'), bool)
 
-    def get_fallback_guidance(self) -> str:
+    def get_fallback_guidance(self, validation_reason: Optional[str] = None) -> str:
+        reason_block = (
+            f"Why your previous response was rejected: {validation_reason}.\n\n"
+            if validation_reason
+            else ""
+        )
         return (
-            "CRITICAL: Your previous response did not contain a valid verdict. "
-            "Respond with ONLY a JSON object containing at minimum a 'valid' boolean. "
-            "Include 'low_confidence': true if you lack context to judge, and a 'reason' string. "
-            "Example: {\"valid\": true, \"low_confidence\": true, \"reason\": \"...\"}. "
-            "No markdown, no prose. Return the JSON object now."
+            "CRITICAL: Your previous response did not contain a valid verdict.\n\n"
+            f"{reason_block}"
+            "You MUST respond with ONLY a valid JSON OBJECT containing at minimum a "
+            "boolean `valid`. Include `low_confidence: true` if you lack context to judge, "
+            "and a string `reason`.\n\n"
+            "### Required schema\n"
+            "```json\n"
+            "{\n"
+            '  "valid": true,\n'
+            '  "low_confidence": false,\n'
+            '  "reason": "string — brief explanation"\n'
+            "}\n"
+            "```\n\n"
+            "### CORRECT example (confident, valid)\n"
+            "```json\n"
+            '{"valid": true, "low_confidence": false, '
+            '"reason": "The fix is safe; no lifetime, threading, or memory invariants are broken."}\n'
+            "```\n\n"
+            "### CORRECT example (low confidence)\n"
+            "```json\n"
+            '{"valid": true, "low_confidence": true, '
+            '"reason": "Could not locate the kMTimeModificationPeriod constant; verdict is provisional."}\n'
+            "```\n\n"
+            "Your response MUST start with `{` and end with `}`. "
+            "Return JSON ONLY — no markdown fences, no prose."
         )
