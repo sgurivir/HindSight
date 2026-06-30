@@ -11,7 +11,7 @@
 
     "exclude_directories": ["AlmanacProxy"
     ],
-    "include_directories": ["StudyApp"],
+    "include_directories": [],
     "exclude_files": [],
     
     "min_function_body_length": 7,

@@ -59,37 +59,50 @@ class AffectedFunctionDetector:
     def _build_function_locations(self) -> Dict[str, List[Dict[str, Any]]]:
         """
         Build a lookup dictionary for function locations.
-        
-        Expects the new checksum format from AST processing:
-        {
-            "functionName": {
-                "checksum": "abc123...",
-                "code": [{"file_name": "...", "start": 10, "end": 50}]
-            }
-        }
-        
+
+        Accepts two on-disk shapes — preserved for compatibility with both
+        the legacy `merged_functions.json` and any future per-function
+        checksum format:
+
+        Legacy (`scoped_ast_util` writes this today):
+            {"function_to_location": {"FuncName": [{"file_name": ..., "start": ..., "end": ...}]}}
+
+        Checksum format (future):
+            {"FuncName": {"checksum": "...", "code": [{"file_name": ..., "start": ..., "end": ...}]}}
+
         Returns:
             Dict mapping function_name -> list of location dicts
         """
         locations = {}
-        
+
         if not self.functions:
             return locations
-        
-        # New checksum format: {"funcName": {"checksum": "...", "code": [...]}}
-        for func_name, func_data in self.functions.items():
+
+        # Unwrap the legacy `function_to_location` wrapper so the loop below
+        # iterates over function-name keys instead of treating the wrapper
+        # itself as a single function entry.
+        function_map = self.functions
+        if (
+            isinstance(function_map, dict)
+            and len(function_map) == 1
+            and "function_to_location" in function_map
+            and isinstance(function_map["function_to_location"], dict)
+        ):
+            function_map = function_map["function_to_location"]
+
+        for func_name, func_data in function_map.items():
             if isinstance(func_data, dict) and 'code' in func_data:
                 # New format with checksum - extract locations from 'code' key
                 loc_data = func_data['code']
             else:
-                # Direct location data (fallback, shouldn't happen with new format)
+                # Direct location data (legacy: list of {file_name, start, end})
                 loc_data = func_data
-                
+
             if isinstance(loc_data, list):
                 locations[func_name] = loc_data
             else:
                 locations[func_name] = [loc_data]
-                
+
         return locations
 
     def _build_call_graph_lookup(self) -> Dict[str, Dict[str, Any]]:

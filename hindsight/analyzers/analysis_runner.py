@@ -33,7 +33,6 @@ from ..core.lang_util.cast_util import CASTUtil
 
 from ..core.lang_util.Environment import Environment
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
-from ..core.llm.llm import Claude, ClaudeConfig
 from ..report.issue_directory_organizer import RepositoryDirHierarchy
 from ..utils.directory_tree_util import DirectoryTreeUtil
 from ..utils.file_content_provider import FileContentProvider

@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..lang_util.code_context_pruner import CodeContextPruner
 from ..lang_util.call_tree_section_generator import generate_call_tree_section_for_function
-from ..llm.llm import Claude, ClaudeConfig, create_llm_provider
 from ..constants import (
     CALL_TREE_MAX_ANCESTOR_DEPTH,
     CALL_TREE_MAX_DESCENDANT_DEPTH,

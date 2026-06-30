@@ -25,12 +25,16 @@ from .token_tracker import TokenTracker
 from ..issue_filter import TraceRelevanceFilter, create_unified_filter
 from ..core.constants import DEFAULT_MAX_TOKENS, PROCESSED_OUTPUT_DIR, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT, TRACE_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT, LLM_PROVIDER_RATE_WINDOW_SECONDS
 from ..core.lang_util.ast_call_graph_parser import ASTCallGraphParser
-from ..core.llm.llm import Claude
-from ..core.mcp_tools.analysis_server import AnalysisMCPServer
-from ..core.async_infra import RateLimiter, run_worker_pool
 from ..core.trace_util.trace_analysis_prompt_builder import TraceAnalysisPromptBuilder
-from ..core.trace_util.trace_code_analysis import TraceAnalysisConfig, TraceCodeAnalysis
 from ..core.trace_util.trace_result_repository import TraceAnalysisResultRepository
+from ..core.trace_util.file_name_extractor_from_trace import FileNameExtractorFromTrace
+from ..orchestration import (
+    AnalysisContext,
+    AnalysisSession,
+    TracePipeline,
+    TraceRunSummary,
+    TraceWork,
+)
 from ..progress_util.analyzed_records_registry import AnalyzedRecordsRegistry
 from ..report.enhanced_report_generator import calculate_stats, generate_html_report_with_callstacks
 from ..report.issue_directory_organizer import DirectoryNode, RepositoryDirHierarchy
@@ -74,57 +78,17 @@ class TraceAnalyzer(BaseAnalyzer):
         self.repo_path = config.get('repo_path')
 
     def analyze_function(self, func_record: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-        """Analyze a single trace/prompt record using LLM."""
-        if not self._initialized:
-            raise RuntimeError("Analyzer not initialized. Call initialize() first.")
+        """Single-function entry point.
 
-        try:
-            prompt_content = func_record.get('prompt_content', '')
-            if not prompt_content:
-                return None
-
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
-                temp_file.write(prompt_content)
-                temp_input_path = temp_file.name
-
-            with tempfile.NamedTemporaryFile(mode='w', suffix='_analysis.json', delete=False) as temp_output:
-                temp_output_path = temp_output.name
-
-            try:
-                analysis_config = TraceAnalysisConfig(
-                    prompt_file_path=temp_input_path,
-                    api_key=self.api_key,
-                    api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-                    model=self.config.get('model', DEFAULT_LLM_MODEL),
-                    repo_path=self.repo_path,
-                    output_file=temp_output_path,
-                    max_tokens=DEFAULT_MAX_TOKENS,
-                    config=self.config
-                )
-
-                trace_analysis = TraceCodeAnalysis(analysis_config, mcp_server=getattr(self, '_mcp_server', None))
-                success = trace_analysis.run_analysis()
-
-                if success:
-                    try:
-                        with open(temp_output_path, 'r', encoding='utf-8') as f:
-                            result = json.load(f)
-                        return result
-                    except (FileNotFoundError, json.JSONDecodeError):
-                        return None
-                else:
-                    return None
-
-            finally:
-                try:
-                    os.unlink(temp_input_path)
-                    os.unlink(temp_output_path)
-                except OSError:
-                    pass
-
-        except Exception as e:
-            self.logger.error(f"Error in analyze_trace: {e}")
-            return None
+        Retained for `BaseAnalyzer` interface compatibility; trace analysis
+        now flows through `TracePipeline` via `TraceAnalysisRunner._run_trace_analysis`,
+        which operates on whole callstacks rather than individual functions.
+        Direct callers should drive `TraceAnalysisRunner` instead.
+        """
+        raise NotImplementedError(
+            "TraceAnalyzer.analyze_function is no longer supported; use "
+            "TraceAnalysisRunner._run_trace_analysis (callstack-oriented pipeline)."
+        )
 
     def finalize(self) -> None:
         """Cleanup after analysis."""
@@ -191,190 +155,6 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             'prompts_dir': os.path.join(trace_analysis_dir, "trace_analysis_prompts"),
             'results_dir': os.path.join(trace_analysis_dir, "trace_analysis")
         }
-
-    def _is_callstack_cached(self, callstack_index: int, callstack: list) -> bool:
-        """Check whether this callstack already has analysis results cached.
-
-        Returns True if cached (the LLM analysis can be skipped), False otherwise.
-        Logs the same skip messages as the inline check inside
-        _analyze_single_callstack so visibility is preserved.
-        """
-        try:
-            from ..core.trace_util.trace_analysis_prompt_builder import TraceAnalysisPromptBuilder
-            temp_builder = TraceAnalysisPromptBuilder()
-            callstack_text = temp_builder._convert_callstack_to_text_format(callstack)
-
-            trace_id = f"trace_{callstack_index+1:04d}"
-
-            with self._registry_lock:
-                if self.analyzed_records_registry and callstack_text and self.analyzed_records_registry.is_analyzed(callstack_text):
-                    self.logger.info(f"Skipping {trace_id} as it has already been analyzed")
-                    return True
-
-            if self.results_publisher:
-                callstack_list = []
-                if callstack_text:
-                    callstack_list = [line.strip() for line in callstack_text.split('\n') if line.strip()]
-
-                if self.results_publisher.check_existing_trace(trace_id, callstack_list):
-                    self.logger.info(f"Skipping {trace_id} - trace already exists in prior result stores")
-                    return True
-        except Exception as e:
-            self.logger.warning(f"Cache check failed for callstack {callstack_index}: {e}")
-            return False
-
-        return False
-
-    def _analyze_single_callstack(self, callstack_index: int, callstack: list, prompt_content: str, callstack_data: dict, trace_analysis_out_dir: str) -> bool:
-        """
-        Analyze a single callstack directly without using prompt files.
-
-        Args:
-            callstack_index: Index of the callstack
-            callstack: Callstack data (list of callstack entries)
-            prompt_content: Generated prompt content
-            callstack_data: Structured callstack data
-            trace_analysis_out_dir: Output directory for results
-
-        Returns:
-            bool: True if analysis successful
-        """
-        try:
-            from ..core.trace_util.trace_analysis_prompt_builder import TraceAnalysisPromptBuilder
-            temp_builder = TraceAnalysisPromptBuilder()
-            callstack_text = temp_builder._convert_callstack_to_text_format(callstack)
-
-            with self._registry_lock:
-                if self.analyzed_records_registry and callstack_text and self.analyzed_records_registry.is_analyzed(callstack_text):
-                    trace_id = f"trace_{callstack_index+1:04d}"
-                    self.logger.info(f"Skipping {trace_id} as it has already been analyzed")
-                    return True  # Return True since it's already been processed
-
-            trace_id = f"trace_{callstack_index+1:04d}"
-
-            if self.results_publisher:
-                callstack_list = []
-                if callstack_text:
-                    callstack_list = [line.strip() for line in callstack_text.split('\n') if line.strip()]
-
-                existing_trace = self.results_publisher.check_existing_trace(trace_id, callstack_list)
-                if existing_trace:
-                    self.logger.info(f"Skipping {trace_id} - trace already exists in prior result stores")
-                    return True
-
-            output_filename = f"{trace_id}_analysis.json"
-            output_file = os.path.join(trace_analysis_out_dir, output_filename)
-
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
-                temp_file.write(prompt_content)
-                temp_prompt_file = temp_file.name
-
-            try:
-                analysis_config = TraceAnalysisConfig(
-                    prompt_file_path=temp_prompt_file,
-                    api_key=self.api_key,
-                    api_url=self.config['api_end_point'],
-                    model=self.config['model'],
-                    repo_path=self.repo_path,
-                    output_file=output_file,
-                    max_tokens=DEFAULT_MAX_TOKENS,
-                    config=self.config
-                )
-
-                if hasattr(self, '_start_function_analysis_tracking'):
-                    self._start_function_analysis_tracking(callstack_text or trace_id)
-
-                trace_analysis = TraceCodeAnalysis(analysis_config, mcp_server=getattr(self, '_mcp_server', None))
-                success = trace_analysis.run_analysis()
-
-                if self.token_tracker:
-                    input_tokens, output_tokens = trace_analysis.get_token_totals()
-                    with self._token_tracker_lock:
-                        self.token_tracker.add_token_usage(input_tokens, output_tokens)
-
-                if hasattr(self, '_record_function_analysis_result'):
-                    self._record_function_analysis_result(
-                        functions_analyzed=1,
-                        success=success,
-                        function_data=callstack_text or trace_id
-                    )
-
-                if success:
-                    if self.results_publisher:
-                        try:
-                            with open(output_file, 'r', encoding='utf-8') as f:
-                                result_data = json.load(f)
-
-                            repo_name = os.path.basename(self.repo_path.rstrip('/'))
-
-                            callstack_list = []
-                            if callstack_text:
-                                callstack_list = [line.strip() for line in callstack_text.split('\n') if line.strip()]
-
-                            result_issues = result_data.get('results', []) or result_data.get('issues', [])
-                            if self.unified_issue_filter and result_issues:
-                                self.logger.debug(f"Applying unified two-level issue filter to {len(result_issues)} issues for {trace_id}")
-                                filtered_issues = self.unified_issue_filter.filter_issues(result_issues)
-                                
-                                if len(filtered_issues) != len(result_issues):
-                                    dropped_count = len(result_issues) - len(filtered_issues)
-                                    self.logger.info(f"Unified issue filter dropped {dropped_count} issues for {trace_id}")
-                                    
-                                    if 'results' in result_data:
-                                        result_data['results'] = filtered_issues
-                                    elif 'issues' in result_data:
-                                        result_data['issues'] = filtered_issues
-                            elif not self.unified_issue_filter:
-                                self.logger.debug("Unified issue filter not available - publishing all issues")
-
-                            enhanced_result = result_data.copy()
-                            enhanced_result['trace_id'] = trace_id
-                            enhanced_result['callstack'] = callstack_list
-                            enhanced_result['repo_name'] = repo_name
-                            if callstack_data:
-                                enhanced_result['callstack_data'] = callstack_data
-
-                            self.results_publisher.add_trace_result(
-                                repo_name=repo_name,
-                                trace_id=trace_id,
-                                callstack=callstack_list,
-                                result=enhanced_result
-                            )
-
-                            self.logger.info(f"Analysis result published for: {trace_id}")
-
-                            # Remove the temporary output file since publisher-subscriber handles file writing
-                            try:
-                                os.remove(output_file)
-                            except OSError:
-                                pass  # Ignore if file removal fails
-
-                        except Exception as e:
-                            self.logger.error(f"Failed to publish result via publisher-subscriber: {e}")
-                            return False
-
-                    if not self.results_publisher:
-                        self.logger.error("Publisher not available - cannot save analysis results")
-                        return False
-
-                    if self.analyzed_records_registry and callstack_text:
-                        with self._registry_lock:
-                            self.analyzed_records_registry.add_analyzed(callstack_text)
-
-                    return True
-                else:
-                    return False
-
-            finally:
-                try:
-                    os.unlink(temp_prompt_file)
-                except OSError:
-                    pass
-
-        except Exception as e:
-            self.logger.error(f"Error analyzing callstack {callstack_index}: {e}")
-            return False
 
     def _extract_callstack_from_prompt(self, prompt_file: str) -> str:
         """
@@ -598,16 +378,14 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
     # _initialize_unified_issue_filter is now provided by UnifiedIssueFilterMixin
 
     def _run_trace_analysis(self, config: dict, hotspot_file: str, api_key: str = None) -> tuple:
-        """
-        Run trace analysis directly on callstack data without generating prompt files.
+        """Drive trace analysis through the new async `TracePipeline`.
 
-        Args:
-            config: Configuration dictionary
-            hotspot_file: Path to hotspot file containing callstack data
-            api_key: API key for LLM calls
+        Sets up the publisher / unified-filter / AST / prompt-builder state
+        synchronously, materializes `TraceWork` items, then dispatches to an
+        inner `asyncio.run`-driven coroutine that runs the LLM stages.
 
-        Returns:
-            tuple: (successful_analyses, failed_analyses)
+        Returns: ``(successful, failed)`` — cache hits count as successful so
+        the caller's progress accounting stays consistent with legacy behavior.
         """
         self.logger.info("Starting trace analysis on callstack data...")
 
@@ -634,46 +412,16 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
         trace_analysis_out_dir = f"{results_dir}/trace_analysis"
         os.makedirs(trace_analysis_out_dir, exist_ok=True)
 
-        ignore_dirs = set()
-        if config.get('exclude_directories'):
-            base_dirs_to_ignore = config.get('exclude_directories', [])
-            for dir_pattern in base_dirs_to_ignore:
-                # Support both directory names and relative paths
-                ignore_dirs.add(dir_pattern)
-                ignore_dirs.add(dir_pattern.upper())
-                ignore_dirs.add(dir_pattern.lower())
-
         file_content_provider = None
         try:
             file_content_provider = self.get_file_content_provider()
         except RuntimeError:
             self.logger.warning("FileContentProvider not available, continuing without it")
 
-        artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
-
-        # Load call graph data for AnalysisMCPServer (enables code navigation tools)
-        call_graph_data = None
         ast_files_config = self.get_complete_ast_files_config(
             repo_path=self.repo_path,
             output_base_dir=output_provider.get_custom_base_dir()
         )
-        merged_graph_file = ast_files_config.get('merged_graph_file')
-        if merged_graph_file and os.path.exists(merged_graph_file):
-            call_graph_data = read_json_file(merged_graph_file)
-            if call_graph_data:
-                self.logger.info(f"Loaded call graph data for AnalysisMCPServer from: {merged_graph_file}")
-            else:
-                self.logger.info("Call graph file exists but could not be loaded, continuing without code nav tools")
-
-        mcp_server = AnalysisMCPServer(
-            repo_path=self.repo_path,
-            file_content_provider=file_content_provider,
-            artifacts_dir=artifacts_dir,
-            directory_tree_util=self.directory_tree_util,
-            ignore_dirs=ignore_dirs,
-            call_graph_data=call_graph_data,
-        )
-        self._mcp_server = mcp_server
 
         self._ensure_ast_files_exist(config, ast_files_config)
 
@@ -684,16 +432,10 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             self.logger.error("Failed to load configuration for prompt builder")
             return 0, 0
 
-        # Setup output directory for prompt builder
         prompt_builder.setup_output_directory()
-
-        # Set batch parameters for callstack processing
         prompt_builder.set_batch_parameters(self.num_traces_to_analyze, getattr(self, 'batch_index', 0))
-
-        # Process hotspot data to get callstack groups
         prompt_builder.process_hotspot_data()
 
-        # Process callstacks to get structured data
         results, files_not_found = prompt_builder.process_callstacks()
         if results is None:
             self.logger.error("Failed to process callstack data")
@@ -701,145 +443,242 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
 
         self.logger.info(f"Loaded {len(results)} callstack groups for analysis")
 
-        # Filter out already analyzed callstacks
-        unanalyzed_callstacks = []
+        # Filter out already-analyzed callstacks (registry pre-check).
+        unanalyzed_callstacks: List[Tuple[int, list, str]] = []
         analyzed_count = 0
-
         for i, callstack in enumerate(results):
-            # Convert callstack to text format for registry check
             callstack_text = prompt_builder._convert_callstack_to_text_format(callstack)
-
-            # Check if this callstack has already been analyzed
             if self.analyzed_records_registry and callstack_text and self.analyzed_records_registry.is_analyzed(callstack_text):
                 analyzed_count += 1
                 continue
-
-            unanalyzed_callstacks.append((i, callstack))
+            unanalyzed_callstacks.append((i, callstack, callstack_text or ""))
 
         self.logger.info(f"Found {analyzed_count} already analyzed callstacks, {len(unanalyzed_callstacks)} unanalyzed callstacks")
 
-        # Honor num_traces_to_analyze parameter
-        if hasattr(self, 'num_traces_to_analyze') and self.num_traces_to_analyze > 0:
-            callstacks_to_analyze = unanalyzed_callstacks[:self.num_traces_to_analyze]
+        # Honor num_traces_to_analyze.
+        if getattr(self, 'num_traces_to_analyze', 0) and self.num_traces_to_analyze > 0:
+            to_analyze = unanalyzed_callstacks[:self.num_traces_to_analyze]
             if len(unanalyzed_callstacks) > self.num_traces_to_analyze:
-                self.logger.info(f"Will analyze {len(callstacks_to_analyze)} unanalyzed callstacks (limited by --num-traces-to-analyze parameter)")
+                self.logger.info(f"Will analyze {len(to_analyze)} unanalyzed callstacks (limited by --num-traces-to-analyze parameter)")
             else:
-                self.logger.info(f"Will analyze all {len(callstacks_to_analyze)} unanalyzed callstacks")
+                self.logger.info(f"Will analyze all {len(to_analyze)} unanalyzed callstacks")
         else:
-            callstacks_to_analyze = unanalyzed_callstacks
-            self.logger.info(f"Will analyze all {len(callstacks_to_analyze)} unanalyzed callstacks")
+            to_analyze = unanalyzed_callstacks
+            self.logger.info(f"Will analyze all {len(to_analyze)} unanalyzed callstacks")
 
-        if not callstacks_to_analyze:
+        if not to_analyze:
             self.logger.info("No unanalyzed callstacks found - all traces have already been processed")
             return 0, 0
 
-        successful_analyses = 0
-        failed_analyses = 0
+        # Pre-generate prompt content sequentially (prompt_builder is not thread-safe).
+        work_items: List[TraceWork] = []
+        file_name_extractor = None
+        try:
+            file_name_extractor = FileNameExtractorFromTrace(
+                config=self.config, repo_path=self.repo_path
+            )
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(f"FileNameExtractorFromTrace initialization failed: {e}")
 
-        # Thread lock for shared mutable state (registry, publisher, counters)
-        _shared_state_lock = threading.Lock()
-
-        # Pre-generate prompt content for each callstack (done sequentially since
-        # prompt_builder is not thread-safe)
-        work_items: List[Tuple[int, list, str, dict]] = []
-        for callstack_index, callstack in callstacks_to_analyze:
+        for callstack_index, callstack, callstack_text in to_analyze:
             trace_id = f"trace_{callstack_index+1:04d}"
             prompt_content, callstack_data = prompt_builder.create_context_for(
                 callstack=callstack,
                 prompt_filename=f"{trace_id}.txt"
             )
-            work_items.append((callstack_index, callstack, prompt_content, callstack_data))
-
-        self.logger.info(f"Generated prompts for {len(work_items)} callstacks, starting parallel analysis with {TRACE_ANALYZER_DEFAULT_WORKERS} workers")
-
-        # Define the async worker function for a single callstack
-        runner_self = self  # capture for use in async closure
-
-        async def _analyze_callstack_async(
-            item: Tuple[int, list, str, dict],
-        ) -> bool:
-            """Async worker: analyze a single callstack in a thread executor.
-
-            The rate limiter is acquired only when an LLM call will actually run.
-            Cached callstacks bypass it so they don't burn rate-limit slots.
-            """
-            callstack_index, callstack, prompt_content, callstack_data = item
-            loop = asyncio.get_running_loop()
-
-            # Cache check is a local lookup — no rate limiting.
-            is_cached = await loop.run_in_executor(
-                None, runner_self._is_callstack_cached, callstack_index, callstack
-            )
-            if is_cached:
-                return True
-
-            # Cache miss — gate the LLM call behind the rate limiter.
-            await rate_limiter.acquire()
-
-            def _sync_analyze() -> bool:
-                return runner_self._analyze_single_callstack(
+            extracted_paths: Tuple[str, ...] = ()
+            if file_name_extractor is not None:
+                try:
+                    paths = file_name_extractor.get_all_file_paths(prompt_content) or []
+                    extracted_paths = tuple(p for p in paths if p)
+                except Exception as e:  # noqa: BLE001
+                    self.logger.warning(f"File-path extraction failed for {trace_id}: {e}")
+            work_items.append(
+                TraceWork(
                     callstack_index=callstack_index,
-                    callstack=callstack,
+                    callstack=tuple(callstack) if callstack else (),
                     prompt_content=prompt_content,
                     callstack_data=callstack_data,
-                    trace_analysis_out_dir=trace_analysis_out_dir,
+                    extracted_file_paths=extracted_paths,
+                    callstack_text=callstack_text,
+                    trace_id=trace_id,
                 )
-
-            return await loop.run_in_executor(None, _sync_analyze)
-
-        # Callbacks for result/error handling
-        completed_count = [0]  # mutable counter for progress logging
-
-        def _on_result(item: Tuple[int, list, str, dict], success: bool) -> None:
-            nonlocal successful_analyses, failed_analyses
-            callstack_index = item[0]
-            trace_id = f"trace_{callstack_index+1:04d}"
-            with _shared_state_lock:
-                completed_count[0] += 1
-                progress_msg = f"[{completed_count[0]}/{len(work_items)}]"
-                if success:
-                    successful_analyses += 1
-                    runner_self.logger.info(f"{progress_msg} ✓ Successfully analyzed: {trace_id}")
-                else:
-                    failed_analyses += 1
-                    runner_self.logger.info(f"{progress_msg} ✗ Failed to analyze: {trace_id}")
-
-        def _on_error(item: Tuple[int, list, str, dict], exc: Exception) -> None:
-            nonlocal failed_analyses
-            callstack_index = item[0]
-            trace_id = f"trace_{callstack_index+1:04d}"
-            with _shared_state_lock:
-                completed_count[0] += 1
-                failed_analyses += 1
-                runner_self.logger.error(
-                    f"[{completed_count[0]}/{len(work_items)}] ✗ Error analyzing {trace_id}: {exc}"
-                )
-
-        # Run the async worker pool
-        rate_limiter = RateLimiter(max_requests=LLM_PROVIDER_RATE_LIMIT,
-                                           window_seconds=LLM_PROVIDER_RATE_WINDOW_SECONDS)
-
-        async def _run_pool():
-            await run_worker_pool(
-                items=work_items,
-                worker_fn=_analyze_callstack_async,
-                max_workers=TRACE_ANALYZER_DEFAULT_WORKERS,
-                on_result=_on_result,
-                on_error=_on_error,
             )
 
-        asyncio.run(_run_pool())
+        self.logger.info(
+            f"Generated prompts for {len(work_items)} callstacks; "
+            f"starting async pipeline with {TRACE_ANALYZER_DEFAULT_WORKERS} workers"
+        )
 
-        self.logger.info(f"Trace analysis completed. Success: {successful_analyses}, Failed: {failed_analyses}")
+        # Drive the async pipeline.
+        summary = asyncio.run(
+            self._run_trace_pipeline_async(
+                config=config,
+                api_key=api_key,
+                work_items=work_items,
+            )
+        )
 
-        # Log tool usage summary (AnalysisMCPServer wraps tools internally)
-        self._mcp_server._tools.log_tool_usage_summary()
+        # Cache hits + successful analyses both count as "success" for legacy parity.
+        successful = summary.successful + summary.cached
+        failed = summary.failed
+        self.logger.info(
+            f"Trace analysis completed. Success: {successful} "
+            f"(new={summary.successful}, cached={summary.cached}), Failed: {failed}"
+        )
 
-        # Log centralized token usage summary
-        if self.token_tracker and (successful_analyses > 0 or failed_analyses > 0):
+        if self.token_tracker and (successful > 0 or failed > 0):
             self.token_tracker.log_summary()
 
-        return successful_analyses, failed_analyses
+        return successful, failed
+
+    async def _run_trace_pipeline_async(
+        self,
+        *,
+        config: dict,
+        api_key: str,
+        work_items: List["TraceWork"],
+    ) -> "TraceRunSummary":
+        """Build an `AnalysisSession` + `TracePipeline` and analyze every trace.
+
+        Cache check and publish are routed back to the existing sync
+        publisher/registry through `to_thread`-wrapped callbacks; this
+        preserves the legacy publish-and-cache semantics without dragging
+        thread locks into the pipeline itself.
+        """
+        output_provider = get_output_directory_provider()
+        output_base = (
+            output_provider.get_custom_base_dir()
+            if output_provider.is_configured()
+            else os.path.dirname(output_provider.get_repo_artifacts_dir())
+        )
+
+        analysis_ctx = AnalysisContext.from_config(
+            repo_path=self.repo_path,
+            config={
+                **config,
+                "code_analyzer_workers": config.get(
+                    "trace_analyzer_workers", TRACE_ANALYZER_DEFAULT_WORKERS
+                ),
+            },
+            output_base_dir=output_base,
+            api_key=api_key,
+        )
+
+        def _token_relay(input_tokens: int, output_tokens: int) -> None:
+            if self.token_tracker is None:
+                return
+            with self._token_tracker_lock:
+                self.token_tracker.add_token_usage(input_tokens, output_tokens)
+
+        async def _cache_check(work: TraceWork) -> bool:
+            return await asyncio.to_thread(self._cache_check_sync, work)
+
+        async def _publish(work: TraceWork, issues: List[Dict[str, Any]]) -> bool:
+            return await asyncio.to_thread(self._publish_trace_result_sync, work, issues)
+
+        async with AnalysisSession.create(
+            analysis_ctx,
+            file_content_provider=self.get_file_content_provider()
+                if hasattr(self, "_file_content_provider") or hasattr(self, "get_file_content_provider")
+                else None,
+            directory_tree_util=getattr(self, "directory_tree_util", None),
+            analyzer_name="trace_analysis",
+        ) as session:
+            pipeline = TracePipeline(
+                session,
+                publish_callback=_publish,
+                cache_check_callback=_cache_check,
+                token_callback=_token_relay,
+            )
+            return await pipeline.analyze_traces(work_items)
+
+    def _cache_check_sync(self, work: "TraceWork") -> bool:
+        """Sync cache lookup invoked from `_cache_check` in a worker thread.
+
+        Mirrors the legacy two-step check: AnalyzedRecordsRegistry first,
+        then the publisher's `check_existing_trace`. Either match means
+        "already analyzed — skip the LLM call".
+        """
+        try:
+            if (
+                self.analyzed_records_registry
+                and work.callstack_text
+                and self.analyzed_records_registry.is_analyzed(work.callstack_text)
+            ):
+                self.logger.info(f"Skipping {work.trace_id} as it has already been analyzed")
+                return True
+
+            if self.results_publisher:
+                callstack_list = (
+                    [line.strip() for line in work.callstack_text.split("\n") if line.strip()]
+                    if work.callstack_text else []
+                )
+                if self.results_publisher.check_existing_trace(work.trace_id, callstack_list):
+                    self.logger.info(
+                        f"Skipping {work.trace_id} - trace already exists in prior result stores"
+                    )
+                    return True
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(f"Cache check failed for {work.trace_id}: {e}")
+            return False
+
+        return False
+
+    def _publish_trace_result_sync(
+        self,
+        work: "TraceWork",
+        issues: List[Dict[str, Any]],
+    ) -> bool:
+        """Apply the unified filter, publish, and update the registry — all sync."""
+        if not self.results_publisher:
+            self.logger.error("Publisher not available - cannot save analysis results")
+            return False
+
+        try:
+            callstack_list = (
+                [line.strip() for line in work.callstack_text.split("\n") if line.strip()]
+                if work.callstack_text else []
+            )
+            repo_name = os.path.basename(self.repo_path.rstrip("/"))
+
+            filtered_issues = list(issues)
+            if self.unified_issue_filter and filtered_issues:
+                self.logger.debug(
+                    f"Applying unified issue filter to {len(filtered_issues)} issues for {work.trace_id}"
+                )
+                filtered_issues = self.unified_issue_filter.filter_issues(filtered_issues)
+                dropped = len(issues) - len(filtered_issues)
+                if dropped:
+                    self.logger.info(
+                        f"Unified issue filter dropped {dropped} issues for {work.trace_id}"
+                    )
+
+            enhanced_result: Dict[str, Any] = {
+                "results": filtered_issues,
+                "trace_id": work.trace_id,
+                "callstack": callstack_list,
+                "repo_name": repo_name,
+            }
+            if work.callstack_data:
+                enhanced_result["callstack_data"] = work.callstack_data
+
+            self.results_publisher.add_trace_result(
+                repo_name=repo_name,
+                trace_id=work.trace_id,
+                callstack=callstack_list,
+                result=enhanced_result,
+            )
+            self.logger.info(f"Analysis result published for: {work.trace_id}")
+
+            if self.analyzed_records_registry and work.callstack_text:
+                with self._registry_lock:
+                    self.analyzed_records_registry.add_analyzed(work.callstack_text)
+
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.logger.error(f"Failed to publish trace result for {work.trace_id}: {e}")
+            return False
 
 
     def _generate_report(self, config: dict) -> tuple:
@@ -1275,18 +1114,12 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             # Get API key with fallback to Apple Connect token
             api_key = get_api_key_from_config(config)
 
-            # Setup prompt logging - use the base directory where outputs are stored
-            # Use out_dir parameter instead of reading from JSON config
-            custom_base_dir = out_dir
-            Claude.setup_prompts_logging("trace_analysis")
-            
-            # Clear older prompts at the beginning of analysis
-            Claude.clear_older_prompts()
-
-            # Get the actual directory used for logging from the singleton
+            # Prompt logging is now owned by `ConversationLogger` (per-session,
+            # instance-scoped). It writes to `{artifacts}/prompts_sent/trace_analysis/`
+            # via the `analyzer_name="trace_analysis"` passed to `AnalysisSession.create`.
             output_provider = get_output_directory_provider()
             actual_prompts_dir = f"{output_provider.get_repo_artifacts_dir()}/prompts_sent/trace_analysis"
-            self.logger.info(f"Prompt logging setup completed in: {actual_prompts_dir}")
+            self.logger.info(f"Prompt logging will land in: {actual_prompts_dir}")
 
             self.logger.info("Configuration loaded successfully")
             self.logger.info(f"Repository path: {self.repo_path}")

@@ -42,7 +42,7 @@ class AnalyticsHelper:
             cls._instance = super(AnalyticsHelper, cls).__new__(cls)
         return cls._instance
 
-    def __init__(self, repo_path: str = None, db_path: str = None):
+    def __init__(self, repo_path: Optional[str] = None, db_path: Optional[str] = None):
         """
         Initialize the analytics helper.
 
@@ -81,7 +81,7 @@ class AnalyticsHelper:
         self.logger.info(f"AnalyticsHelper singleton initialized with database: {self.db_path}")
 
     @classmethod
-    def get_instance(cls, repo_path: str = None, db_path: str = None) -> 'AnalyticsHelper':
+    def get_instance(cls, repo_path: Optional[str] = None, db_path: Optional[str] = None) -> 'AnalyticsHelper':
         """
         Get the singleton instance of AnalyticsHelper.
 
@@ -198,7 +198,7 @@ class AnalyticsHelper:
         except Exception as e:
             self.logger.error(f"Failed to record token usage: {e}")
 
-    def start_function_analysis(self, function_data: str = None) -> None:
+    def start_function_analysis(self, function_data: Optional[str] = None) -> None:
         """
         Mark the start of a function analysis operation.
         This records the timestamp and function hash for later use in recording the analysis result.
@@ -216,7 +216,7 @@ class AnalyticsHelper:
             self.logger.debug("Function analysis started")
 
     def record_function_analysis_result(self, functions_analyzed: int,
-                                      success: bool, function_data: str = None) -> None:
+                                      success: bool, function_data: Optional[str] = None) -> None:
         """
         Record the result of function analysis.
 

@@ -11,7 +11,10 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Dict
 
-from ..llm.llm import Claude, ClaudeConfig
+from ...llm import (
+    make_client_config_from_dict,
+    one_shot_text_sync,
+)
 from ..constants import DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT, DEFAULT_MAX_TOKENS
 from ...utils.config_util import load_config_tolerant, get_api_key_from_config, get_llm_provider_type
 from ...utils.file_util import read_file
@@ -45,26 +48,28 @@ class FileNameExtractorFromTrace:
         if not api_key:
             raise ValueError("API key not found in configuration")
         
-        # Create Claude configuration
-        claude_config = ClaudeConfig(
+        # Build the async LLM client config once. Each `extract_file_names`
+        # call spins up an `AsyncLLMClient` for the duration of the call via
+        # `one_shot_text_sync`, then tears it down — fine here because
+        # `extract_file_names` is invoked at most once per trace run.
+        self._client_config = make_client_config_from_dict(
             api_key=api_key,
-            api_url=config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-            model=config.get('model', DEFAULT_LLM_MODEL),
-            max_tokens=config.get('max_tokens', DEFAULT_MAX_TOKENS),
-            provider_type=get_llm_provider_type(config)
+            config=config,
+            default_api_url=DEFAULT_LLM_API_END_POINT,
+            default_model=DEFAULT_LLM_MODEL,
+            default_max_tokens=DEFAULT_MAX_TOKENS,
         )
-        
-        # Initialize Claude client
-        self.claude = Claude(claude_config)
-        
+
         # Load system prompt
         self.system_prompt = self._load_system_prompt()
-        
+
         # Initialize FileContentProvider if repo_path is provided
         if self.repo_path:
             self._initialize_file_content_provider()
-        
-        logger.info(f"Initialized FileNameExtractorFromTrace with provider: {claude_config.provider_type}")
+
+        logger.info(
+            f"Initialized FileNameExtractorFromTrace (model={self._client_config.model})"
+        )
 
     def _load_system_prompt(self) -> str:
         """
@@ -96,88 +101,64 @@ class FileNameExtractorFromTrace:
     def extract_file_names(self, trace_content: str) -> List[str]:
         """
         Extract file names from trace content using LLM.
-        
+
         Args:
             trace_content: The trace data as a string
-            
+
         Returns:
             List[str]: List of extracted file names
         """
         try:
             logger.info(f"Extracting file names from trace content ({len(trace_content)} characters)")
-            
-            # Start conversation tracking
-            self.claude.start_conversation("file_name_extraction", "trace_analysis")
-            
-            # Prepare user message
-            user_message = f"Extract all file names from the following trace data:\n\n{trace_content}"
-            
-            # Send message to LLM
-            response = self.claude.send_message_with_system(
-                system_prompt=self.system_prompt,
-                messages=[{"role": "user", "content": user_message}],
-                enable_system_cache=True,
-                cache_ttl="1h"
+
+            user_message = (
+                "Extract all file names from the following trace data:\n\n"
+                f"{trace_content}"
             )
-            
-            if not response or "error" in response:
-                logger.error("Failed to get response from LLM")
-                return []
-            
-            # Extract response content
-            response_content = ""
-            if "content" in response and isinstance(response.get("content"), list):
-                # Claude native format
-                for block in response.get("content", []):
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        response_content += block.get("text", "")
-            elif "choices" in response:
-                # AWS Bedrock format
-                choices = response.get("choices", [])
-                if choices:
-                    assistant_message = choices[0].get("message", {})
-                    response_content = assistant_message.get("content", "")
-            
+
+            response_content = one_shot_text_sync(
+                self._client_config,
+                system_prompt=self.system_prompt,
+                user_prompt=user_message,
+                enable_system_cache=True,
+            )
+
             if not response_content:
-                logger.error("No content in LLM response")
+                logger.error("No response from LLM (or upstream error)")
                 return []
-            
+
             # Parse JSON response - handle markdown code blocks
             try:
-                # Clean the response content to extract JSON from markdown code blocks
                 cleaned_content = self._extract_json_from_response(response_content)
-                
                 file_names = json.loads(cleaned_content)
                 if isinstance(file_names, list):
-                    # Validate that all items are strings and filter out empty/whitespace-only names
                     validated_names = []
                     for name in file_names:
                         if isinstance(name, str) and name.strip():
                             validated_names.append(name.strip())
-                        elif name:  # Log non-string or empty entries for debugging
-                            logger.debug(f"Filtered out invalid file name: {repr(name)} (type: {type(name)})")
-                    
-                    logger.info(f"Successfully extracted {len(validated_names)} file names (filtered from {len(file_names)} total)")
+                        elif name:
+                            logger.debug(
+                                f"Filtered out invalid file name: {repr(name)} "
+                                f"(type: {type(name)})"
+                            )
+                    logger.info(
+                        f"Successfully extracted {len(validated_names)} file names "
+                        f"(filtered from {len(file_names)} total)"
+                    )
                     return validated_names
-                else:
-                    logger.error("LLM response is not a JSON array")
-                    return []
-                    
+                logger.error("LLM response is not a JSON array")
+                return []
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse LLM response as JSON: {e}")
                 logger.debug(f"Raw response: {response_content}")
-                logger.debug(f"Cleaned content: {self._extract_json_from_response(response_content)}")
+                logger.debug(
+                    f"Cleaned content: {self._extract_json_from_response(response_content)}"
+                )
                 return []
-            
+
         except Exception as e:
             logger.error(f"Error extracting file names: {e}")
             return []
-        finally:
-            # Log conversation
-            try:
-                self.claude.log_complete_conversation()
-            except Exception as e:
-                logger.warning(f"Failed to log conversation: {e}")
 
     def _extract_json_from_response(self, response_content: str) -> str:
         """

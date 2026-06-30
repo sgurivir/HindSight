@@ -420,7 +420,7 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
     
     def __init__(self, api_key: str, api_url: str = None, model: str = None, provider_type: str = "aws_bedrock"):
         """
-        Initialize LLMBasedDirectoryClassifier with LLM configuration using centralized factory.
+        Initialize LLMBasedDirectoryClassifier with LLM configuration.
 
         Args:
             api_key: API key for LLM provider
@@ -428,26 +428,20 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
             model: Model name (optional, uses default if not provided)
             provider_type: LLM provider type ("aws_bedrock")
         """
-        from ..core.llm.llm import Claude, ClaudeConfig, create_llm_provider
         from ..core.constants import DEFAULT_LLM_API_END_POINT, DEFAULT_LLM_MODEL, DEFAULT_MAX_TOKENS
+        from ..llm.bedrock import LLMClientConfig
 
         self.api_url = api_url or DEFAULT_LLM_API_END_POINT
         self.model = model or DEFAULT_LLM_MODEL
         self.provider_type = provider_type
+        self.api_key = api_key
 
-        self.claude_config = ClaudeConfig(
-            api_key=api_key,
+        self._client_config = LLMClientConfig(
             api_url=self.api_url,
             model=self.model,
             max_tokens=DEFAULT_MAX_TOKENS,
-            timeout=120,
-            provider_type=provider_type
+            api_key=api_key,
         )
-
-        provider = create_llm_provider(self.claude_config)
-
-        self.claude = Claude(self.claude_config)
-        self.claude.provider = provider
     
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> 'LLMBasedDirectoryClassifier':
@@ -550,27 +544,24 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
         """
         Analyze repository directory structure using LLM to identify directories to exclude.
         Now uses complete directory tree structure instead of just first-level directories.
-        
+
         Args:
             repo_path: Path to the repository root
             subdirectories: List of subdirectory paths to analyze (optional, will discover all if not provided)
             already_excluded_directories: List of directories already excluded by human analysis (will be skipped)
             user_provided_include_list: List of directories that must NOT be excluded (user explicitly wants them included)
-            
+
         Returns:
             List[str]: List of directory paths that should be excluded (in addition to already_excluded_directories)
         """
-        import json
         from pathlib import Path
+        from ..llm.bedrock import check_token_limit
+        from ..llm.sync_bridge import one_shot_json_sync
         from ..utils.log_util import get_logger
-        
-        logger = get_logger(__name__)
-        
-        try:
-            if not self.claude.validate_connection():
-                logger.error("Failed to validate LLM connection")
-                return []
 
+        logger = get_logger(__name__)
+
+        try:
             logger.info("Building complete directory tree structure...")
             tree_structure, all_directory_paths = self._build_directory_tree(repo_path, max_depth=12)
 
@@ -583,130 +574,58 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
             system_prompt = self._create_system_prompt()
             user_prompt = self._create_tree_based_user_prompt(tree_structure, already_excluded_directories, user_provided_include_list)
 
-            if not self.claude.check_token_limit(system_prompt, user_prompt):
+            if not check_token_limit(self._client_config, system_prompt, user_prompt):
                 logger.warning("Prompt exceeds token limits, using shallower tree structure")
                 # Try with shallower tree
                 tree_structure, all_directory_paths = self._build_directory_tree(repo_path, max_depth=8)
                 user_prompt = self._create_tree_based_user_prompt(tree_structure, already_excluded_directories, user_provided_include_list)
 
-                if not self.claude.check_token_limit(system_prompt, user_prompt):
+                if not check_token_limit(self._client_config, system_prompt, user_prompt):
                     logger.warning("Tree structure still too large, chunking analysis")
                     return self._analyze_directories_in_chunks(repo_path, already_excluded_set, user_provided_include_list)
 
-            self.claude.start_conversation("directory_tree_analysis", f"Analyzing complete directory tree structure")
-
-            # Create payload without tools — directory classifier doesn't need them
-            messages = [{"role": "user", "content": user_prompt}]
-            full_messages = [
-                {"role": "system", "content": system_prompt}
-            ] + messages
-
-            payload = self.claude.provider.create_payload(
-                full_messages,
-                stream=False,
-                enable_system_cache=True,
-                cache_ttl="1h"
+            excluded_dirs = one_shot_json_sync(
+                self._client_config,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
             )
-            
-            # Remove tools from payload to prevent LLM from trying to use them
-            if "tools" in payload:
-                del payload["tools"]
-
-            self.claude.conversation_messages.append(full_messages.copy())
-
-            response = self.claude.provider.make_request(payload)
-
-            self.claude.conversation_responses.append(response.copy() if response else {"error": "No response"})
-            
-            if response is None:
+            if excluded_dirs is None:
                 logger.error("No response from LLM")
                 return []
 
-            if "error" in response:
-                logger.error(f"LLM API error: {response.get('error')}")
-                return []
-            
-            # Extract response content - handle both Claude native and AWS Bedrock formats
-            content = ""
-
-            if "content" in response and isinstance(response.get("content"), list):
-                content_blocks = response.get("content", [])
-                for block in content_blocks:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        content = block.get("text", "")
-                        break
-
-            elif "choices" in response:
-                choices = response.get("choices", [])
-                if choices:
-                    assistant_message = choices[0].get("message", {})
-                    content = assistant_message.get("content", "")
-            
-            if not content:
-                logger.error("Empty content in LLM response")
-                logger.debug(f"Response format: {list(response.keys())}")
+            if not isinstance(excluded_dirs, list):
+                logger.error(f"Expected JSON array, got {type(excluded_dirs)}")
                 return []
 
-            try:
-                # Clean up markdown formatting if present
-                if "```json" in content:
-                    start = content.find("```json") + 7
-                    end = content.find("```", start)
-                    if end != -1:
-                        content = content[start:end].strip()
-                elif "```" in content:
-                    start = content.find("```") + 3
-                    end = content.find("```", start)
-                    if end != -1:
-                        content = content[start:end].strip()
-                
-                excluded_dirs = json.loads(content)
-                
-                if not isinstance(excluded_dirs, list):
-                    logger.error(f"Expected JSON array, got {type(excluded_dirs)}")
-                    return []
+            # Validate that returned directories exist in the repository
+            valid_excluded_dirs = []
+            logger.debug(f"Total directories collected by tree builder: {len(all_directory_paths)}")
+            logger.debug(f"Sample of collected directories: {sorted(list(all_directory_paths))[:10]}")
 
-                # Validate that returned directories exist in the repository
-                valid_excluded_dirs = []
-                logger.debug(f"Total directories collected by tree builder: {len(all_directory_paths)}")
-                logger.debug(f"Sample of collected directories: {sorted(list(all_directory_paths))[:10]}")
-                
-                for dir_path in excluded_dirs:
-                    if isinstance(dir_path, str):
-                        normalized_path = dir_path.replace('\\', '/')
-                        logger.debug(f"Checking if '{normalized_path}' exists in collected directories")
-                        if normalized_path in all_directory_paths:
-                            valid_excluded_dirs.append(normalized_path)
-                            logger.debug(f"✓ Found: {normalized_path}")
-                        else:
-                            from pathlib import Path
-                            repo_root = Path(repo_path).resolve()
-                            actual_dir_path = repo_root / normalized_path
-                            if actual_dir_path.exists() and actual_dir_path.is_dir():
-                                logger.info(f"Directory exists on filesystem but not in tree collection, adding anyway: {normalized_path}")
-                                valid_excluded_dirs.append(normalized_path)
-                            else:
-                                logger.warning(f"Directory not found in repository: {dir_path}")
-                                # Debug: show similar paths
-                                similar_paths = [p for p in all_directory_paths if dir_path.split('/')[-1] in p]
-                                if similar_paths:
-                                    logger.debug(f"Similar paths found: {similar_paths[:5]}")
+            for dir_path in excluded_dirs:
+                if isinstance(dir_path, str):
+                    normalized_path = dir_path.replace('\\', '/')
+                    logger.debug(f"Checking if '{normalized_path}' exists in collected directories")
+                    if normalized_path in all_directory_paths:
+                        valid_excluded_dirs.append(normalized_path)
+                        logger.debug(f"Found: {normalized_path}")
                     else:
-                        logger.warning(f"Invalid excluded directory type: {type(dir_path)}")
-                
-                logger.info(f"LLM analysis complete: {len(valid_excluded_dirs)} directories recommended for exclusion")
+                        repo_root = Path(repo_path).resolve()
+                        actual_dir_path = repo_root / normalized_path
+                        if actual_dir_path.exists() and actual_dir_path.is_dir():
+                            logger.info(f"Directory exists on filesystem but not in tree collection, adding anyway: {normalized_path}")
+                            valid_excluded_dirs.append(normalized_path)
+                        else:
+                            logger.warning(f"Directory not found in repository: {dir_path}")
+                            similar_paths = [p for p in all_directory_paths if dir_path.split('/')[-1] in p]
+                            if similar_paths:
+                                logger.debug(f"Similar paths found: {similar_paths[:5]}")
+                else:
+                    logger.warning(f"Invalid excluded directory type: {type(dir_path)}")
 
-                self.claude.log_complete_conversation(
-                    final_result=json.dumps(valid_excluded_dirs, indent=2)
-                )
-                
-                return valid_excluded_dirs
-                
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse LLM response as JSON: {e}")
-                logger.debug(f"Raw response: {content}")
-                return []
-            
+            logger.info(f"LLM analysis complete: {len(valid_excluded_dirs)} directories recommended for exclusion")
+            return valid_excluded_dirs
+
         except Exception as e:
             logger.error(f"Error in LLM directory analysis: {e}")
             return []
@@ -969,70 +888,29 @@ class LLMBasedDirectoryClassifier(DirectoryClassifier):
                     pass
             
             chunk_tree = "\n".join(chunk_tree_lines)
-            
+
             # Analyze this chunk
             try:
+                from ..llm.sync_bridge import one_shot_json_sync
+
                 system_prompt = self._create_system_prompt()
                 user_prompt = self._create_tree_based_user_prompt(chunk_tree, list(already_excluded_set), user_provided_include_list)
-                
-                # Create payload manually to exclude tools (directory classifier doesn't need tools)
-                messages = [{"role": "user", "content": user_prompt}]
-                full_messages = [
-                    {"role": "system", "content": system_prompt}
-                ] + messages
-                
-                # Create payload without tools
-                payload = self.claude.provider.create_payload(
-                    full_messages,
-                    stream=False,
-                    enable_system_cache=True,
-                    cache_ttl="1h"
+
+                excluded_dirs = one_shot_json_sync(
+                    self._client_config,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
                 )
-                
-                # Remove tools from payload to prevent LLM from trying to use them
-                if "tools" in payload:
-                    del payload["tools"]
-                
-                # Make request directly
-                response = self.claude.provider.make_request(payload)
-                
-                if response:
-                    # Extract and parse response (same logic as main method)
-                    content = ""
-                    if "content" in response and isinstance(response.get("content"), list):
-                        content_blocks = response.get("content", [])
-                        for block in content_blocks:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                content = block.get("text", "")
-                                break
-                    elif "choices" in response:
-                        choices = response.get("choices", [])
-                        if choices:
-                            assistant_message = choices[0].get("message", {})
-                            content = assistant_message.get("content", "")
-                    
-                    if content:
-                        # Clean up and parse JSON
-                        if "```json" in content:
-                            start = content.find("```json") + 7
-                            end = content.find("```", start)
-                            if end != -1:
-                                content = content[start:end].strip()
-                        elif "```" in content:
-                            start = content.find("```") + 3
-                            end = content.find("```", start)
-                            if end != -1:
-                                content = content[start:end].strip()
-                        
-                        try:
-                            excluded_dirs = json.loads(content)
-                            if isinstance(excluded_dirs, list):
-                                for dir_path in excluded_dirs:
-                                    if isinstance(dir_path, str) and dir_path in chunk_paths:
-                                        all_excluded.append(dir_path)
-                        except json.JSONDecodeError:
-                            logger.warning(f"Failed to parse JSON response for chunk {i//chunk_size + 1}")
-                            
+
+                if isinstance(excluded_dirs, list):
+                    for dir_path in excluded_dirs:
+                        if isinstance(dir_path, str) and dir_path in chunk_paths:
+                            all_excluded.append(dir_path)
+                elif excluded_dirs is None:
+                    logger.warning(f"No response for chunk {i//chunk_size + 1}")
+                else:
+                    logger.warning(f"Expected list, got {type(excluded_dirs)} for chunk {i//chunk_size + 1}")
+
             except Exception as e:
                 logger.warning(f"Error analyzing chunk {i//chunk_size + 1}: {e}")
                 continue

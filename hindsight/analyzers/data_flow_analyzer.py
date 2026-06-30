@@ -50,7 +50,8 @@ from ..core.constants import (
 )
 from ..core.lang_util.call_graph_util import CallGraph, load_call_graph_from_json, print_statistics
 from ..core.lang_util.call_tree_util import CallTreeGenerator
-from ..core.mcp_tools.code_navigation_server import CodeNavigationServer
+from ..core.lang_util.code_navigation import CodeNavigationServer
+from ..orchestration.pipeline_security import open_security_llm
 from ..utils.config_util import (
     ConfigValidationError,
     load_and_validate_config,
@@ -338,7 +339,6 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
             Annotated call tree dict with ext_input fields
         """
         from .external_input_analyzer import ExternalInputAnalyzer
-        from ..core.llm.llm import Claude, ClaudeConfig, create_llm_provider
         from ..core.constants import (
             DEFAULT_LLM_API_END_POINT, DEFAULT_LLM_MODEL,
             DATA_FLOW_ANALYZER_MODEL, DATA_FLOW_ANALYZER_MAX_TOKENS,
@@ -361,38 +361,13 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
         )
         self.logger.info(f"MCP server initialized with {mcp_server.graph.get_num_nodes()} symbols")
 
-        # Build LLM provider for async requests
+        # LLM client config — the actual `AsyncLLMClient` is opened lazily inside
+        # the inner async function so the httpx pool gets `aclose`d cleanly when
+        # the asyncio.run scope exits.
         api_key = get_api_key_from_config(config)
-        llm_config = ClaudeConfig(
-            api_key=api_key or "",
-            api_url=config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-            model=config.get('model', DATA_FLOW_ANALYZER_MODEL),
-            max_tokens=config.get('max_tokens', DATA_FLOW_ANALYZER_MAX_TOKENS),
-            provider_type=get_llm_provider_type(config)
-        )
-        provider = create_llm_provider(llm_config)
         model_name = config.get('model', DATA_FLOW_ANALYZER_MODEL)
+        max_tokens = config.get('max_tokens', DATA_FLOW_ANALYZER_MAX_TOKENS)
         context_window = ModelLimits.get_context_window(model_name)
-
-        # Create async LLM request function that wraps the synchronous provider
-        async def async_llm_request(system_prompt: str, messages: List[Dict[str, str]]) -> str:
-            """Async wrapper around synchronous LLM provider.make_request()."""
-            loop = asyncio.get_event_loop()
-
-            def _sync_call():
-                full_messages = [{"role": "system", "content": system_prompt}] + messages
-                payload = provider.create_payload(full_messages, stream=False)
-                response = provider.make_request(payload)
-                if response is None:
-                    return ""
-                if "error" in response:
-                    return ""
-                choices = response.get("choices", [])
-                if not choices:
-                    return ""
-                return choices[0].get("message", {}).get("content", "")
-
-            return await loop.run_in_executor(None, _sync_call)
 
         # Collect all function names from the call tree, respecting directory/file filters
         all_functions: List[str] = []
@@ -462,51 +437,64 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
                 with open(cache_path, 'w') as f:
                     json.dump(cache_data, f, indent=2)
 
-        # Run analysis for uncached functions
-        if functions_to_analyze:
-            analyzer = ExternalInputAnalyzer(
-                mcp_server=mcp_server,
-                llm_request_fn=async_llm_request,
-                rate_limit=EXTERNAL_INPUT_RATE_LIMIT,
-                max_workers=max_workers,
-                context_window=context_window,
-                on_result_callback=_persist_result,
-            )
+        async def _run_ext_input_pool():
+            """Open the async LLM client once, run the (analyze → retry) pool,
+            return the analyzer + merged results. The httpx pool is closed when
+            this context exits."""
+            async with open_security_llm(
+                api_key=api_key,
+                config=config,
+                model_override=model_name,
+                max_tokens_override=max_tokens,
+            ) as async_llm_request:
+                if functions_to_analyze:
+                    analyzer = ExternalInputAnalyzer(
+                        mcp_server=mcp_server,
+                        llm_request_fn=async_llm_request,
+                        rate_limit=EXTERNAL_INPUT_RATE_LIMIT,
+                        max_workers=max_workers,
+                        context_window=context_window,
+                        on_result_callback=_persist_result,
+                    )
 
-            results = asyncio.run(analyzer.analyze_all(functions_to_analyze))
+                    results = await analyzer.analyze_all(functions_to_analyze)
 
-            # Retry functions that failed due to LLM/rate-limit errors
-            failed_functions = [
-                func for func, (_, reason) in results.items()
-                if reason in failed_reasons or reason.startswith("Error:")
-            ]
+                    # Retry functions that failed due to LLM/rate-limit errors
+                    failed_functions = [
+                        func for func, (_, reason) in results.items()
+                        if reason in failed_reasons or reason.startswith("Error:")
+                    ]
 
-            if failed_functions:
-                self.logger.info(f"Retrying {len(failed_functions)} failed functions after 60s backoff...")
-                import time
-                time.sleep(60)
-                retry_analyzer = ExternalInputAnalyzer(
-                    mcp_server=mcp_server,
-                    llm_request_fn=async_llm_request,
-                    rate_limit=EXTERNAL_INPUT_RATE_LIMIT,
-                    max_workers=max_workers,
-                    context_window=context_window,
-                    on_result_callback=_persist_result,
-                )
-                retry_results = asyncio.run(retry_analyzer.analyze_all(failed_functions))
-                for func, result in retry_results.items():
-                    results[func] = result
-                analyzer._results.update(retry_results)
-        else:
-            # All functions were cached — create analyzer just for annotation
-            analyzer = ExternalInputAnalyzer(
-                mcp_server=mcp_server,
-                llm_request_fn=async_llm_request,
-                rate_limit=EXTERNAL_INPUT_RATE_LIMIT,
-                max_workers=max_workers,
-                context_window=context_window,
-            )
-            results = {}
+                    if failed_functions:
+                        self.logger.info(
+                            f"Retrying {len(failed_functions)} failed functions after 60s backoff..."
+                        )
+                        await asyncio.sleep(60)
+                        retry_analyzer = ExternalInputAnalyzer(
+                            mcp_server=mcp_server,
+                            llm_request_fn=async_llm_request,
+                            rate_limit=EXTERNAL_INPUT_RATE_LIMIT,
+                            max_workers=max_workers,
+                            context_window=context_window,
+                            on_result_callback=_persist_result,
+                        )
+                        retry_results = await retry_analyzer.analyze_all(failed_functions)
+                        for func, result in retry_results.items():
+                            results[func] = result
+                        analyzer._results.update(retry_results)
+                else:
+                    # All functions were cached — create analyzer just for annotation
+                    analyzer = ExternalInputAnalyzer(
+                        mcp_server=mcp_server,
+                        llm_request_fn=async_llm_request,
+                        rate_limit=EXTERNAL_INPUT_RATE_LIMIT,
+                        max_workers=max_workers,
+                        context_window=context_window,
+                    )
+                    results = {}
+                return analyzer, results
+
+        analyzer, results = asyncio.run(_run_ext_input_pool())
 
         # Merge cached results into analyzer for annotation
         all_results = dict(cached_results)
@@ -565,7 +553,6 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
             Dict with sink analysis results and annotated call tree
         """
         from .sink_analyzer import SinkAnalyzer
-        from ..core.llm.llm import Claude, ClaudeConfig, create_llm_provider
         from ..core.constants import (
             DEFAULT_LLM_API_END_POINT, DEFAULT_LLM_MODEL,
             DATA_FLOW_ANALYZER_MODEL, DATA_FLOW_ANALYZER_MAX_TOKENS,
@@ -588,36 +575,10 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
         )
         self.logger.info(f"MCP server initialized with {mcp_server.graph.get_num_nodes()} symbols")
 
-        # Build LLM provider
         api_key = get_api_key_from_config(config)
-        llm_config = ClaudeConfig(
-            api_key=api_key or "",
-            api_url=config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-            model=config.get('model', DATA_FLOW_ANALYZER_MODEL),
-            max_tokens=config.get('max_tokens', DATA_FLOW_ANALYZER_MAX_TOKENS),
-            provider_type=get_llm_provider_type(config)
-        )
-        provider = create_llm_provider(llm_config)
         model_name = config.get('model', DATA_FLOW_ANALYZER_MODEL)
+        max_tokens = config.get('max_tokens', DATA_FLOW_ANALYZER_MAX_TOKENS)
         context_window = ModelLimits.get_context_window(model_name)
-
-        async def async_llm_request(system_prompt: str, messages: List[Dict[str, str]]) -> str:
-            loop = asyncio.get_event_loop()
-
-            def _sync_call():
-                full_messages = [{"role": "system", "content": system_prompt}] + messages
-                payload = provider.create_payload(full_messages, stream=False)
-                response = provider.make_request(payload)
-                if response is None:
-                    return ""
-                if "error" in response:
-                    return ""
-                choices = response.get("choices", [])
-                if not choices:
-                    return ""
-                return choices[0].get("message", {}).get("content", "")
-
-            return await loop.run_in_executor(None, _sync_call)
 
         # Collect all function names from the call tree, respecting directory/file filters
         all_functions: List[str] = []
@@ -688,49 +649,61 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
                 with open(cache_path, 'w') as f:
                     json.dump(cache_data, f, indent=2)
 
-        if functions_to_analyze:
-            analyzer = SinkAnalyzer(
-                mcp_server=mcp_server,
-                llm_request_fn=async_llm_request,
-                rate_limit=SINK_ANALYSIS_RATE_LIMIT,
-                max_workers=max_workers,
-                context_window=context_window,
-                on_result_callback=_persist_result,
-            )
+        async def _run_sink_pool():
+            """Open the async LLM client once for the sink discovery run."""
+            async with open_security_llm(
+                api_key=api_key,
+                config=config,
+                model_override=model_name,
+                max_tokens_override=max_tokens,
+            ) as async_llm_request:
+                if functions_to_analyze:
+                    analyzer = SinkAnalyzer(
+                        mcp_server=mcp_server,
+                        llm_request_fn=async_llm_request,
+                        rate_limit=SINK_ANALYSIS_RATE_LIMIT,
+                        max_workers=max_workers,
+                        context_window=context_window,
+                        on_result_callback=_persist_result,
+                    )
 
-            results = asyncio.run(analyzer.analyze_all(functions_to_analyze))
+                    results = await analyzer.analyze_all(functions_to_analyze)
 
-            # Retry failed functions
-            failed_functions = [
-                func for func, (_, reason, _) in results.items()
-                if reason in failed_reasons or reason.startswith("Error:")
-            ]
+                    # Retry failed functions
+                    failed_functions = [
+                        func for func, (_, reason, _) in results.items()
+                        if reason in failed_reasons or reason.startswith("Error:")
+                    ]
 
-            if failed_functions:
-                self.logger.info(f"Retrying {len(failed_functions)} failed sink functions after 60s backoff...")
-                import time
-                time.sleep(60)
-                retry_analyzer = SinkAnalyzer(
-                    mcp_server=mcp_server,
-                    llm_request_fn=async_llm_request,
-                    rate_limit=SINK_ANALYSIS_RATE_LIMIT,
-                    max_workers=max_workers,
-                    context_window=context_window,
-                    on_result_callback=_persist_result,
-                )
-                retry_results = asyncio.run(retry_analyzer.analyze_all(failed_functions))
-                for func, result in retry_results.items():
-                    results[func] = result
-                analyzer._results.update(retry_results)
-        else:
-            analyzer = SinkAnalyzer(
-                mcp_server=mcp_server,
-                llm_request_fn=async_llm_request,
-                rate_limit=SINK_ANALYSIS_RATE_LIMIT,
-                max_workers=max_workers,
-                context_window=context_window,
-            )
-            results = {}
+                    if failed_functions:
+                        self.logger.info(
+                            f"Retrying {len(failed_functions)} failed sink functions after 60s backoff..."
+                        )
+                        await asyncio.sleep(60)
+                        retry_analyzer = SinkAnalyzer(
+                            mcp_server=mcp_server,
+                            llm_request_fn=async_llm_request,
+                            rate_limit=SINK_ANALYSIS_RATE_LIMIT,
+                            max_workers=max_workers,
+                            context_window=context_window,
+                            on_result_callback=_persist_result,
+                        )
+                        retry_results = await retry_analyzer.analyze_all(failed_functions)
+                        for func, result in retry_results.items():
+                            results[func] = result
+                        analyzer._results.update(retry_results)
+                else:
+                    analyzer = SinkAnalyzer(
+                        mcp_server=mcp_server,
+                        llm_request_fn=async_llm_request,
+                        rate_limit=SINK_ANALYSIS_RATE_LIMIT,
+                        max_workers=max_workers,
+                        context_window=context_window,
+                    )
+                    results = {}
+                return analyzer, results
+
+        analyzer, results = asyncio.run(_run_sink_pool())
 
         # Merge cached + new results
         all_results = dict(cached_results)
@@ -978,7 +951,6 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
         """
         from .flow_vulnerability_analyzer import FlowVulnerabilityAnalyzer
         from ..core.knowledge.cwe_store import CWEStore
-        from ..core.llm.llm import Claude, ClaudeConfig, create_llm_provider
         from ..core.constants import (
             DEFAULT_LLM_API_END_POINT,
             DATA_FLOW_ANALYZER_MODEL, DATA_FLOW_ANALYZER_MAX_TOKENS,
@@ -1020,36 +992,11 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
         )
         self.logger.info(f"MCP server initialized with {mcp_server.graph.get_num_nodes()} symbols")
 
-        # Build LLM provider
+        # Build LLM client config
         api_key = get_api_key_from_config(config)
-        llm_config = ClaudeConfig(
-            api_key=api_key or "",
-            api_url=config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-            model=config.get('model', DATA_FLOW_ANALYZER_MODEL),
-            max_tokens=config.get('max_tokens', DATA_FLOW_ANALYZER_MAX_TOKENS),
-            provider_type=get_llm_provider_type(config)
-        )
-        provider = create_llm_provider(llm_config)
         model_name = config.get('model', DATA_FLOW_ANALYZER_MODEL)
+        max_tokens = config.get('max_tokens', DATA_FLOW_ANALYZER_MAX_TOKENS)
         context_window = ModelLimits.get_context_window(model_name)
-
-        async def async_llm_request(system_prompt: str, messages: List[Dict[str, str]]) -> str:
-            loop = asyncio.get_event_loop()
-
-            def _sync_call():
-                full_messages = [{"role": "system", "content": system_prompt}] + messages
-                payload = provider.create_payload(full_messages, stream=False)
-                response = provider.make_request(payload)
-                if response is None:
-                    return ""
-                if "error" in response:
-                    return ""
-                choices = response.get("choices", [])
-                if not choices:
-                    return ""
-                return choices[0].get("message", {}).get("content", "")
-
-            return await loop.run_in_executor(None, _sync_call)
 
         data_flow_paths = self.get_default_data_flow_paths(
             config['path_to_repo'], config.get('output_base_dir')
@@ -1062,18 +1009,27 @@ class DataFlowAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Anal
             f"(workers={max_workers}, rate_limit={FLOW_VULN_RATE_LIMIT}/min)"
         )
 
-        analyzer = FlowVulnerabilityAnalyzer(
-            mcp_server=mcp_server,
-            cwe_store=cwe_store,
-            llm_request_fn=async_llm_request,
-            rate_limit=FLOW_VULN_RATE_LIMIT,
-            max_workers=max_workers,
-            context_window=context_window,
-            prompts_dir=prompts_dir,
-            cache_path=cache_path,
-        )
+        async def _run_flow_vuln_pool():
+            """Open the async LLM client once for the vulnerability scan."""
+            async with open_security_llm(
+                api_key=api_key,
+                config=config,
+                model_override=model_name,
+                max_tokens_override=max_tokens,
+            ) as async_llm_request:
+                analyzer = FlowVulnerabilityAnalyzer(
+                    mcp_server=mcp_server,
+                    cwe_store=cwe_store,
+                    llm_request_fn=async_llm_request,
+                    rate_limit=FLOW_VULN_RATE_LIMIT,
+                    max_workers=max_workers,
+                    context_window=context_window,
+                    prompts_dir=prompts_dir,
+                    cache_path=cache_path,
+                )
+                return await analyzer.analyze_all(flows_to_analyze)
 
-        all_results = asyncio.run(analyzer.analyze_all(flows_to_analyze))
+        all_results = asyncio.run(_run_flow_vuln_pool())
 
         # Collect all confirmed vulnerabilities
         all_vulns: List[Dict[str, Any]] = []

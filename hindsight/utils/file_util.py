@@ -337,7 +337,7 @@ def get_file_line_count(file_path: str, repo_path: str, file_line_counts: Dict[s
         return SMALL_FILE_LINE_THRESHOLD + 1, False
 
 
-def read_file_with_line_numbers(file_path: str, repo_path: str, start_line: int, end_line: int = None) -> str:
+def read_file_with_line_numbers(file_path: str, repo_path: str, start_line: int, end_line: Optional[int] = None) -> str:
     """
     Read file content with line numbers, supporting line ranges and proper offset.
     

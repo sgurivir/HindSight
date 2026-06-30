@@ -178,119 +178,94 @@ class LLMBasedFilter:
         return filtered_issues
     
     def _llm_filter_issues(self, issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """LLM-based filtering using the trivial issue filter prompt.
+
+        Drives `stage_trivial_filter` from the new async LLM stack via the
+        `SyncStageRunner` bridge — `filter_issues` stays sync at the API
+        level so callers (UnifiedIssueFilter, pipelines via `to_thread`) need
+        no change.
+
+        Per-issue failures and JSON parse errors keep the issue (no verdict
+        → don't drop). Matches the legacy behavior exactly.
         """
-        Real LLM-based filtering using the trivial issue filter prompt with TrivialFilterAnalyzer.
-        
-        Uses the TrivialFilterAnalyzer from hindsight.core.llm.iterative for proper
-        stage-specific JSON extraction and validation. This approach avoids the deprecated
-        Claude.run_iterative_analysis() method.
-        """
-        import json
-        from ..core.llm.llm import Claude, ClaudeConfig
-        from ..core.llm.iterative import TrivialFilterAnalyzer
-        from ..utils.config_util import get_llm_provider_type
-        
+        from hindsight.llm import (
+            SyncStageRunner,
+            make_client_config_from_dict,
+            stage_trivial_filter,
+        )
+
         original_count = len(issues)
-        self.logger.info(f"LLMBasedFilter: Starting LLM-based filtering of {original_count} issues using TrivialFilterAnalyzer")
-        
-        # Load the trivial issue filter prompt
+        self.logger.info(
+            f"LLMBasedFilter: trivial filtering {original_count} issues via stage_trivial_filter"
+        )
+
         prompt_path = Path(__file__).parent.parent / "core" / "prompts" / "trivialIssueFilterPrompt.md"
         try:
-            with open(prompt_path, 'r', encoding='utf-8') as f:
-                system_prompt = f.read()
-        except Exception as e:
-            self.logger.error(f"Failed to load trivial issue filter prompt: {e}")
-            # Fallback to dummy filtering
+            with open(prompt_path, "r", encoding="utf-8") as fh:
+                system_prompt = fh.read()
+        except Exception as exc:
+            self.logger.error(f"Failed to load trivial issue filter prompt: {exc}")
             return self._dummy_filter_issues(issues)
-        
-        # Create Claude instance directly using ClaudeConfig
+
         try:
-            llm_provider_type = get_llm_provider_type(self.config)
-            claude_config = ClaudeConfig(
+            client_config = make_client_config_from_dict(
                 api_key=self.api_key,
-                api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-                model=self.config.get('model', DEFAULT_LLM_MODEL),
-                max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
-                provider_type=llm_provider_type
+                config=self.config,
+                default_api_url=DEFAULT_LLM_API_END_POINT,
+                default_model=DEFAULT_LLM_MODEL,
+                default_max_tokens=DEFAULT_MAX_TOKENS,
             )
-            claude = Claude(claude_config)
-            
-            # Create TrivialFilterAnalyzer for proper JSON extraction
-            analyzer = TrivialFilterAnalyzer(claude)
-        except Exception as e:
-            self.logger.error(f"Failed to initialize Claude/TrivialFilterAnalyzer: {e}")
+        except Exception as exc:
+            self.logger.error(f"Failed to build client config: {exc}")
             return self._dummy_filter_issues(issues)
-        
-        filtered_issues = []
+
+        # Build one user prompt per issue.
+        user_prompts: List[str] = []
+        for issue in issues:
+            user_prompts.append(json.dumps({
+                "issue": issue.get("issue", ""),
+                "category": issue.get("category", ""),
+                "issueType": issue.get("issueType", issue.get("issue_type", "")),
+                "severity": issue.get("severity", ""),
+                "description": issue.get("description", ""),
+                "suggestion": issue.get("suggestion", ""),
+            }, indent=2))
+
+        try:
+            runner = SyncStageRunner(client_config)
+            verdicts = runner.run_many(
+                stage_trivial_filter(system_prompt, max_iterations=3),
+                user_prompts,
+                max_iterations=3,
+            )
+        except Exception as exc:
+            self.logger.error(f"SyncStageRunner failed; keeping all issues: {exc}")
+            return list(issues)
+
+        filtered_issues: List[Dict[str, Any]] = []
         dropped_count = 0
-        
-        # Process each issue individually using TrivialFilterAnalyzer
-        for i, issue in enumerate(issues, 1):
-            try:
-                # Prepare issue data for LLM
-                issue_data = {
-                    "issue": issue.get('issue', ''),
-                    "category": issue.get('category', ''),
-                    "issueType": issue.get('issueType', issue.get('issue_type', '')),
-                    "severity": issue.get('severity', ''),
-                    "description": issue.get('description', ''),
-                    "suggestion": issue.get('suggestion', '')
-                }
-                
-                # Create user message with issue data
-                user_message = json.dumps(issue_data, indent=2)
-                
-                # Use TrivialFilterAnalyzer.run_iterative_analysis for structured JSON response
-                self.logger.debug(f"Analyzing issue {i}/{original_count} with TrivialFilterAnalyzer")
-                result = analyzer.run_iterative_analysis(
-                    system_prompt=system_prompt,
-                    user_prompt=user_message,
-                    tools_executor=None,  # No tools needed for trivial filtering
-                    supported_tools=None,  # No tools needed for trivial filtering
-                    max_iterations=3  # Limit iterations for filtering
-                )
-                
-                # Parse the JSON result returned by run_iterative_analysis
-                parsed_result = None
-                if result:
-                    try:
-                        # result is a JSON string, parse it to get the dictionary
-                        parsed_result = json.loads(result) if isinstance(result, str) else result
-                    except json.JSONDecodeError as e:
-                        self.logger.warning(f"Failed to parse JSON result for issue {i}: {e}")
-                        self.logger.debug(f"Raw result: {result}")
-                
-                if parsed_result and isinstance(parsed_result, dict) and 'result' in parsed_result:
-                    is_trivial = parsed_result.get('result', False)
-                    
-                    if not is_trivial:
-                        filtered_issues.append(issue)
-                    else:
-                        dropped_count += 1
-                        issue_summary = issue.get('issue', '')[:100]
-                        self.logger.info(f"Issue {i} marked as trivial by LLM: {issue_summary}...")
-                        
-                        # Save the dropped issue
-                        self._save_dropped_issue(issue, "Marked as trivial by LLM")
-                else:
-                    self.logger.warning(f"Invalid or empty result from TrivialFilterAnalyzer for issue {i}")
-                    if result:
-                        self.logger.debug(f"Raw result received: {result}")
-                    # Keep issue if we can't get valid result
-                    filtered_issues.append(issue)
-                    
-            except Exception as e:
-                self.logger.error(f"Error processing issue {i} with TrivialFilterAnalyzer: {e}")
-                # Keep issue if error occurs
+        for idx, (issue, verdict) in enumerate(zip(issues, verdicts), start=1):
+            if isinstance(verdict, dict) and verdict.get("result") is True:
+                dropped_count += 1
+                preview = issue.get("issue", "")[:100]
+                self.logger.info(f"Issue {idx} marked as trivial by LLM: {preview}...")
+                self._save_dropped_issue(issue, "Marked as trivial by LLM")
+            else:
+                # No verdict / verdict says keep → preserve the issue.
+                if verdict is None:
+                    self.logger.debug(f"No verdict for issue {idx}; keeping it")
                 filtered_issues.append(issue)
-        
+
         filtered_count = len(filtered_issues)
-        
         if dropped_count > 0:
-            self.logger.info(f"LLMBasedFilter: LLM filtered {dropped_count} trivial issues, keeping {filtered_count} issues")
+            self.logger.info(
+                f"LLMBasedFilter: LLM filtered {dropped_count} trivial issues, "
+                f"keeping {filtered_count}"
+            )
         else:
-            self.logger.info(f"LLMBasedFilter: LLM found no trivial issues, keeping all {filtered_count} issues")
-        
+            self.logger.info(
+                f"LLMBasedFilter: LLM found no trivial issues, keeping all {filtered_count}"
+            )
         return filtered_issues
     
     def is_available(self) -> bool:

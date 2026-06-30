@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Performance Analyzer
+Performance Analyzer — runs on the new async orchestration stack.
 
 Analyzes call paths for in-place performance optimization opportunities.
 Identifies issues related to CPU, memory, power, and I/O efficiency.
 
-Uses a two-stage LLM process:
-- Stage A: Context collection along a call path (with per-function caching)
-- Stage B: Performance issue identification
+Uses a two-stage LLM process via `hindsight.orchestration.PerfPipeline`:
+- Stage A — Context collection along a call path (with per-function cache)
+- Stage B — Performance issue identification
 
 Employs edge coloring to avoid redundant analysis of overlapping paths.
 """
@@ -20,7 +20,7 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 from .analysis_runner import AnalysisRunner
 from .analysis_runner_mixins import ReportGeneratorMixin
@@ -28,16 +28,27 @@ from .call_path_enumerator import CallPathEnumerator
 from .edge_coloring_tracker import EdgeColoringTracker
 from .llm_based_analyzer import LLMBasedAnalyzer
 from ..core.ast_index import RepoAstIndex
-from ..core.async_infra import RateLimiter, run_worker_pool
 from ..core.constants import (
-    DEFAULT_MAX_TOKENS, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT,
-    LLM_PROVIDER_RATE_LIMIT, LLM_PROVIDER_RATE_WINDOW_SECONDS,
+    DEFAULT_LLM_API_END_POINT,
+    DEFAULT_LLM_MODEL,
+    DEFAULT_MAX_TOKENS,
+    LLM_PROVIDER_RATE_LIMIT,
 )
 from ..core.lang_util.call_graph_util import CallGraph
-from ..core.llm.perf_analysis import PerfAnalysis, PerfAnalysisConfig
-from ..core.mcp_tools.analysis_server import AnalysisMCPServer
+from ..orchestration import (
+    AnalysisContext,
+    AnalysisSession,
+    PerfPathWork,
+    PerfPipeline,
+    PerfRunSummary,
+    perf_function_checksum,
+)
 from ..report.report_generator import generate_html_report
-from ..utils.config_util import load_and_validate_config, get_api_key_from_config, get_llm_provider_type
+from ..utils.config_util import (
+    get_api_key_from_config,
+    get_llm_provider_type,
+    load_and_validate_config,
+)
 from ..utils.log_util import get_logger, setup_default_logging
 from ..utils.output_directory_provider import get_output_directory_provider
 
@@ -54,7 +65,7 @@ PERF_DEFAULT_MIN_FUNCTION_LINES = 5
 
 
 class PerfAnalyzer(LLMBasedAnalyzer):
-    """Analyzer that identifies performance optimization opportunities along call paths."""
+    """Path-based performance analyzer; defers the LLM stages to `PerfPipeline`."""
 
     def __init__(self):
         super().__init__()
@@ -66,77 +77,69 @@ class PerfAnalyzer(LLMBasedAnalyzer):
         return "PerfAnalyzer"
 
     def initialize(self, config: Mapping[str, Any]) -> None:
-        """Setup, load models, and prepare for analysis."""
+        """Setup, load AST, prepare for analysis."""
         super().initialize(config)
         try:
             self.ast_index.validate_ast_built()
         except RuntimeError as e:
             self.logger.warning(f"AST validation failed: {e}")
 
-    def analyze_function(self, func_record: Mapping[str, Any], mcp_server=None) -> Optional[Mapping[str, Any]]:
-        """
-        Not used by perf_analyzer (it works on paths, not individual functions).
-        Kept for interface compatibility.
-        """
+    def analyze_function(self, func_record, mcp_server=None):
+        """Not used by perf — kept for interface compatibility."""
         return None
 
-    async def analyze_path(self, path: List[str], mcp_server=None) -> Optional[List[Dict[str, Any]]]:
-        """
-        Analyze a single call path for performance issues.
-
-        Args:
-            path: Ordered list of function names [root, ..., leaf]
-            mcp_server: Optional MCP server for tool dispatch
-
-        Returns:
-            List of issue dicts or None on failure
-        """
-        if not self._initialized:
-            raise RuntimeError("Analyzer not initialized. Call initialize() first.")
-
-        try:
-            self._wait_for_rate_limit()
-
-            perf_config = PerfAnalysisConfig(
-                api_key=self.api_key,
-                api_url=self.config.get("api_end_point", DEFAULT_LLM_API_END_POINT),
-                model=self.config.get("model", DEFAULT_LLM_MODEL),
-                repo_path=self.repo_path,
-                max_tokens=DEFAULT_MAX_TOKENS,
-                config=self.config,
-                file_content_provider=self.file_content_provider,
-                llm_provider_type=self.config.get("llm_provider_type", "aws_bedrock"),
-            )
-
-            analysis = PerfAnalysis(perf_config, mcp_server=mcp_server)
-            analysis.ast_index = self.ast_index
-
-            issues = await analysis.analyze_path(path, mcp_server=mcp_server)
-            return issues
-
-        except Exception as e:
-            self.logger.error(f"Error analyzing path: {e}\n{traceback.format_exc()}")
-            return None
-
     def finalize(self) -> None:
-        """Cleanup after analysis."""
         pass
 
     def get_all_issues(self) -> List[Dict[str, Any]]:
-        """Get all collected issues."""
         return self._all_issues
 
     def add_issues(self, issues: List[Dict[str, Any]]) -> None:
-        """Add issues from a path analysis."""
         if issues:
             self._all_issues.extend(issues)
 
+    # ------------------------------------------------------------------
+    # PerfPipeline integration
+    # ------------------------------------------------------------------
+
+    def build_path_work(self, path: List[str]) -> PerfPathWork:
+        """Materialize a `PerfPathWork` from an AST-resolved call path.
+
+        Mirrors the legacy `PerfAnalysis._get_function_bodies` + checksum
+        derivation, but produces the typed work item the new pipeline expects.
+        Returns an item with empty bodies/checksums for unknown functions —
+        Stage A will just lack pre-collected context for those.
+        """
+        bodies: Dict[str, Dict[str, Any]] = {}
+        checksums: Dict[str, str] = {}
+        merged = self.ast_index.merged_functions or {}
+
+        for func_name in path:
+            func_data = merged.get(func_name) or {}
+            file_path = func_data.get("file", "") or func_data.get("file_path", "")
+            start = int(func_data.get("start_line", 0) or 0)
+            end = int(func_data.get("end_line", 0) or 0)
+            body = func_data.get("body", "") or func_data.get("source", "")
+            bodies[func_name] = {
+                "file": file_path,
+                "start_line": start,
+                "end_line": end,
+                "body": body,
+            }
+            checksums[func_name] = perf_function_checksum(func_name, file_path, start, end)
+
+        return PerfPathWork(
+            path=tuple(path),
+            function_bodies=bodies,
+            function_checksums=checksums,
+        )
+
 
 class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
-    """
-    CLI runner for the performance analyzer.
+    """CLI runner for performance analysis.
 
-    Orchestrates: path enumeration → edge coloring → async analysis → dedup → report.
+    Orchestrates: path enumeration → edge coloring → async analysis via the
+    new `PerfPipeline` → dedup → report. CLI surface is preserved verbatim.
     """
 
     def __init__(self):
@@ -145,7 +148,6 @@ class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
         self.edge_tracker = EdgeColoringTracker()
 
     def run(self) -> int:
-        """Main entry point. Returns exit code."""
         args = self._parse_args()
         try:
             return asyncio.run(self._async_run(args))
@@ -157,8 +159,6 @@ class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
             return 1
 
     async def _async_run(self, args) -> int:
-        """Async main logic."""
-        # Load config
         config = self._load_config(args)
         if config is None:
             return 1
@@ -166,18 +166,17 @@ class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
         repo_path = config["path_to_repo"]
         logger.info(f"Starting performance analysis for: {repo_path}")
 
-        # Initialize analyzer
         self.analyzer.initialize(config)
 
-        # Load call graph
         call_graph = self._build_call_graph()
         if call_graph is None:
             logger.error("Could not build call graph from AST")
             return 1
 
-        logger.info(f"Call graph: {call_graph.get_num_nodes()} nodes, {call_graph.get_num_edges()} edges")
+        logger.info(
+            f"Call graph: {call_graph.get_num_nodes()} nodes, {call_graph.get_num_edges()} edges"
+        )
 
-        # Enumerate paths
         entry_points = set(config.get("entry_points", [])) or None
         enumerator = CallPathEnumerator(
             call_graph=call_graph,
@@ -205,65 +204,78 @@ class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
             logger.info("All paths already covered by edge coloring — nothing to analyze")
             return 0
 
-        # Create MCP server for tool dispatch
-        mcp_server = self._create_mcp_server(config, call_graph)
+        # Drive the new async pipeline.
+        summary = await self._run_pipeline(config, paths_to_analyze)
 
-        # Run async worker pool
-        max_workers = config.get("max_concurrent_analyses", PERF_DEFAULT_MAX_WORKERS)
-        rpm_limit = config.get("rpm_limit", PERF_DEFAULT_RPM_LIMIT)
-        rate_limiter = RateLimiter(max_requests=rpm_limit,
-                                   window_seconds=LLM_PROVIDER_RATE_WINDOW_SECONDS)
-
-        async def worker_fn(path: List[str]) -> Optional[List[Dict]]:
-            return await self.analyzer.analyze_path(path, mcp_server=mcp_server)
-
-        def on_result(path: List[str], result: Optional[List[Dict]]) -> None:
+        # Mark each analyzed path on the edge tracker so future runs short-circuit.
+        for path in paths_to_analyze:
             self.edge_tracker.mark_analyzed(path)
-            if result:
-                self.analyzer.add_issues(result)
-                logger.info(f"Path complete: {len(result)} issues found")
 
-        def on_error(path: List[str], exc: Exception) -> None:
-            logger.error(f"Path analysis failed: {path[0]}→...→{path[-1]}: {exc}")
-
-        logger.info(f"Starting async analysis: {len(paths_to_analyze)} paths, "
-                    f"{max_workers} workers, {rpm_limit} RPM limit")
-
-        await run_worker_pool(
-            items=paths_to_analyze,
-            worker_fn=worker_fn,
-            max_workers=max_workers,
-            rate_limiter=rate_limiter,
-            on_result=on_result,
-            on_error=on_error,
-        )
-
-        # Post-processing: deduplicate issues
-        all_issues = self.analyzer.get_all_issues()
+        # Post-processing
+        all_issues = list(summary.issues)
+        self.analyzer.add_issues(all_issues)
         deduped_issues = self._deduplicate_issues(all_issues)
         logger.info(f"Issues: {len(all_issues)} total → {len(deduped_issues)} after dedup")
 
-        # Coverage stats
         stats = self.edge_tracker.get_coverage_stats()
         logger.info(f"Edge coverage: {stats['analyzed_edges']} edges analyzed")
 
-        # Generate report
         if deduped_issues:
             self._generate_report(deduped_issues, config)
 
-        # Save raw results
         self._save_results(deduped_issues, config)
-
         return 0
 
+    async def _run_pipeline(
+        self,
+        config: dict,
+        paths: List[List[str]],
+    ) -> PerfRunSummary:
+        """Build a session + pipeline and analyze every path."""
+        # Resolve the output base dir from the configured singleton — perf
+        # config doesn't carry it explicitly, so fall back to whichever
+        # directory `OutputDirectoryProvider` already established.
+        output_provider = get_output_directory_provider()
+        output_base = (
+            output_provider.get_custom_base_dir()
+            if output_provider.is_configured()
+            else os.path.dirname(output_provider.get_repo_artifacts_dir())
+        )
+
+        analysis_ctx = AnalysisContext.from_config(
+            repo_path=config["path_to_repo"],
+            config={
+                **config,
+                # Surface the perf-specific worker limit so AnalysisContext
+                # picks it up (defaults to PERF_DEFAULT_MAX_WORKERS).
+                "code_analyzer_workers": config.get(
+                    "max_concurrent_analyses", PERF_DEFAULT_MAX_WORKERS
+                ),
+            },
+            output_base_dir=output_base,
+            api_key=config["api_key"],
+        )
+
+        work_items = [self.analyzer.build_path_work(path) for path in paths]
+        logger.info(
+            f"Starting perf pipeline: {len(work_items)} paths, "
+            f"{analysis_ctx.max_workers} workers"
+        )
+
+        async with AnalysisSession.create(analysis_ctx, analyzer_name="perf_analysis") as session:
+            pipeline = PerfPipeline(session)
+            return await pipeline.analyze_paths(work_items)
+
+    # ------------------------------------------------------------------
+    # Call graph + AST helpers (unchanged from legacy)
+    # ------------------------------------------------------------------
+
     def _build_call_graph(self) -> Optional[CallGraph]:
-        """Build CallGraph from AST merged_call_graph data."""
         merged_call_graph = self.analyzer.ast_index.merged_call_graph
         if not merged_call_graph:
             return None
 
         graph = CallGraph()
-
         if isinstance(merged_call_graph, dict):
             for caller, callees in merged_call_graph.items():
                 graph.add_node(caller)
@@ -281,64 +293,31 @@ class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
 
         return graph if graph.get_num_nodes() > 0 else None
 
-    def _create_mcp_server(self, config: dict, call_graph: CallGraph) -> Optional[AnalysisMCPServer]:
-        """Create MCP server for unified tool dispatch."""
-        try:
-            repo_path = config["path_to_repo"]
-            output_provider = get_output_directory_provider()
-            artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
-
-            ignore_dirs = set()
-            for dir_name in config.get("exclude_directories", []):
-                ignore_dirs.add(dir_name)
-                ignore_dirs.add(dir_name.upper())
-                ignore_dirs.add(dir_name.lower())
-
-            mcp_server = AnalysisMCPServer(
-                repo_path=repo_path,
-                file_content_provider=self.analyzer.file_content_provider,
-                artifacts_dir=artifacts_dir,
-                ignore_dirs=ignore_dirs,
-                call_graph_data=self.analyzer.ast_index.merged_call_graph,
-            )
-            return mcp_server
-        except Exception as e:
-            logger.warning(f"Could not create MCP server: {e}")
-            return None
-
     def _deduplicate_issues(self, issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Deduplicate issues by (file_path, function_name, issueType, line_overlap)."""
         if not issues:
             return []
-
         seen: Dict[str, Dict[str, Any]] = {}
         for issue in issues:
             if not isinstance(issue, dict):
                 continue
-            file_path = issue.get("file_path", "")
-            func_name = issue.get("function_name", "")
-            issue_type = issue.get("issueType", "")
-            line = str(issue.get("line_number", ""))
-
-            key = f"{file_path}:{func_name}:{issue_type}:{line}"
+            key = (
+                f"{issue.get('file_path', '')}:{issue.get('function_name', '')}:"
+                f"{issue.get('issueType', '')}:{issue.get('line_number', '')}"
+            )
             if key not in seen:
                 seen[key] = issue
             else:
-                # Keep the one with longer description (richer context)
                 existing_desc = len(seen[key].get("description", ""))
                 new_desc = len(issue.get("description", ""))
                 if new_desc > existing_desc:
                     seen[key] = issue
-
         return list(seen.values())
 
     def _generate_report(self, issues: List[Dict[str, Any]], config: dict) -> None:
-        """Generate HTML report."""
         try:
             reports_dir = self.get_reports_directory()
             report_file = os.path.join(reports_dir, "perf_analysis_report.html")
             project_name = config.get("project_name", os.path.basename(config["path_to_repo"]))
-
             generate_html_report(
                 issues=issues,
                 output_file=report_file,
@@ -350,37 +329,30 @@ class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
             logger.error(f"Report generation failed: {e}")
 
     def _save_results(self, issues: List[Dict[str, Any]], config: dict) -> None:
-        """Save raw results JSON."""
         try:
             output_provider = get_output_directory_provider()
             results_dir = f"{output_provider.get_repo_artifacts_dir()}/results/perf_analysis"
             os.makedirs(results_dir, exist_ok=True)
-
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_file = os.path.join(results_dir, f"perf_results_{timestamp}.json")
-
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(issues, f, indent=2, ensure_ascii=False)
-
             logger.info(f"Results saved: {output_file} ({len(issues)} issues)")
         except Exception as e:
             logger.error(f"Failed to save results: {e}")
 
     def _load_config(self, args) -> Optional[dict]:
-        """Load and validate configuration."""
         try:
             config = load_and_validate_config(args.config)
             if args.repo:
                 config["path_to_repo"] = str(Path(args.repo).resolve())
 
-            # Get API key
             api_key = get_api_key_from_config(config)
             if not api_key:
                 logger.error("No API key configured")
                 return None
             config["api_key"] = api_key
 
-            # Repo path validation
             if not config.get("path_to_repo"):
                 logger.error("No repository path specified")
                 return None
@@ -388,10 +360,8 @@ class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
                 logger.error(f"Repository not found: {config['path_to_repo']}")
                 return None
 
-            # Set LLM provider type
             config["llm_provider_type"] = get_llm_provider_type(config)
 
-            # Perf-specific config overrides from CLI
             if args.max_path_depth:
                 config["max_path_depth"] = args.max_path_depth
             if args.min_path_depth:
@@ -407,7 +377,6 @@ class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
             return None
 
     def _parse_args(self):
-        """Parse command-line arguments."""
         parser = argparse.ArgumentParser(description="Hindsight Performance Analyzer")
         parser.add_argument("--config", required=True, help="Path to config JSON file")
         parser.add_argument("--repo", help="Path to repository (overrides config)")
@@ -421,7 +390,6 @@ class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
 
 
 def main():
-    """CLI entry point."""
     runner = PerfAnalysisRunner()
     sys.exit(runner.run())
 

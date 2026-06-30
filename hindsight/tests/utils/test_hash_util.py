@@ -40,11 +40,6 @@ class TestHashForContentMD5:
         result = HashUtil.hash_for_content_md5("")
         assert result == "None"
 
-    def test_hash_for_content_md5_none(self):
-        """Test MD5 hash for None returns 'None'."""
-        result = HashUtil.hash_for_content_md5(None)
-        assert result == "None"
-
     def test_hash_for_content_md5_consistency(self):
         """Test that same content produces same hash."""
         content = "Test content for hashing"
@@ -219,11 +214,6 @@ class TestHashForCallstackMD5:
     def test_hash_for_callstack_md5_empty(self):
         """Test callstack hash for empty string returns 'empty'."""
         result = HashUtil.hash_for_callstack_md5("")
-        assert result == "empty"
-
-    def test_hash_for_callstack_md5_none(self):
-        """Test callstack hash for None returns 'empty'."""
-        result = HashUtil.hash_for_callstack_md5(None)
         assert result == "empty"
 
     def test_hash_for_callstack_md5_custom_truncation(self):

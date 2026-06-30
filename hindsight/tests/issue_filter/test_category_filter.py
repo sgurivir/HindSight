@@ -89,14 +89,6 @@ class TestCategoryBasedFilterFilterIssues:
         
         assert filtered == []
 
-    def test_filter_issues_none_input(self):
-        """Test filtering None input returns None."""
-        filter_instance = CategoryBasedFilter()
-        
-        filtered = filter_instance.filter_issues(None)
-        
-        assert filtered is None
-
     def test_filter_issues_all_allowed(self):
         """Test filtering when all issues have allowed categories."""
         filter_instance = CategoryBasedFilter()

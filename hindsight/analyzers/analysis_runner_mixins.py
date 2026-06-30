@@ -273,8 +273,13 @@ class PublisherSubscriberMixin:
             previously_added_count += 1
             self.logger.info(f"Registered previously added subscriber: {type(subscriber).__name__}")
         
-        # Create and add default file system subscriber
-        default_subscriber = CodeAnalysysResultsLocalFSSubscriber(output_base_dir)
+        # Create and add default file system subscriber. Diff results land
+        # under ``results/diff_analysis/`` so they don't collide with code
+        # analyzer output for the same repo; the per-file JSON schema is
+        # identical so FastAPI clients can consume both with one shape.
+        default_subscriber = CodeAnalysysResultsLocalFSSubscriber(
+            output_base_dir, analysis_subdir="diff_analysis"
+        )
         default_subscriber.set_repo_name(repo_name)
         self.results_publisher.subscribe(default_subscriber)
         self._subscribers.append(default_subscriber)

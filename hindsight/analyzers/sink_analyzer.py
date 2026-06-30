@@ -30,8 +30,8 @@ from ..core.constants import (
     SINK_ANALYSIS_CHARS_PER_TOKEN,
     LLM_PROVIDER_RATE_WINDOW_SECONDS,
 )
-from ..core.async_infra import RateLimiter
-from ..core.mcp_tools.code_navigation_server import CodeNavigationServer
+from ..llm.rate_limit import AsyncRateLimiter as RateLimiter
+from ..core.lang_util.code_navigation import CodeNavigationServer
 from ..utils.log_util import get_logger
 
 logger = get_logger(__name__)

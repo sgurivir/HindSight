@@ -33,7 +33,6 @@ from .affected_function_detector import AffectedFunctionDetector, extract_change
 from ..analyzers.analysis_runner_mixins import UnifiedIssueFilterMixin, ReportGeneratorMixin
 from ..issue_filter.unified_issue_filter import create_unified_filter
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
-from ..core.llm.diff_analysis import DiffAnalysis, DiffAnalysisConfig
 from ..core.constants import MAX_CHARACTERS_PER_DIFF_ANALYSIS, DEFAULT_NUM_BLOCKS_TO_ANALYZE, DEFAULT_LLM_MODEL, MAX_FILES_PER_DIFF_CHUNK, DEFAULT_LLM_API_END_POINT, MAX_SUPPORTED_FILE_COUNT, MAX_FUNCTION_BODY_LENGTH, DEFAULT_MAX_TOKENS, DIFF_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT, LLM_PROVIDER_RATE_WINDOW_SECONDS, CALL_TREE_ANALYSIS_ENABLED, CALL_TREE_ANALYSIS_MAX_DEPTH, CALL_TREE_ANALYSIS_MAX_CHARS, CALL_TREE_ANALYSIS_MAX_NODES
 from ..core.call_tree import CallTreeBuilder, RootSelector
 from ..core.errors import AnalyzerErrorCode, AnalysisResult
@@ -48,9 +47,6 @@ from ..core.errors import AnalyzerErrorCode, AnalysisResult
 
 from ..results_store.code_analysis_publisher import CodeAnalysisResultsPublisher
 from ..results_store.code_analysys_results_local_fs_subscriber import CodeAnalysysResultsLocalFSSubscriber
-
-from ..core.async_infra import RateLimiter, run_worker_pool
-from ..core.mcp_tools.analysis_server import AnalysisMCPServer
 
 
 class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, BaseDiffAnalyzer):
@@ -520,461 +516,258 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             self.logger.error(f"Full traceback: {traceback.format_exc()}")
             return {}
 
-    def _analyze_affected_functions(self, affected_functions: List[Dict[str, Any]],
-                                     all_changed_files: List[str],
-                                     changed_lines_per_file: Dict[str, Dict[str, List[int]]],
-                                     ast_artifacts: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Dispatch between call-tree and legacy per-function analysis."""
-        if self.config.get('call_tree_analysis_enabled', CALL_TREE_ANALYSIS_ENABLED):
-            self.logger.info("Diff analysis: using call-tree pipeline (one LLM run per root)")
-            return self._analyze_affected_functions_as_call_trees(
-                affected_functions, all_changed_files, changed_lines_per_file, ast_artifacts
-            )
-        self.logger.info("Diff analysis: using legacy per-function pipeline")
-        return self._analyze_affected_functions_legacy(
-            affected_functions, all_changed_files, changed_lines_per_file, ast_artifacts
-        )
-
-    def _analyze_affected_functions_legacy(self, affected_functions: List[Dict[str, Any]],
-                                     all_changed_files: List[str],
-                                     changed_lines_per_file: Dict[str, Dict[str, List[int]]],
-                                     ast_artifacts: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Analyze each affected function using LLM with diff context.
-
-        Uses an async worker pool for parallel analysis. With max_workers=1,
-        behavior is identical to the previous sequential loop.
-
-        Args:
-            affected_functions: List of affected function info dicts
-            all_changed_files: List of all changed files in the commit
-            changed_lines_per_file: Changed lines per file from diff parsing
-            ast_artifacts: AST artifacts for context
-
-        Returns:
-            List of all issues found across all functions
-        """
-        total_functions = len(affected_functions)
-
-        api_key = get_api_key_from_config(self.config)
-        if not api_key:
-            self.logger.error("No API key available for function analysis")
-            return []
-
-        self._initialize_unified_issue_filter_for_diff(api_key)
-
-        llm_provider_type = get_llm_provider_type(self.config)
-        api_url = self.config.get('api_url') or self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT)
-
-        # Determine worker count from config (default: DIFF_ANALYZER_DEFAULT_WORKERS)
-        max_workers = self.config.get('diff_analyzer_workers', DIFF_ANALYZER_DEFAULT_WORKERS)
-        rate_limit = self.config.get('diff_analyzer_rate_limit', LLM_PROVIDER_RATE_LIMIT)
-        rate_window = self.config.get('diff_analyzer_rate_window_seconds', LLM_PROVIDER_RATE_WINDOW_SECONDS)
-
-        self.logger.info(
-            f"Analyzing {total_functions} affected functions with "
-            f"max_workers={max_workers}, rate_limit={rate_limit} RPM"
-        )
-
-        # Create the AnalysisMCPServer (full tools for Stage Da)
-        from ..utils.output_directory_provider import get_output_directory_provider
-        try:
-            output_provider = get_output_directory_provider()
-            artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
-        except RuntimeError:
-            artifacts_dir = None
-
-        ignore_dirs = set(self.config.get('exclude_directories', []))
-
-        directory_tree_util = None
-        try:
-            from ..utils.directory_tree_util import DirectoryTreeUtil
-            directory_tree_util = DirectoryTreeUtil()
-        except Exception:
-            pass
-
-        mcp_server = AnalysisMCPServer(
-            repo_path=str(self.repo_checkout_dir),
-            file_content_provider=getattr(self, 'file_content_provider', None),
-            artifacts_dir=artifacts_dir,
-            directory_tree_util=directory_tree_util,
-            ignore_dirs=ignore_dirs,
-        )
-
-        # Thread-safe collection of results
-        all_issues: List[Dict[str, Any]] = []
-        issues_lock = threading.Lock()
-
-        # Build indexed items: (index, func_info) for ordering prompt logging
-        indexed_functions = list(enumerate(affected_functions, 1))
-
-        # Define the async worker function for a single function
-        async def _analyze_one_function(item: Tuple[int, Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-            """Analyze a single affected function (runs in worker pool)."""
-            idx, func_info = item
-            func_name = func_info.get('function', 'unknown')
-            file_path = func_info.get('file', 'unknown')
-
-            self.logger.info(f"Analyzing function {idx}/{total_functions}: {func_name} in {file_path}")
-
-            # Issue-specific prompt logging
-            from ..core.llm.llm import Claude
-            Claude.start_issue_logging(idx)
-
-            try:
-                prompt_data = self._build_function_diff_prompt(
-                    func_info,
-                    all_changed_files,
-                    changed_lines_per_file,
-                    ast_artifacts
-                )
-
-                if not prompt_data:
-                    self.logger.warning(f"Could not build prompt for function {func_name}")
-                    return None
-
-                # Each worker creates its own DiffAnalysis instance with the shared MCP server
-                diff_config = DiffAnalysisConfig(
-                    api_key=api_key,
-                    api_url=api_url,
-                    model=self.config.get('model', DEFAULT_LLM_MODEL),
-                    repo_path=str(self.repo_checkout_dir),
-                    output_file="",
-                    max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
-                    config=self.config,
-                    file_content_provider=getattr(self, 'file_content_provider', None),
-                    mcp_server=mcp_server,
-                )
-
-                # Run the synchronous LLM calls in an executor thread
-                loop = asyncio.get_running_loop()
-                issues = await loop.run_in_executor(
-                    None,
-                    self._run_single_function_analysis,
-                    diff_config, prompt_data, func_name
-                )
-
-                # Track tokens
-                # Note: token tracking happens inside _run_single_function_analysis
-
-                if issues:
-                    if self.unified_issue_filter:
-                        filtered_issues = self.unified_issue_filter.filter_issues(issues)
-                        if len(filtered_issues) != len(issues):
-                            self.logger.info(f"Function {func_name}: filtered {len(issues) - len(filtered_issues)} issues")
-                        issues = filtered_issues
-
-                    with issues_lock:
-                        all_issues.extend(issues)
-                    self.logger.info(f"Function {func_name}: found {len(issues)} issues")
-                else:
-                    self.logger.info(f"Function {func_name}: no issues found")
-
-                return issues
-
-            except Exception as e:
-                self.logger.error(f"Error analyzing function {func_name}: {e}")
-                self.logger.error(f"Full traceback: {traceback.format_exc()}")
-                return None
-            finally:
-                Claude.end_issue_logging()
-
-        # Define error handler for the worker pool
-        def _on_error(item: Tuple[int, Dict[str, Any]], exc: Exception) -> None:
-            idx, func_info = item
-            func_name = func_info.get('function', 'unknown')
-            self.logger.error(f"Worker pool error for function {func_name}: {exc}")
-
-        # Run the async worker pool
-        rate_limiter = RateLimiter(max_requests=rate_limit, window_seconds=rate_window)
-
-        async def _run_pool():
-            await run_worker_pool(
-                items=indexed_functions,
-                worker_fn=_analyze_one_function,
-                max_workers=max_workers,
-                rate_limiter=rate_limiter,
-                on_error=_on_error,
-            )
-
-        asyncio.run(_run_pool())
-
-        self.logger.info(f"Function-level analysis complete: {len(all_issues)} total issues from {total_functions} functions")
-        return all_issues
-
-    def _run_single_function_analysis(
-        self,
-        diff_config: 'DiffAnalysisConfig',
-        prompt_data: Dict[str, Any],
-        func_name: str
-    ) -> Optional[List[Dict[str, Any]]]:
-        """
-        Run Stage Da + Stage Db for a single function (synchronous, thread-safe).
-
-        This method is called from run_in_executor and performs the actual LLM calls.
-
-        Args:
-            diff_config: DiffAnalysisConfig with mcp_server set
-            prompt_data: Prompt data for the function
-            func_name: Function name (for logging)
-
-        Returns:
-            List of issues or None on failure
-        """
-        diff_analyzer = DiffAnalysis(diff_config)
-        self._last_analysis = diff_analyzer
-
-        # Stage Da: Collect diff context
-        diff_context_bundle = diff_analyzer.run_diff_context_collection(prompt_data)
-        if diff_context_bundle is None:
-            self.logger.warning(f"Stage Da failed for {func_name} - skipping Stage Db")
-            return None
-
-        # Stage Db: Analyze from context
-        issues = diff_analyzer.run_diff_analysis_from_context(diff_context_bundle)
-
-        # Track token usage (thread-safe via token_tracker's internal lock or external lock)
-        if self.token_tracker and hasattr(diff_analyzer, 'get_token_totals'):
-            try:
-                input_tokens, output_tokens = diff_analyzer.get_token_totals()
-                if input_tokens > 0 or output_tokens > 0:
-                    self.token_tracker.add_token_usage(input_tokens, output_tokens)
-                    self.logger.debug(f"Function {func_name} token usage: {input_tokens} input, {output_tokens} output")
-            except Exception as e:
-                self.logger.warning(f"Failed to record token usage for {func_name}: {e}")
-
-        return issues
-
-    # ==================================================================
-    # Call-tree-at-once diff pipeline
-    # ==================================================================
-
-    def _analyze_affected_functions_as_call_trees(
+    def _analyze_affected_functions(
         self,
         affected_functions: List[Dict[str, Any]],
         all_changed_files: List[str],
         changed_lines_per_file: Dict[str, Dict[str, List[int]]],
         ast_artifacts: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """Diff analysis using call trees rooted at the highest affected ancestor.
+        """Drive Stage Da → Db (per-function) or one-LLM-run-per-root (call-tree).
 
-        Affected functions are clustered into trees — each root is the highest
-        affected function in a chain. Each tree is analyzed in a single LLM run
-        with diff-marked source bodies. Issues are attributed to ``defect_function``
-        so dedup / FP filter / report generator continue to work unchanged.
+        Dispatches between modes based on ``ctx.enable_call_tree`` (which
+        reads ``call_tree_analysis_enabled`` from the config). Both paths
+        publish through ``AsyncResultSink``; this method then reads the flat
+        list of issues back from the publisher to preserve the legacy return
+        contract.
+
+        What this method does NOT change:
+          - Publisher init (still ``_initialize_publisher_subscriber``)
+          - Unified issue filter init
+          - Token tracker
+          - On-disk results in ``results/diff_analysis/*_analysis.json``
+          - Conversation-logging directory layout
+            (``prompts_sent/diff_analysis/...``)
         """
-        if not affected_functions:
-            return []
+        from ..orchestration import (
+            AnalysisContext,
+            AnalysisSession,
+            AsyncResultSink,
+            DiffPipeline,
+        )
 
         api_key = get_api_key_from_config(self.config)
         if not api_key:
-            self.logger.error("No API key available for call-tree diff analysis")
+            self.logger.error("No API key available for diff analysis")
             return []
 
         self._initialize_unified_issue_filter_for_diff(api_key)
 
-        # Build a builder from the diff's per-commit call graph (only changed
-        # files have AST, so callers/callees outside that set will appear as
-        # out-of-tree markers — that's expected and desired).
-        call_graph = ast_artifacts.get('call_graph', []) or []
+        # The legacy diff layout puts artifacts under
+        # ``{out_dir}/{repo}_diff_analysis/analysis/``, not under
+        # ``{out_dir}/{repo}/``. Pass the analysis dir explicitly so the
+        # pipeline's context_bundles / diff_context_bundles / prompts_sent
+        # land where the rest of the diff tooling expects them.
+        ctx = AnalysisContext.from_config(
+            repo_path=str(self.repo_checkout_dir),
+            config=self.config,
+            output_base_dir=str(self.analysis_dir.parent),
+            api_key=api_key,
+            artifacts_dir=str(self.analysis_dir),
+        )
+
+        use_call_tree = ctx.enable_call_tree
+        if use_call_tree:
+            work_items = self._build_call_tree_work_items(
+                affected_functions, all_changed_files, changed_lines_per_file, ast_artifacts
+            )
+            self.logger.info(
+                f"Diff analysis: call-tree mode, built {len(work_items)} tree work items "
+                f"from {len(affected_functions)} affected functions"
+            )
+        else:
+            work_items = self._build_function_work_items(
+                affected_functions, all_changed_files, changed_lines_per_file, ast_artifacts
+            )
+            self.logger.info(
+                f"Diff analysis: per-function mode, built {len(work_items)} work items"
+            )
+
+        if not work_items:
+            return []
+
+        fcp = getattr(self, "file_content_provider", None)
+        try:
+            from ..utils.directory_tree_util import DirectoryTreeUtil
+
+            dtu = DirectoryTreeUtil()
+        except Exception:
+            dtu = None
+
+        issue_filter = (
+            self.unified_issue_filter.filter_issues
+            if self.unified_issue_filter is not None
+            else None
+        )
+
+        def _token_callback(input_tokens: int, output_tokens: int) -> None:
+            if self.token_tracker is None:
+                return
+            try:
+                self.token_tracker.add_token_usage(input_tokens, output_tokens)
+            except Exception as exc:
+                self.logger.debug(f"token_callback failed (non-fatal): {exc}")
+
+        async def _run_async() -> None:
+            async with AnalysisSession.create(
+                ctx,
+                file_content_provider=fcp,
+                directory_tree_util=dtu,
+                analyzer_name="diff_analysis",
+            ) as session:
+                session.conversation_logger.clear_older_prompts()
+                sink = AsyncResultSink(self.results_publisher, repo_name=ctx.repo_name)
+                pipeline = DiffPipeline(
+                    session,
+                    sink,
+                    issue_filter=issue_filter,
+                    token_callback=_token_callback,
+                )
+                if use_call_tree:
+                    summary = await pipeline.analyze_diff_call_tree(work_items)
+                else:
+                    summary = await pipeline.analyze_diff_per_function(work_items)
+                self.logger.info(
+                    f"Diff pipeline summary: selected={summary.selected} "
+                    f"successful={summary.successful} cached={summary.cached} "
+                    f"failed={summary.failed} duration={summary.duration_seconds:.1f}s"
+                )
+                if summary.error:
+                    self.logger.error(f"Diff pipeline aborted: {summary.error}")
+
+        try:
+            asyncio.run(_run_async())
+        except Exception as exc:
+            self.logger.error(f"Diff orchestration crashed: {exc}")
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            return []
+
+        # Read published issues back from the publisher to preserve the
+        # legacy return shape (flat list of issues).
+        all_issues: List[Dict[str, Any]] = []
+        if self.results_publisher:
+            published = self.results_publisher.get_results(ctx.repo_name) or []
+            for entry in published:
+                results = entry.get("results") if isinstance(entry, dict) else None
+                if isinstance(results, list):
+                    all_issues.extend(r for r in results if isinstance(r, dict))
+        self.logger.info(
+            f"Diff analysis: {len(all_issues)} total issues from {len(work_items)} work items"
+        )
+        return all_issues
+
+    def _build_function_work_items(
+        self,
+        affected_functions: List[Dict[str, Any]],
+        all_changed_files: List[str],
+        changed_lines_per_file: Dict[str, Dict[str, List[int]]],
+        ast_artifacts: Dict[str, Any],
+    ) -> List["DiffFunctionWork"]:
+        """Per-function work-item builder. Reuses the existing prompt builder."""
+        from ..orchestration import DiffFunctionWork
+        from ..utils.hash_util import HashUtil
+
+        items: List["DiffFunctionWork"] = []
+        for func_info in affected_functions:
+            try:
+                prompt_data = self._build_function_diff_prompt(
+                    func_info, all_changed_files, changed_lines_per_file, ast_artifacts
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    f"Could not build prompt for {func_info.get('function', 'unknown')}: {exc}"
+                )
+                continue
+            if not prompt_data:
+                continue
+            function_name = prompt_data.get(
+                "function", func_info.get("function", "unknown")
+            )
+            file_path = prompt_data.get("file_path", func_info.get("file", "unknown"))
+            start = int(func_info.get("start", 0) or 0)
+            end = int(func_info.get("end", 0) or 0)
+            try:
+                checksum = HashUtil.checksum_for_function_source(
+                    str(self.repo_checkout_dir), file_path, start, end
+                )
+            except Exception as exc:
+                self.logger.debug(
+                    f"checksum_for_function_source failed for {function_name}: {exc}"
+                )
+                checksum = ""
+            items.append(
+                DiffFunctionWork(
+                    prompt_data=prompt_data,
+                    function_name=function_name,
+                    file_path=file_path,
+                    function_checksum=checksum,
+                )
+            )
+        return items
+
+    def _build_call_tree_work_items(
+        self,
+        affected_functions: List[Dict[str, Any]],
+        all_changed_files: List[str],
+        changed_lines_per_file: Dict[str, Dict[str, List[int]]],
+        ast_artifacts: Dict[str, Any],
+    ) -> List["DiffCallTreeWork"]:
+        """Call-tree work-item builder. Mirrors the legacy call-tree path."""
+        from ..orchestration import DiffCallTreeWork
+
+        call_graph = ast_artifacts.get("call_graph", []) or []
         builder = CallTreeBuilder(
             nested_call_graph=call_graph,
             repo_path=str(self.repo_checkout_dir),
-            max_depth=self.config.get('call_tree_max_depth', CALL_TREE_ANALYSIS_MAX_DEPTH),
-            max_chars=self.config.get('call_tree_max_chars', CALL_TREE_ANALYSIS_MAX_CHARS),
-            max_nodes=self.config.get('call_tree_max_nodes', CALL_TREE_ANALYSIS_MAX_NODES),
+            max_depth=self.config.get("call_tree_max_depth", CALL_TREE_ANALYSIS_MAX_DEPTH),
+            max_chars=self.config.get("call_tree_max_chars", CALL_TREE_ANALYSIS_MAX_CHARS),
+            max_nodes=self.config.get("call_tree_max_nodes", CALL_TREE_ANALYSIS_MAX_NODES),
         )
 
-        affected_set: Set[str] = {f.get('function', '') for f in affected_functions if f.get('function')}
-        # Map function name -> affected_function dict so we can recover
-        # changed_lines / affected_reason later.
+        affected_set: Set[str] = {
+            f.get("function", "") for f in affected_functions if f.get("function")
+        }
         affected_by_name: Dict[str, Dict[str, Any]] = {
-            f.get('function', ''): f for f in affected_functions if f.get('function')
+            f.get("function", ""): f for f in affected_functions if f.get("function")
         }
 
         selector = RootSelector(builder)
         selection = selector.select_for_diff(affected_set)
-        roots = selection.roots
-
+        roots: List[str] = list(selection.roots or [])
         if not roots:
             self.logger.warning("Diff call-tree analysis: no roots after selection")
             return []
-
-        total_roots = len(roots)
-        self.logger.info(
-            f"Diff call-tree analysis: {len(affected_set)} affected functions → {total_roots} trees"
-        )
-
-        # MCP server (shared across workers, matches legacy path).
-        from ..utils.output_directory_provider import get_output_directory_provider
-        try:
-            output_provider = get_output_directory_provider()
-            artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
-        except RuntimeError:
-            artifacts_dir = None
-        ignore_dirs = set(self.config.get('exclude_directories', []) or [])
-        try:
-            from ..utils.directory_tree_util import DirectoryTreeUtil
-            directory_tree_util = DirectoryTreeUtil()
-        except Exception:
-            directory_tree_util = None
-        mcp_server = AnalysisMCPServer(
-            repo_path=str(self.repo_checkout_dir),
-            file_content_provider=getattr(self, 'file_content_provider', None),
-            artifacts_dir=artifacts_dir,
-            directory_tree_util=directory_tree_util,
-            ignore_dirs=ignore_dirs,
-        )
-
-        llm_provider_type = get_llm_provider_type(self.config)
-        api_url = self.config.get('api_url') or self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT)
-
-        max_workers = self.config.get('diff_analyzer_workers', DIFF_ANALYZER_DEFAULT_WORKERS)
-        rate_limit = self.config.get('diff_analyzer_rate_limit', LLM_PROVIDER_RATE_LIMIT)
-        rate_window = self.config.get('diff_analyzer_rate_window_seconds', LLM_PROVIDER_RATE_WINDOW_SECONDS)
-        self.logger.info(
-            f"Diff call-tree analysis: {total_roots} trees, max_workers={max_workers}, rate_limit={rate_limit} RPM"
-        )
-
-        all_issues: List[Dict[str, Any]] = []
-        issues_lock = threading.Lock()
-        indexed_roots = list(enumerate(roots, 1))
 
         diff_context_payload = {
             "all_changed_files": all_changed_files,
             "changed_lines_per_file": changed_lines_per_file,
         }
 
-        async def _analyze_one_root(item: Tuple[int, str]) -> Optional[List[Dict[str, Any]]]:
-            idx, root_name = item
-            self.logger.info(f"[{idx}/{total_roots}] Diff call-tree analysis for root: {root_name}")
-
-            from ..core.llm.llm import Claude
-            Claude.start_issue_logging(idx)
-
+        items: List["DiffCallTreeWork"] = []
+        for root_name in roots:
+            tree = builder.build(root_name)
+            if tree is None:
+                self.logger.warning(f"Could not build tree for root: {root_name}")
+                continue
+            tree_dict = tree.to_dict()
             try:
-                tree = builder.build(root_name)
-                if tree is None:
-                    self.logger.warning(f"[{idx}/{total_roots}] Could not build tree for {root_name}")
-                    return None
-
-                # Replace each node's source with a diff-marked version, and add
-                # is_modified / changed_lines fields per node.
-                tree_dict = tree.to_dict()
                 self._inject_diff_markers_into_tree(
                     tree_dict, changed_lines_per_file, affected_by_name
                 )
-
-                diff_config = DiffAnalysisConfig(
-                    api_key=api_key,
-                    api_url=api_url,
-                    model=self.config.get('model', DEFAULT_LLM_MODEL),
-                    repo_path=str(self.repo_checkout_dir),
-                    output_file="",
-                    max_tokens=self.config.get('max_tokens', DEFAULT_MAX_TOKENS),
-                    config=self.config,
-                    file_content_provider=getattr(self, 'file_content_provider', None),
-                    mcp_server=mcp_server,
+            except Exception as exc:
+                self.logger.warning(
+                    f"diff-marker injection failed for root {root_name}: {exc}"
                 )
-
-                loop = asyncio.get_running_loop()
-                issues = await loop.run_in_executor(
-                    None,
-                    self._run_single_call_tree_analysis,
-                    diff_config, tree_dict, diff_context_payload, root_name,
+            items.append(
+                DiffCallTreeWork(
+                    tree_dict=tree_dict,
+                    diff_context=diff_context_payload,
+                    root_name=root_name,
+                    root_file=tree.root_file,
+                    root_checksum=tree.root_checksum,
                 )
-
-                if not issues:
-                    self.logger.info(f"[{idx}/{total_roots}] Root {root_name}: no issues")
-                    return issues or []
-
-                # Apply unified FP / dedup filter.
-                if self.unified_issue_filter:
-                    filtered = self.unified_issue_filter.filter_issues(issues)
-                    if len(filtered) != len(issues):
-                        self.logger.info(
-                            f"[{idx}/{total_roots}] Root {root_name}: filtered "
-                            f"{len(issues) - len(filtered)} issues"
-                        )
-                    issues = filtered
-
-                # Schema-compatibility shim — ensure legacy fields are populated.
-                normalized: List[Dict[str, Any]] = []
-                for raw in issues:
-                    if not isinstance(raw, dict):
-                        continue
-                    out = dict(raw)
-                    if 'function_name' not in out:
-                        out['function_name'] = out.get('defect_function') or root_name
-                    if 'file_path' not in out:
-                        out['file_path'] = out.get('defect_file', '')
-                    if 'file_name' not in out and out.get('file_path'):
-                        out['file_name'] = os.path.basename(out['file_path'])
-                    if 'line_number' not in out:
-                        out['line_number'] = str(out.get('defect_line_number', ''))
-                    if 'issueType' not in out:
-                        out['issueType'] = out.get('category', 'logicBug')
-                    if 'severity' not in out:
-                        out['severity'] = 'medium'
-                    normalized.append(out)
-
-                with issues_lock:
-                    all_issues.extend(normalized)
-
-                self.logger.info(f"[{idx}/{total_roots}] Root {root_name}: {len(normalized)} issues")
-                return normalized
-
-            except Exception as e:
-                self.logger.error(f"[{idx}/{total_roots}] Error analyzing root {root_name}: {e}")
-                self.logger.error(f"Full traceback: {traceback.format_exc()}")
-                return None
-            finally:
-                Claude.end_issue_logging()
-
-        def _on_error(item: Tuple[int, str], exc: Exception) -> None:
-            idx, root_name = item
-            self.logger.error(f"[{idx}/{total_roots}] Worker error for {root_name}: {exc}")
-
-        rate_limiter = RateLimiter(max_requests=rate_limit, window_seconds=rate_window)
-
-        async def _run_pool():
-            await run_worker_pool(
-                items=indexed_roots,
-                worker_fn=_analyze_one_root,
-                max_workers=max_workers,
-                rate_limiter=rate_limiter,
-                on_error=_on_error,
             )
-
-        asyncio.run(_run_pool())
-
-        self.logger.info(
-            f"Diff call-tree analysis complete: {len(all_issues)} total issues from {total_roots} trees"
-        )
-        return all_issues
-
-    def _run_single_call_tree_analysis(
-        self,
-        diff_config: 'DiffAnalysisConfig',
-        tree_dict: Dict[str, Any],
-        diff_context: Dict[str, Any],
-        root_name: str,
-    ) -> Optional[List[Dict[str, Any]]]:
-        """Synchronous worker that runs ``run_diff_call_tree_analysis`` once."""
-        diff_analyzer = DiffAnalysis(diff_config)
-        self._last_analysis = diff_analyzer
-
-        issues = diff_analyzer.run_diff_call_tree_analysis(tree_dict, diff_context)
-
-        if self.token_tracker and hasattr(diff_analyzer, 'get_token_totals'):
-            try:
-                input_tokens, output_tokens = diff_analyzer.get_token_totals()
-                if input_tokens > 0 or output_tokens > 0:
-                    self.token_tracker.add_token_usage(input_tokens, output_tokens)
-            except Exception as e:
-                self.logger.warning(f"Token usage record failed for root {root_name}: {e}")
-
-        return issues
+        return items
 
     def _inject_diff_markers_into_tree(
         self,
@@ -1294,7 +1087,9 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             previously_added_count += 1
             self.logger.info(f"Registered previously added subscriber: {type(subscriber).__name__}")
 
-        default_subscriber = CodeAnalysysResultsLocalFSSubscriber(output_base_dir)
+        default_subscriber = CodeAnalysysResultsLocalFSSubscriber(
+            output_base_dir, analysis_subdir="diff_analysis"
+        )
         default_subscriber.set_repo_name(repo_name)
         self.results_publisher.subscribe(default_subscriber)
         self._subscribers.append(default_subscriber)
@@ -1321,7 +1116,9 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
             self.results_publisher.subscribe(subscriber)
             self.logger.info(f"Registered previously added subscriber: {type(subscriber).__name__}")
 
-        default_subscriber = CodeAnalysysResultsLocalFSSubscriber(output_base_dir)
+        default_subscriber = CodeAnalysysResultsLocalFSSubscriber(
+            output_base_dir, analysis_subdir="diff_analysis"
+        )
         default_subscriber.set_repo_name(repo_name)
         self.results_publisher.subscribe(default_subscriber)
         self._subscribers.append(default_subscriber)
@@ -1628,13 +1425,6 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                 custom_base_dir=str(self.analysis_dir.parent)  # Use parent so repo name appending works correctly
             )
             self.logger.info(f"Configured OutputDirectoryProvider for diff analysis - prompts will be saved to: {self.analysis_dir}/prompts_sent")
-
-            # Step 2.5.0: Setup conversation logging directory EARLY (before DirectoryClassifier uses LLM)
-            # This must happen before any LLM calls to ensure conversation logging is available
-            from ..core.llm.llm import Claude
-            Claude.setup_prompts_logging("diff_analysis")
-            Claude.clear_older_prompts()
-            self.logger.info("Setup conversation logging directory and cleared older prompts (early setup before DirectoryClassifier)")
 
             # Step 2.5.1: Run DirectoryClassifier and check file count limit BEFORE diff generation
             self.logger.info("\n\n=== DIRECTORY CLASSIFICATION & FILE COUNT CHECK ===")

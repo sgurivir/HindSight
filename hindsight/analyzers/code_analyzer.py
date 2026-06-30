@@ -57,7 +57,6 @@ import asyncio
 import json
 import os
 import sys
-import tempfile
 import threading
 import traceback
 from datetime import datetime
@@ -66,10 +65,9 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .analysis_runner import AnalysisRunner
 from .analysis_runner_mixins import UnifiedIssueFilterMixin, ReportGeneratorMixin
+from .base_analyzer import BaseAnalyzer
 from .directory_classifier import DirectoryClassifier
-from .base_analyzer import BaseAnalyzer, AnalyzerProtocol
 from .dummy_analyzer import DummyCodeAnalyzer
-from .llm_based_analyzer import LLMBasedAnalyzer
 from .token_tracker import TokenTracker
 from ..analysys_strategy.diff_strategy import DiffStrategy
 from ..core.constants import (DEFAULT_LOGS_DIR, DEFAULT_MAX_TOKENS,
@@ -84,15 +82,11 @@ from ..core.constants import (DEFAULT_LOGS_DIR, DEFAULT_MAX_TOKENS,
                               CALL_TREE_ANALYSIS_MAX_DEPTH,
                               CALL_TREE_ANALYSIS_MAX_CHARS,
                               CALL_TREE_ANALYSIS_MAX_NODES)
-from ..core.call_tree import CallTreeBuilder, RootSelector
+from ..core.call_tree import CallTreeBuilder
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
 from ..core.lang_util.filter_by_file_util import FilterByFileUtil
 from ..core.ast_index import RepoAstIndex
-from ..core.async_infra import RateLimiter, run_worker_pool
-from ..core.mcp_tools.analysis_server import AnalysisMCPServer
 from hindsight.utils.log_util import LogUtil, get_logger, setup_default_logging
-from ..core.llm.code_analysis import AnalysisConfig, CodeAnalysis
-from ..core.llm.llm import Claude
 from ..report.issue_directory_organizer import DirectoryNode, RepositoryDirHierarchy
 from ..report.report_generator import calculate_stats, generate_html_report, generate_dropped_issues_html_report
 from ..utils.issue_organizer_util import organize_issues_complete
@@ -137,236 +131,36 @@ DEFAULT_AST_CALL_GRAPH_DIR = "code_insights"
 DEFAULT_LLM_ANALYSIS_OUT_DIR = "code_analysis"
 
 
-class CodeAnalyzer(LLMBasedAnalyzer):
-    """Analyzer that performs LLM-based code analysis."""
+class CodeAnalyzer(BaseAnalyzer):
+    """Result-reader for code analysis output.
 
-    def __init__(self):
-        super().__init__()
-        # Initialize centralized AST index for lazy loading
-        self.ast_index = RepoAstIndex()
+    All LLM-driven analysis lives in `hindsight.orchestration.CodePipeline`;
+    this class survives only because the report-generation path needs a
+    `BaseAnalyzer` subclass that knows where on disk to find `*_analysis.json`
+    files (one level deeper than `BaseAnalyzer._read_analysis_results`'s
+    default).
+    """
 
     def name(self) -> str:
         return "CodeAnalyzer"
 
-    def initialize(self, config: Mapping[str, Any]) -> None:
-        """Setup, load models, and prepare for analysis."""
-        super().initialize(config)
-        # Initialize AST index (actual loading is lazy)
-        self._initialize_ast_index()
-
-    def _initialize_ast_index(self) -> None:
-        """
-        Initialize AST index for centralized loading.
-        The actual loading is now handled lazily by RepoAstIndex.
-        """
-        try:
-            # Validate that AST has been built before analysis
-            self.ast_index.validate_ast_built()
-            self.logger.debug("AST index initialized and validated")
-        except RuntimeError as e:
-            self.logger.warning(f"AST validation failed: {e}")
-            # Don't fail initialization - let individual property access handle missing files
-
-    def analyze_function(self, func_record: Mapping[str, Any], mcp_server=None) -> Optional[Mapping[str, Any]]:
-        """Analyze a single function record using LLM.
-
-        Args:
-            func_record: Function data record to analyze.
-            mcp_server: Optional AnalysisMCPServer instance. When provided, it is
-                passed to CodeAnalysis so that code-navigation tools are available
-                and the MCP dispatch layer is used for tool execution.
-        """
-        if not self._initialized:
-            raise RuntimeError("Analyzer not initialized. Call initialize() first.")
-
-        try:
-            # Rate limiting - wait if necessary for HTTP-based LLM providers
-            self._wait_for_rate_limit()
-
-            # Create a temporary file for this analysis
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
-                json.dump(dict(func_record), temp_file, indent=2)
-                temp_input_path = temp_file.name
-
-            try:
-                # Create AnalysisConfig
-                analysis_config = AnalysisConfig(
-                    json_file_path=temp_input_path,
-                    api_key=self.api_key,
-                    api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-                    model=self.config.get('model', DEFAULT_LLM_MODEL),
-                    repo_path=self.repo_path,
-                    output_file="",
-                    max_tokens=DEFAULT_MAX_TOKENS,
-                    processed_cache_file=None,  # Using new publisher-subscriber caching system
-                    config=self.config,
-                    file_content_provider=self.file_content_provider,
-                    file_filter=self.config.get('file_filter', []),
-                    min_function_body_length=self.config.get('min_function_body_length', 7),
-                )
-
-                # Create CodeAnalysis instance with pre-loaded data
-                # Pass the MCP server if available for unified tool dispatch
-                code_analysis = CodeAnalysis(analysis_config, mcp_server=mcp_server)
-
-                # Override the AST index with our cached instance to avoid reloading
-                code_analysis.ast_index = self.ast_index
-
-                # Store the analysis instance for token tracking
-                self._last_analysis = code_analysis
-
-                # Stage 4a: Context collection
-                # Derive a unique cache key from the function name + file path.
-                # NOTE: func_record is a processed_entry whose keys are 'function'
-                # (not 'name') and 'context.file' (not 'checksum').  Using the
-                # wrong keys caused every function to resolve to 'unknown' and
-                # share the same bundle path (ad921d60.json).
-                import hashlib as _hashlib
-                func_name_for_key = func_record.get('function', func_record.get('name', 'unknown'))
-                func_file_for_key = func_record.get('context', {}).get('file', '')
-                func_checksum = f"{func_file_for_key}:{func_name_for_key}"
-                func_checksum_hex = _hashlib.md5(func_checksum.encode()).hexdigest()
-
-                context_bundle = code_analysis.run_context_collection(
-                    json_data=dict(func_record),
-                    checksum=func_checksum_hex
-                )
-
-                if context_bundle is None:
-                    self.logger.warning(f"Stage 4a failed for {func_record.get('name', 'unknown')} - skipping Stage 4b")
-                    return None
-
-                # Stage 4b: Analysis from context
-                issues = code_analysis.run_analysis_from_context(context_bundle)
-
-                if issues is None:
-                    return None
-
-                # Post-process results
-                result = [self._post_process_analysis_result(item) if isinstance(item, dict) else item for item in issues]
-                return result if result else []
-
-            finally:
-                # Clean up temporary input file
-                try:
-                    os.unlink(temp_input_path)
-                except OSError:
-                    pass
-
-        except Exception as e:
-            # Log error but don't raise to maintain interface contract
-            self.logger.error(f"Error during function analysis: {e}")
-            self.logger.error(f"Function record keys: {list(func_record.keys()) if isinstance(func_record, dict) else 'Not a dict'}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
-            return None
-
-    def finalize(self) -> None:
-        """Cleanup after analysis."""
-        pass
-
-    def analyze_call_tree(self, tree_dict: Dict[str, Any], mcp_server=None) -> Optional[list]:
-        """Analyze an entire call tree in a single LLM run.
-
-        Args:
-            tree_dict: Output of ``CallTree.to_dict()`` (schema 2.0).
-            mcp_server: Optional AnalysisMCPServer for unified tool dispatch.
-
-        Returns:
-            List of issue dicts on success, ``None`` on failure, ``[]`` for
-            "no issues found".
-        """
-        if not self._initialized:
-            raise RuntimeError("Analyzer not initialized. Call initialize() first.")
-
-        try:
-            self._wait_for_rate_limit()
-
-            analysis_config = AnalysisConfig(
-                json_file_path="",                       # not used in call-tree mode
-                api_key=self.api_key,
-                api_url=self.config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-                model=self.config.get('model', DEFAULT_LLM_MODEL),
-                repo_path=self.repo_path,
-                output_file="",
-                max_tokens=DEFAULT_MAX_TOKENS,
-                processed_cache_file=None,
-                config=self.config,
-                file_content_provider=self.file_content_provider,
-                file_filter=self.config.get('file_filter', []),
-                min_function_body_length=self.config.get('min_function_body_length', 7),
-            )
-
-            code_analysis = CodeAnalysis(analysis_config, mcp_server=mcp_server)
-            code_analysis.ast_index = self.ast_index
-            self._last_analysis = code_analysis
-
-            issues = code_analysis.run_call_tree_analysis(tree_dict)
-            if issues is None:
-                return None
-
-            return [
-                self._post_process_analysis_result(item) if isinstance(item, dict) else item
-                for item in issues
-            ]
-        except Exception as e:
-            root = (tree_dict.get("root") or {}).get("function", "unknown")
-            self.logger.error(f"Error during call-tree analysis for root {root}: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
-            return None
-
-    def set_publisher(self, publisher) -> None:
-        """
-        Set the publisher for result checking.
-
-        Args:
-            publisher: The CodeAnalysisResultsPublisher instance
-        """
-        # Store publisher for potential future use
-        self.publisher = publisher
-        # The actual caching logic is handled at the runner level
-        self.logger.debug("Publisher set on CodeAnalyzer")
-
-    def _post_process_analysis_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Post-process analysis result to ensure required fields are properly set.
-
-        Args:
-            result: Analysis result dictionary
-
-        Returns:
-            Dict[str, Any]: Post-processed result
-        """
-        if not isinstance(result, dict):
-            return result
-
-        # No longer setting file_name field as it's been removed from the database schema
-        # The file_path field contains the full path information needed
-
-        return result
+    def analyze_function(self, func_record: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+        # Required by BaseAnalyzer. Unused — analysis goes through CodePipeline.
+        raise NotImplementedError(
+            "CodeAnalyzer no longer performs analysis directly; use "
+            "hindsight.orchestration.CodePipeline instead."
+        )
 
     def pull_results_from_directory(self, artifacts_dir: str) -> Dict[str, Any]:
-        """
-        Pull code analysis results from the provided artifacts directory.
+        """Read all `*_analysis.json` files from `{artifacts_dir}/results/code_analysis/`.
 
-        Args:
-            artifacts_dir: Path to the artifacts directory containing analysis results
-
-        Returns:
-            Dictionary containing:
-            - 'results': List of code analysis results
-            - 'statistics': Dictionary with statistics about the results
-            - 'summary': Dictionary with summary information
+        Returns the same `{'results', 'statistics', 'summary'}` shape the
+        legacy implementation produced — report generation depends on it.
         """
-        # For code analyzer, results are stored in results/code_analysis/ subdirectory
         code_analysis_dir = os.path.join(artifacts_dir, "results", "code_analysis")
-
-        # Use the base implementation with code analysis specific directory
         result = self._read_analysis_results(code_analysis_dir, ANALYSIS_FILE_SUFFIX)
-
-        # Add code analyzer specific information to summary
-        result['summary']['analyzer_type'] = 'code_analysis'
-        result['summary']['analysis_directory'] = code_analysis_dir
-
+        result["summary"]["analyzer_type"] = "code_analysis"
+        result["summary"]["analysis_directory"] = code_analysis_dir
         return result
 
 
@@ -397,463 +191,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         # Unified issue filter (initialized when needed)
         self.unified_issue_filter = None
 
-    def _get_function_line_count(self, json_data: Dict[str, Any]) -> int:
-        """
-        Extract the line count of a function from JSON data.
-
-        Args:
-            json_data: The JSON data for a function to analyze
-
-        Returns:
-            int: Number of lines in the function, or 0 if not determinable
-        """
-        try:
-            # Try different possible locations for line count information
-            line_count = 0
-
-            # Check for direct line count fields
-            if 'line_count' in json_data:
-                line_count = json_data['line_count']
-            elif 'lines' in json_data:
-                line_count = json_data['lines']
-            elif 'num_lines' in json_data:
-                line_count = json_data['num_lines']
-
-            # Check in context
-            elif 'context' in json_data and isinstance(json_data['context'], dict):
-                context = json_data['context']
-                line_count = (
-                    context.get('line_count', 0) or
-                    context.get('lines', 0) or
-                    context.get('num_lines', 0)
-                )
-
-            # Check in function data
-            elif 'function' in json_data and isinstance(json_data['function'], dict):
-                func = json_data['function']
-                line_count = (
-                    func.get('line_count', 0) or
-                    func.get('lines', 0) or
-                    func.get('num_lines', 0)
-                )
-
-                # Also check function's context
-                if line_count == 0 and 'context' in func and isinstance(func['context'], dict):
-                    func_context = func['context']
-                    line_count = (
-                        func_context.get('line_count', 0) or
-                        func_context.get('lines', 0) or
-                        func_context.get('num_lines', 0)
-                    )
-
-            # Try to calculate from start_line and end_line if available
-            if line_count == 0:
-                start_line = None
-                end_line = None
-
-                # Check different locations for line numbers
-                for location in [json_data, json_data.get('context', {}), json_data.get('function', {})]:
-                    if isinstance(location, dict):
-                        if start_line is None:
-                            start_line = location.get('start_line') or location.get('startLine') or location.get('start')
-                        if end_line is None:
-                            end_line = location.get('end_line') or location.get('endLine') or location.get('end')
-
-                        if start_line is not None and end_line is not None:
-                            break
-
-                if start_line is not None and end_line is not None:
-                    line_count = max(0, end_line - start_line + 1)
-
-            return max(0, int(line_count)) if line_count else 0
-
-        except Exception as e:
-            self.logger.debug(f"Error extracting line count from JSON data: {e}")
-            return 0
-
-    def _should_analyze_function(self, json_data: Dict[str, Any], config: dict) -> bool:
-        """
-        Check if a function should be analyzed based on LLM analysis filtering logic.
-        This implements the filtering precedence: function-filter > file-filter > include_directories > exclude_directories
-
-        Args:
-            json_data: The JSON data for a function/file to analyze
-            config: Configuration dictionary containing filtering parameters
-
-        Returns:
-            bool: True if the function should be analyzed, False otherwise
-        """
-        # Step 0: Check if --function-filter is provided with a JSON file. If so, use only verified functions
-        if self.verified_functions:
-            return self._should_analyze_function_by_verified_list(json_data)
-
-        # Step 1: Check if --file-filter is provided. If so, use only file filter logic
-        if self.file_filter:
-            return self._should_analyze_function_by_file_filter(json_data)
-
-        # Step 2: Check function length requirements (both minimum and maximum)
-        min_function_body_length = config.get('min_function_body_length', MIN_FUNCTION_BODY_LENGTH)
-        function_line_count = self._get_function_line_count(json_data)
-
-        # Extract function name for logging
-        function_name = (
-            json_data.get('name') or
-            json_data.get('function_name') or
-            'Unknown'
-        )
-
-        if function_line_count > 0 and function_line_count < min_function_body_length:
-            self.logger.debug(f"Skipping function '{function_name}' - only {function_line_count} lines (minimum: {min_function_body_length})")
-            return False
-
-        if function_line_count > MAX_FUNCTION_BODY_LENGTH:
-            self.logger.debug(f"Skipping function '{function_name}' - {function_line_count} lines exceeds maximum ({MAX_FUNCTION_BODY_LENGTH})")
-            return False
-
-        # Step 3: Apply include_directories, exclude_directories, and exclude_files logic
-        return self._should_analyze_function_by_directory_filters(json_data, config)
-
-    def _should_analyze_function_by_verified_list(self, json_data: Dict[str, Any]) -> bool:
-        """
-        Check if a function should be analyzed based on the verified functions list from function_filter JSON.
-
-        Args:
-            json_data: The JSON data for a function/file to analyze
-
-        Returns:
-            bool: True if the function is in the verified functions list, False otherwise
-        """
-        # Extract function name from the JSON data
-        function_name = (
-            json_data.get('name')
-            or json_data.get('function_name')
-            or json_data.get('function')  # Extract function name from nested function data
-        )
-
-        if function_name and function_name in self.verified_functions:
-            self.logger.debug(f"✓ Function '{function_name}' found in verified functions list")
-            return True
-        else:
-            if function_name:
-                self.logger.debug(f"✗ Function '{function_name}' not in verified functions list")
-            else:
-                self.logger.debug("✗ Could not extract function name from JSON data")
-            return False
-
-    def _should_analyze_function_by_file_filter(self, json_data: Dict[str, Any]) -> bool:
-        """
-        Check if a function should be analyzed based on the --file-filter argument.
-        This uses the existing filtered lists logic.
-
-        Args:
-            json_data: The JSON data for a function/file to analyze
-
-        Returns:
-            bool: True if the function should be analyzed, False otherwise
-        """
-        # If we have filtered lists, check if this function/class is in them
-        if self.filtered_functions or self.filtered_classes:
-            # Extract function/class name from the JSON data
-            function_name = None
-            class_name = None
-
-            # Check different possible structures in the JSON data
-            function_name = (
-                json_data.get('name')
-                or json_data.get('function_name')
-                or json_data.get('function')  # Extract function name from nested function data
-                )
-
-            # Check for class names
-            class_name = (
-                json_data.get('class_name')
-                or json_data.get('className')
-                or json_data.get('data_type_name')
-)
-
-            # Check if function or class is in our filtered lists
-            if function_name and function_name in self.filtered_functions:
-                self.logger.debug(f"✓ Function '{function_name}' found in filtered functions list")
-                return True
-            if class_name and class_name in self.filtered_classes:
-                self.logger.debug(f"✓ Class '{class_name}' found in filtered classes list")
-                return True
-
-            # If we have filtered lists but this item is not in them, fall back to file-based filtering
-            # This ensures we don't miss files due to function/class name mismatches
-            self.logger.debug(f"Function/class name not found in filtered lists (function: '{function_name}', class: '{class_name}'), falling back to file-based filtering")
-
-        # Always fall back to file-based filtering if function/class name matching didn't succeed
-        return self._should_analyze_function_by_file(json_data)
-
-    def _should_analyze_function_by_directory_filters(self, json_data: Dict[str, Any], config: dict) -> bool:
-        """
-        Check if a function should be analyzed based on include_directories, exclude_directories, and exclude_files.
-        Uses the unified filtering method from FilteredFileFinder to ensure consistent behavior.
-
-        Args:
-            json_data: The JSON data for a function/file to analyze
-            config: Configuration dictionary containing filtering parameters
-
-        Returns:
-            bool: True if the function should be analyzed, False otherwise
-        """
-        # Extract file path from the JSON data
-        file_path = self._extract_file_path_from_json(json_data)
-        if not file_path:
-            self.logger.debug(f"Could not extract file path from JSON data, including by default")
-            return True
-
-        # Normalize file path
-        normalized_file_path = file_path.lstrip('./')
-
-        # Get filtering parameters from config
-        include_directories = config.get('include_directories', [])
-        exclude_directories = config.get('exclude_directories', [])
-        exclude_files = config.get('exclude_files', [])
-
-        # Use the unified filtering method from FilteredFileFinder
-        result = FilteredFileFinder.should_analyze_by_directory_filters(
-            normalized_file_path,
-            include_directories,
-            exclude_directories,
-            exclude_files
-        )
-
-        if result:
-            self.logger.debug(f"✓ File {normalized_file_path} passed all directory filters")
-        else:
-            self.logger.debug(f"✗ File {normalized_file_path} excluded by directory filters")
-
-        return result
-
-    def _extract_file_path_from_json(self, json_data: Dict[str, Any]) -> str:
-        """
-        Extract file path from JSON data, checking multiple possible locations.
-
-        Args:
-            json_data: The JSON data for a function/file to analyze
-
-        Returns:
-            str: File path or None if not found
-        """
-        # Try direct / top-level contexts
-        file_path = (
-            json_data.get('file')
-            or (json_data.get('context', {}).get('file')
-                if isinstance(json_data.get('context'), dict) else None)
-            or (json_data.get('fileContext', {}).get('file')
-                if isinstance(json_data.get('fileContext'), dict) else None)
-        )
-
-        # Nested function data
-        if not file_path and isinstance(json_data.get('function'), dict):
-            func = json_data['function']
-            file_path = (
-                (func.get('context', {}).get('file')
-                if isinstance(func.get('context'), dict) else None)
-                or func.get('file')
-            )
-
-        # Invoking list (first item's context)
-        if (not file_path and isinstance(json_data.get('invoking'), list)
-                and json_data['invoking']):
-            first = json_data['invoking'][0]
-            if isinstance(first, dict):
-                ctx = first.get('context')
-                if isinstance(ctx, dict):
-                    file_path = ctx.get('file')
-
-        return file_path
-
-    def _should_analyze_function_by_file(self, json_data: Dict[str, Any]) -> bool:
-        """
-        Fallback method to check if a function should be analyzed based on file path.
-
-        Args:
-            json_data: The JSON data for a function/file to analyze
-
-        Returns:
-            bool: True if the function should be analyzed, False otherwise
-        """
-        # Extract file path from the JSON data - check multiple possible locations
-        file_path = None
-
-        # Try direct / top-level contexts
-        file_path = (
-            json_data.get('file')
-            or (json_data.get('context', {}).get('file')
-                if isinstance(json_data.get('context'), dict) else None)
-            or (json_data.get('fileContext', {}).get('file')
-                if isinstance(json_data.get('fileContext'), dict) else None)
-        )
-
-        # Nested function data
-        if not file_path and isinstance(json_data.get('function'), dict):
-            func = json_data['function']
-            file_path = (
-                (func.get('context', {}).get('file')
-                if isinstance(func.get('context'), dict) else None)
-                or func.get('file')
-            )
-
-        # Invoking list (first item’s context)
-        if (not file_path and isinstance(json_data.get('invoking'), list)
-                and json_data['invoking']):
-            first = json_data['invoking'][0]
-            if isinstance(first, dict):
-                ctx = first.get('context')
-                if isinstance(ctx, dict):
-                    file_path = ctx.get('file')
-
-        if not file_path:
-            self.logger.debug(f"Could not extract file path from JSON data keys: {list(json_data.keys())}")
-            if 'context' in json_data:
-                self.logger.debug(
-                    f"Context keys: {list(json_data['context'].keys()) if isinstance(json_data['context'], dict) else 'Not a dict'}"
-                )
-            self.logger.debug(f"Full JSON structure: {json.dumps(json_data, indent=2)[:500]}...")
-            return True
-
-        # Normalize file paths for comparison (remove leading ./ and handle relative paths)
-        normalized_file_path = file_path.lstrip('./')
-
-        # Debug logging to understand the matching process
-        self.logger.debug(f"Extracted file path: '{file_path}' -> normalized: '{normalized_file_path}'")
-        self.logger.debug(f"File filter contains {len(self.file_filter)} files: {self.file_filter[:3]}..." if len(self.file_filter) > 3 else f"File filter: {self.file_filter}")
-
-        # Check if the file is in our filter list
-        for filter_file in self.file_filter:
-            normalized_filter_file = filter_file.lstrip('./')
-            self.logger.debug(f"Comparing '{normalized_file_path}' with filter '{normalized_filter_file}'")
-            if normalized_file_path == normalized_filter_file or normalized_file_path.endswith('/' + normalized_filter_file):
-                self.logger.debug(f"✓ File {normalized_file_path} matches filter {normalized_filter_file}")
-                return True
-
-        self.logger.debug(f"✗ File {normalized_file_path} does not match any filter in file_filter")
-        return False
-
-    def _process_function_entry(self, func_entry: Dict, repo_path: str) -> Dict:
-        """
-        Process single function entry (extracted from ASTCallGraphParser logic).
-
-        Args:
-            func_entry: Function entry from call graph
-            repo_path: Repository path
-
-        Returns:
-            Dict: Processed function entry ready for analysis
-        """
-        # Extract primary function information
-        function_name = func_entry.get('function', '')
-        context = func_entry.get('context', {})
-        primary_file = context.get('file', '')
-
-
-        # Skip if no valid file
-        if not primary_file:
-            return {}
-
-        # Handle functions_invoked (new format - just a list of function names)
-        functions_invoked = func_entry.get('functions_invoked', [])
-
-        # Extract data_types_used from the entry
-        data_types_used = func_entry.get('data_types_used', [])
-
-        # Extract constants_used from the entry
-        constants_used = func_entry.get('constants_used', {})
-
-        # Extract invoked_by (caller functions) from the entry
-        invoked_by = func_entry.get('invoked_by', [])
-
-        # Extract function context for primary function
-        function_context = extract_function_context(func_entry, repo_path, True)
-
-
-        # Build result structure
-        result = {
-            'function': function_name,
-            'code': function_context,  # Add the actual function code here
-            'context': {
-                'file': primary_file,
-                'start': context.get('start'),
-                'end': context.get('end'),
-                'function_context': function_context
-            }
-        }
-
-
-        # Add functions_invoked if it's not empty
-        if functions_invoked:
-            result['functions_invoked'] = functions_invoked
-
-        # Add data_types_used if it's not empty
-        if data_types_used:
-            result['data_types_used'] = data_types_used
-
-        # Add constants_used if it's not empty
-        if constants_used:
-            result['constants_used'] = constants_used
-
-        # Add invoked_by (caller functions) if it's not empty
-        if invoked_by:
-            result['invoked_by'] = invoked_by
-
-        return result
-
-    def _generate_temp_function_file(self, func_entry: Dict, repo_path: str) -> str:
-        """
-        Generate temporary function INPUT file only when needed.
-        This file is used as input to the LLM analysis and is deleted after analysis.
-        The analysis RESULT files are preserved for caching purposes.
-
-        Args:
-            func_entry: Function entry from call graph
-            repo_path: Repository path
-
-        Returns:
-            str: Path to temporary INPUT file (will be deleted after analysis)
-        """
-        # Process the function entry
-        processed_entry = self._process_function_entry(func_entry, repo_path)
-        if not processed_entry:
-            return ""
-
-        # Create unique filename
-        function_name = processed_entry.get('function', 'unknown')
-        primary_file = processed_entry.get('context', {}).get('file', 'unknown')
-
-        # Create safe filename using same logic as output filename
-        safe_function_name = "".join(c for c in function_name if c.isalnum() or c in ('_', '-'))
-        safe_file_name = "".join(c for c in os.path.basename(primary_file) if c.isalnum() or c in ('_', '-', '.'))
-
-        # Truncate function name and file name to prevent filesystem length issues
-        # Most filesystems have a 255 character limit, so we'll be conservative
-        max_function_name_length = 100
-        max_file_name_length = 50
-        
-        if len(safe_function_name) > max_function_name_length:
-            safe_function_name = safe_function_name[:max_function_name_length]
-            
-        if len(safe_file_name) > max_file_name_length:
-            safe_file_name = safe_file_name[:max_file_name_length]
-
-        # Use deterministic hash (same as output filename logic)
-        file_hash = HashUtil.hash_for_file_identifier_md5(primary_file, truncate_length=8)
-        temp_filename = f"{safe_function_name}_{safe_file_name}_{file_hash}.json"
-
-        temp_path = os.path.join(self.processed_output_dir, temp_filename)
-
-        # Write processed entry to temp file
-        try:
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(processed_entry, f, indent=2, ensure_ascii=False)
-            return temp_path
-        except Exception as e:
-            self.logger.error(f"Failed to create temp file {temp_path}: {e}")
-            return ""
-
-    def _process_call_graph(self, config: dict, nested_call_graph_path: str, _output_base_dir: str = None) -> tuple:
+    def _process_call_graph(self, config: dict, nested_call_graph_path: str) -> tuple:
         """Validate call graph exists and prepare for on-demand processing."""
         self.logger.info("Validating call graph for on-demand processing...")
 
@@ -1129,877 +467,215 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
 
         self.logger.info(f"Initialized publisher-subscriber system for report generation: {repo_name}")
 
-    def _run_code_analysis(self, config: dict, output_base_dir: str, api_key: str = None) -> tuple:
-        """Run code analysis.
+    def _run_code_analysis(
+        self,
+        config: dict,
+        output_base_dir: str,
+        api_key: Optional[str] = None,
+    ) -> tuple:
+        """Run code analysis through the async orchestration stack.
 
-        Dispatches between the call-tree pipeline (one LLM run per filter-relative
-        root, whole subtree in prompt) and the legacy per-function pipeline based
-        on ``CALL_TREE_ANALYSIS_ENABLED`` in ``hindsight.core.constants``. The
-        legacy path remains available as a fallback while the new approach is
-        validated.
+        Drop-in replacement for the old `_run_code_analysis_legacy` /
+        `_run_call_tree_code_analysis` paths. Returns the same
+        `(successful, failed)` tuple so the caller does not change.
+
+        What this method does NOT change:
+          - Publisher/subscriber initialization (still
+            `_initialize_publisher_subscriber(...)`)
+          - Unified issue filter initialization
+          - Token tracker creation
+          - Conversation logging path (preserves
+            `prompts_sent/code_analysis/{N}/stepX_stage.md` layout)
+          - Output directories under `~/llm_artifacts/{repo}/...`
+          - On-disk results in `results/code_analysis/*_analysis.json`
+
+        What is new:
+          - LLM HTTP is async (`httpx.AsyncClient`)
+          - Per-iteration tool calls dispatch concurrently
+          - Per-function fan-out via `asyncio.Semaphore` (no thread pool)
+          - Per-function failures isolated (one bad LLM response can't abort
+            the whole run); results published write-through so partial state
+            is visible even if the run crashes
         """
-        if config.get('call_tree_analysis_enabled', CALL_TREE_ANALYSIS_ENABLED):
-            self.logger.info("Code analysis: using call-tree pipeline (one LLM run per root)")
-            return self._run_call_tree_code_analysis(config, output_base_dir, api_key)
+        from ..orchestration import (
+            AnalysisContext,
+            AnalysisSession,
+            AsyncResultSink,
+            CodePipeline,
+            FunctionFilters,
+        )
 
-        self.logger.info("Code analysis: using legacy per-function pipeline")
-        return self._run_code_analysis_legacy(config, output_base_dir, api_key)
+        self.logger.info("Starting code analysis via async orchestration stack...")
 
-    def _run_code_analysis_legacy(self, config: dict, output_base_dir: str, api_key: str = None) -> tuple:
-        """Run code analysis with on-demand file generation from call graph."""
-        self.logger.info("Starting on-demand code analysis...")
-
-        # Initialize centralized token tracker if not already set
+        # --- Token tracker (preserve legacy behavior) ---
         if not self.token_tracker:
             llm_provider_type = get_llm_provider_type(config)
             self.token_tracker = TokenTracker(llm_provider_type)
-            self.logger.info(f"Auto-initialized centralized token tracker for provider: {llm_provider_type}")
+            self.logger.info(
+                f"Auto-initialized centralized token tracker for provider: {llm_provider_type}"
+            )
 
-        # Initialize publisher-subscriber system
+        # --- Publisher init (unchanged from legacy path) ---
         self._initialize_publisher_subscriber(config, output_base_dir)
 
-        # If the startup token fetch failed transiently (e.g. network not ready),
-        # retry Apple Connect now that the environment is more likely to be ready.
+        # --- Retry Apple Connect token fetch if it failed at startup ---
         if not api_key:
             self.logger.info("API key not available from startup — retrying Apple Connect token fetch...")
             api_key = get_api_key_from_config(config)
             if api_key:
-                self.logger.info("Apple Connect token retrieved on retry — proceeding with code analysis")
+                self.logger.info("Apple Connect token retrieved on retry")
 
-        # Initialize unified issue filter
+        # --- Unified issue filter (unchanged) ---
         self._initialize_unified_issue_filter(api_key, config)
 
-        # Check if call graph data is available
-        if not hasattr(self, 'call_graph_data') or not self.call_graph_data:
-            self.logger.error("No call graph data available for on-demand processing")
+        if not hasattr(self, "call_graph_data") or not self.call_graph_data:
+            self.logger.error("No call graph data available for analysis")
             return 0, 0
 
-        # Extract configuration values
-        repo_path = config['path_to_repo']
+        repo_path = config["path_to_repo"]
         self._current_repo_path = repo_path
-        num_functions_to_analyze = config.get('num_functions_to_analyze', DEFAULT_NUM_FUNCTIONS_TO_ANALYZE)
 
-        # Create LLM analysis output directory under results/
+        # Make sure `results/code_analysis/` exists (legacy parity).
         results_dir = self.get_results_directory()
         code_analysis_dir = f"{results_dir}/code_analysis"
         os.makedirs(code_analysis_dir, exist_ok=True)
+        config["analysis_dir"] = code_analysis_dir
 
-        # Set the analysis directory in config
-        config['analysis_dir'] = code_analysis_dir
-
-        # Pre-filter and sort all functions before processing
-        self.logger.info("Pre-filtering and sorting functions by length...")
-        filtered_functions = []
-
-        for file_entry in self.call_graph_data:
-            functions = file_entry.get('functions', [])
-
-            for func_entry in functions:
-                # Add file information to function entry if missing
-                if 'context' not in func_entry:
-                    func_entry['context'] = {}
-                if 'file' not in func_entry['context']:
-                    func_entry['context']['file'] = file_entry.get('file', '')
-
-                # Apply filtering logic
-                if self._should_analyze_function(func_entry, config):
-                    # Calculate function length for sorting
-                    function_length = self._get_function_line_count(func_entry)
-                    filtered_functions.append({
-                        'func_entry': func_entry,
-                        'file_entry': file_entry,
-                        'length': function_length
-                    })
-
-        # Sort by function length (longest first)
-        filtered_functions.sort(key=lambda x: x['length'], reverse=True)
-
-        total_functions = len(filtered_functions)
-        self.logger.info(f"After filtering: {total_functions} functions to process (sorted by length, longest first)")
-
-        if total_functions == 0:
-            self.logger.warning("No functions passed filtering criteria")
+        if not api_key:
+            self.logger.warning("No API key available — skipping code analysis")
             return 0, 0
 
-        # Count existing results to determine how many new functions to analyze
-        existing_results_count = 0
+        # --- Build the typed context for the session ---
+        ctx = AnalysisContext.from_config(
+            repo_path=repo_path,
+            config=config,
+            output_base_dir=output_base_dir,
+            api_key=api_key,
+        )
+
+        # --- Build a CallTreeBuilder when call-tree mode is on ---
+        call_tree_builder = None
+        if ctx.enable_call_tree:
+            try:
+                call_tree_builder = CallTreeBuilder(
+                    nested_call_graph=self.call_graph_data,
+                    repo_path=repo_path,
+                    max_depth=ctx.call_tree_max_depth,
+                    max_chars=ctx.call_tree_max_chars,
+                    max_nodes=ctx.call_tree_max_nodes,
+                )
+                self.logger.info("Code analysis: call-tree mode enabled")
+            except Exception as exc:
+                self.logger.warning(
+                    f"CallTreeBuilder init failed; falling back to per-function mode: {exc}"
+                )
+                call_tree_builder = None
+
+        # --- Hooks into the legacy components ---
+        issue_filter = (
+            self.unified_issue_filter.filter_issues
+            if self.unified_issue_filter is not None
+            else None
+        )
+
+        def _token_callback(input_tokens: int, output_tokens: int) -> None:
+            """Bridge LLM-stack token usage into the legacy TokenTracker.
+
+            TokenTracker.record_tokens_from_analysis() takes an object with
+            `total_input_tokens` / `total_output_tokens` attributes — we shape
+            a minimal stub for each call.
+            """
+            try:
+                stub = type("_TokenStub", (), {
+                    "total_input_tokens": input_tokens,
+                    "total_output_tokens": output_tokens,
+                })()
+                self.token_tracker.record_tokens_from_analysis(stub)
+            except Exception as exc:
+                self.logger.debug(f"token_callback failed (non-fatal): {exc}")
+
+        # --- File content provider / directory tree util (preserved) ---
+        fcp = self.get_file_content_provider() if hasattr(self, "get_file_content_provider") else None
+        dtu = getattr(self, "directory_tree_util", None)
+
+        # --- Filters — resolve from the runner's state (mirrors legacy precedence) ---
+        filters = FunctionFilters(
+            file_filter=tuple(self.file_filter or ()),
+            include_directories=tuple(config.get("include_directories", []) or ()),
+            exclude_directories=tuple(config.get("exclude_directories", []) or ()),
+            exclude_files=tuple(config.get("exclude_files", []) or ()),
+            verified_functions=frozenset(self.verified_functions or set()),
+            filtered_functions=frozenset(self.filtered_functions or []),
+            filtered_classes=frozenset(self.filtered_classes or []),
+            min_function_body_length=int(
+                config.get("min_function_body_length", MIN_FUNCTION_BODY_LENGTH)
+            ),
+            max_function_body_length=int(
+                config.get("max_function_body_length", MAX_FUNCTION_BODY_LENGTH)
+            ),
+        )
+
+        num_to_analyze = config.get("num_functions_to_analyze", DEFAULT_NUM_FUNCTIONS_TO_ANALYZE)
+
+        # Account for already-cached results so we honor the limit globally.
         if self.results_publisher:
-            repo_name = os.path.basename(repo_path.rstrip('/'))
-            existing_results = self.results_publisher.get_results(repo_name)
-            existing_results_count = len(existing_results) if existing_results else 0
-            self.logger.info(f"Found {existing_results_count} existing analysis results")
-
-        # Calculate how many new functions we can analyze
-        remaining_to_analyze = max(0, num_functions_to_analyze - existing_results_count)
-        
-        if remaining_to_analyze == 0:
-            self.logger.info(f"Already have {existing_results_count} results, which meets or exceeds the limit of {num_functions_to_analyze}. No new analysis needed.")
-            return existing_results_count, 0
-        elif remaining_to_analyze < total_functions:
-            self.logger.info(f"Limiting analysis to {remaining_to_analyze} functions (have {existing_results_count} existing, limit is {num_functions_to_analyze})")
-            filtered_functions = filtered_functions[:remaining_to_analyze]
-            total_functions = len(filtered_functions)
-        else:
-            self.logger.info(f"Will analyze {total_functions} functions (have {existing_results_count} existing, limit is {num_functions_to_analyze})")
-
-        # Initialize analyzer
-        llm_provider_type = get_llm_provider_type(config)
-        analyzer: AnalyzerProtocol = CodeAnalyzer()
-        self.logger.info(f"Using CodeAnalyzer for analysis (llm_provider_type={llm_provider_type})")
-
-        # Initialize analyzer with configuration values
-        # Note: file_filter and min_function_body_length are NOT passed because
-        # all filtering has already been applied during pre-filtering stage
-        analyzer_config = {
-            'api_key': api_key,
-            'repo_path': repo_path,
-            'file_content_provider': self.get_file_content_provider() if hasattr(self, 'get_file_content_provider') else None,
-            'api_end_point': config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-            'model': config.get('model', DEFAULT_LLM_MODEL),
-            'output_base_dir': output_base_dir,
-            'user_provided_prompts': self.user_provided_prompts  # Pass user-provided prompts to analyzer
-        }
-        analyzer_config.update(config)  # Add all config values
-
-        analyzer.initialize(analyzer_config)
-        self.analyzer_instance = analyzer
-
-        # Set publisher on analyzer for result checking if it's a CodeAnalyzer
-        if hasattr(analyzer, 'set_publisher') and self.results_publisher:
-            analyzer.set_publisher(self.results_publisher)
-
-        if not api_key:
-            self.logger.warning("No API key available from config or other ways")
-            self.logger.info("Skipping code analysis due to missing API key")
-            return 0, 0
-
-        # --- Create AnalysisMCPServer for unified tool dispatch ---
-        # This provides the MCP layer with optional code-navigation tools
-        # (call-graph tools will be used by prompts in Phase 4)
-        try:
-            output_provider = get_output_directory_provider()
-            mcp_output_base_dir = output_provider.get_custom_base_dir()
-        except RuntimeError:
-            mcp_output_base_dir = None
-
-        mcp_ignore_dirs = set()
-        if config.get('exclude_directories'):
-            for dir_name in config.get('exclude_directories', []):
-                mcp_ignore_dirs.add(dir_name)
-                mcp_ignore_dirs.add(dir_name.upper())
-                mcp_ignore_dirs.add(dir_name.lower())
-
-        mcp_file_content_provider = self.get_file_content_provider() if hasattr(self, 'get_file_content_provider') else None
-
-        mcp_artifacts_dir = None
-        try:
-            output_provider = get_output_directory_provider()
-            mcp_artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
-        except RuntimeError:
-            pass
-
-        mcp_directory_tree_util = getattr(self, 'directory_tree_util', None)
-
-        # Pass call graph data to enable code-navigation tools (when available)
-        mcp_call_graph_data = getattr(self, 'call_graph_data', None)
-
-        mcp_server = AnalysisMCPServer(
-            repo_path=repo_path,
-            file_content_provider=mcp_file_content_provider,
-            artifacts_dir=mcp_artifacts_dir,
-            directory_tree_util=mcp_directory_tree_util,
-            ignore_dirs=mcp_ignore_dirs,
-            call_graph_data=mcp_call_graph_data,
-        )
-
-        # --- Determine worker count ---
-        max_workers = config.get('code_analyzer_workers', CODE_ANALYZER_DEFAULT_WORKERS)
-        rate_limit = config.get('code_analyzer_rate_limit', LLM_PROVIDER_RATE_LIMIT)
-        rate_window = config.get('code_analyzer_rate_window_seconds', LLM_PROVIDER_RATE_WINDOW_SECONDS)
-        self.logger.info(f"Parallel analysis: max_workers={max_workers}, rate_limit={rate_limit} per {rate_window}s")
-
-        # --- Thread-safe counters and publisher lock ---
-        _publisher_lock = threading.Lock()
-        _counters_lock = threading.Lock()
-        successful_analyses = 0
-        failed_analyses = 0
-
-        # --- Define the per-function analysis work ---
-        def _extract_function_metadata(func_data: Dict):
-            func_entry = func_data['func_entry']
-            function_length = func_data['length']
-            function_name = func_entry.get('function', 'unknown')
-            primary_file = func_entry.get('context', {}).get('file', 'unknown')
-            func_context = func_entry.get('context', {})
-            function_checksum = HashUtil.checksum_for_function_source(
-                repo_path, primary_file, func_context.get('start', 0), func_context.get('end', 0)
-            )
-            return func_entry, function_length, function_name, primary_file, function_checksum
-
-        def _check_cache_and_handle_hit(func_data: Dict, index: int) -> Optional[bool]:
-            """Check the result cache; on hit, republish and return True/False.
-
-            Returns None on cache miss — caller must run the LLM analysis path.
-            """
-            nonlocal successful_analyses
-
-            _, function_length, function_name, primary_file, function_checksum = _extract_function_metadata(func_data)
-
-            if not self.results_publisher:
-                self.logger.debug(f"[{index}/{total_functions}] No results publisher available - will analyze {function_name}")
-                return None
-
-            self.logger.debug(f"[{index}/{total_functions}] Checking cache for function='{function_name}', file='{primary_file}', checksum='{function_checksum}'")
-            existing_result = self.results_publisher.check_existing_result(
-                primary_file,
-                function_name,
-                function_checksum
-            )
-
-            if not existing_result:
-                self.logger.debug(f"[{index}/{total_functions}] NO existing result found for {function_name} - will analyze")
-                return None
-
-            self.logger.info(f"[{index}/{total_functions}] ANALYSIS SKIPPED - Same checksum found for {function_name}")
-            self.logger.info(f"[{index}/{total_functions}] Function: {function_name} | File: {primary_file} | Checksum: {function_checksum}")
-            self.logger.info(f"[{index}/{total_functions}] Content unchanged ({function_length} lines) - reusing existing analysis result")
-
-            repo_name = os.path.basename(repo_path.rstrip('/'))
-            try:
-                normalized_result = CodeAnalysisResultValidator.normalize_result(
-                    existing_result,
-                    file_path=primary_file,
-                    function=function_name,
-                    checksum=function_checksum
-                )
-
-                validation_errors = normalized_result.validate()
-                if validation_errors:
-                    self.logger.warning(f"[{index}/{total_functions}] Existing result validation failed: {validation_errors}")
-                    existing_results_list = []
-                else:
-                    existing_results_list = [issue.to_dict() for issue in normalized_result.results]
-
-                if self.unified_issue_filter and existing_results_list:
-                    original_count = len(existing_results_list)
-                    existing_results_list = self.unified_issue_filter.category_filter.filter_issues(existing_results_list)
-                    if len(existing_results_list) != original_count:
-                        dropped_count = original_count - len(existing_results_list)
-                        self.logger.info(f"[{index}/{total_functions}] Applied Level 1 category filter to cached results: dropped {dropped_count} issues, keeping {len(existing_results_list)}")
-
-                with _publisher_lock:
-                    self.results_publisher.add_result(
-                        repo_name=repo_name,
-                        file_path=primary_file,
-                        function=function_name,
-                        function_checksum=function_checksum,
-                        results=existing_results_list
-                    )
-                self.logger.info(f"[{index}/{total_functions}] Republished existing result with {len(existing_results_list)} issues to current analysis")
-
-            except Exception as e:
-                self.logger.warning(f"[{index}/{total_functions}] Failed to normalize existing result: {e}, skipping republish")
-
-            with _counters_lock:
-                successful_analyses += 1
-            return True
-
-        def _run_llm_analysis(func_data: Dict, index: int) -> bool:
-            """Run the LLM analysis path. Assumes cache miss already verified.
-
-            Returns True on success, False on failure.
-            """
-            nonlocal successful_analyses, failed_analyses
-
-            func_entry, function_length, function_name, primary_file, function_checksum = _extract_function_metadata(func_data)
-
-            # Generate temporary function file on-demand
-            temp_file_path = self._generate_temp_function_file(func_entry, repo_path)
-            if not temp_file_path:
-                self.logger.warning(f"[{index}/{total_functions}] Failed to generate temp file for {function_name}")
-                with _counters_lock:
-                    failed_analyses += 1
-                return False
-
-            try:
-                progress_msg = f"[{index}/{total_functions}]"
-                self.logger.info("")
-                self.logger.info("=" * 80)
-                self.logger.info(f"{progress_msg} Analyzing: {function_name} ({function_length} lines)")
-                self.logger.info("=" * 80)
-
-                # Start function analysis tracking
-                self._start_function_analysis_tracking(function_name)
-
-                # Load the processed function data
-                with open(temp_file_path, 'r', encoding='utf-8') as f:
-                    json_data = json.load(f)
-
-                # Use analyzer to analyze the function with MCP server
-                result = analyzer.analyze_function(json_data, mcp_server=mcp_server)
-
-                success = False
-                if result is not None:
-                    # Use centralized schema to create standardized result
-                    try:
-                        # Normalize the result to ensure it's in the correct format
-                        if isinstance(result, list):
-                            valid_issues = []
-                            for item in result:
-                                if isinstance(item, dict):
-                                    if 'issue' not in item:
-                                        item['issue'] = item.get('description', 'No description provided')
-                                    if 'severity' not in item:
-                                        item['severity'] = 'medium'
-                                    if 'category' not in item:
-                                        item['category'] = 'general'
-                                    valid_issues.append(item)
-                                else:
-                                    self.logger.warning(f"Skipping invalid result item: {type(item)} - {item}")
-                            issues_list = valid_issues
-                        elif isinstance(result, dict):
-                            if 'issue' not in result:
-                                result['issue'] = result.get('description', 'No description provided')
-                            if 'severity' not in result:
-                                result['severity'] = 'medium'
-                            if 'category' not in result:
-                                result['category'] = 'general'
-                            issues_list = [result]
-                        else:
-                            self.logger.warning(f"Unexpected result format: {type(result)} - {result}")
-                            issues_list = [{
-                                'issue': f'Analysis completed with unexpected result format: {str(result)}',
-                                'severity': 'low',
-                                'category': 'general'
-                            }]
-
-                        # Create standardized result using the schema
-                        standardized_result = create_result(
-                            file_path=primary_file,
-                            function=function_name,
-                            checksum=function_checksum,
-                            issues=issues_list
-                        )
-
-                        # Validate the result
-                        validation_errors = standardized_result.validate()
-                        if validation_errors:
-                            self.logger.warning(f"[{index}/{total_functions}] Result validation failed: {validation_errors}")
-                            success = False
-                        else:
-                            # Convert to dict format for publisher
-                            result_issues = [issue.to_dict() for issue in standardized_result.results]
-
-                            # Apply unified issue filter before publishing (only for new analysis results)
-                            if self.unified_issue_filter and result_issues:
-                                self.logger.debug(f"Applying unified issue filter to {len(result_issues)} issues")
-
-                                # Get the original function context from the processed entry
-                                function_context = None
-                                try:
-                                    with open(temp_file_path, 'r', encoding='utf-8') as f:
-                                        temp_data = json.load(f)
-                                    function_context = temp_data.get('code', '')
-                                    if function_context:
-                                        self.logger.debug(f"Retrieved function context ({len(function_context)} chars) for Level 3 filtering")
-                                    else:
-                                        self.logger.debug("No function context found in temp file for Level 3 filtering")
-                                except Exception as e:
-                                    self.logger.warning(f"Failed to retrieve function context for Level 3 filtering: {e}")
-                                    function_context = None
-
-                                filtered_issues = self.unified_issue_filter.filter_issues(result_issues, function_context)
-
-                                if len(filtered_issues) != len(result_issues):
-                                    dropped_count = len(result_issues) - len(filtered_issues)
-                                    self.logger.info(f"Unified issue filter: dropped {dropped_count} issues, keeping {len(filtered_issues)} issues")
-
-                                result_issues = filtered_issues
-                            elif not self.unified_issue_filter:
-                                self.logger.debug("Unified issue filter not available - publishing all issues")
-
-                            # Publish result using publisher-subscriber system
-                            repo_name = os.path.basename(repo_path.rstrip('/'))
-                            if self.results_publisher:
-                                with _publisher_lock:
-                                    self.results_publisher.add_result(
-                                        repo_name=repo_name,
-                                        file_path=primary_file,
-                                        function=function_name,
-                                        function_checksum=function_checksum,
-                                        results=result_issues
-                                    )
-                                success = True
-                            else:
-                                self.logger.error("Publisher not available - cannot save analysis results")
-                                success = False
-
-                    except Exception as e:
-                        self.logger.error(f"[{index}/{total_functions}] Failed to create standardized result: {e}")
-                        self.logger.error(f"Result type: {type(result)}, Result: {result}")
-                        success = False
-
-                    # Use centralized token tracking
-                    if hasattr(analyzer, '_last_analysis') and analyzer._last_analysis:
-                        self.token_tracker.record_tokens_from_analysis(analyzer._last_analysis)
-                else:
-                    success = False
-
-                # Record function analysis result
-                self._record_function_analysis_result(
-                    functions_analyzed=1,
-                    success=success,
-                    function_data=function_name
-                )
-
-                if success:
-                    with _counters_lock:
-                        successful_analyses += 1
-                    if isinstance(result, list) and len(result) == 0:
-                        self.logger.info(f"{progress_msg} Successfully analyzed: {function_name} ({function_length} lines) - No issues found")
-                    else:
-                        self.logger.info(f"{progress_msg} Successfully analyzed: {function_name} ({function_length} lines)")
-                else:
-                    with _counters_lock:
-                        failed_analyses += 1
-                    self.logger.error(f"{progress_msg} Failed to analyze: {function_name} ({function_length} lines) - No response or malformed response received")
-
-                return success
-
-            except Exception as e:
-                with _counters_lock:
-                    failed_analyses += 1
-                self.logger.error(f"[{index}/{total_functions}] Error analyzing {function_name}: {e}")
-                return False
-
-            finally:
-                # Clean up temporary INPUT file only (not the analysis result file)
-                if os.path.exists(temp_file_path):
-                    try:
-                        os.unlink(temp_file_path)
-                        self.logger.debug(f"Cleaned up temporary input file: {temp_file_path}")
-                    except OSError as e:
-                        self.logger.warning(f"Failed to cleanup temp input file {temp_file_path}: {e}")
-
-        # --- Execute analysis via async worker pool with rate limiting ---
-        self.logger.info(f"Starting parallel analysis with {max_workers} workers for {total_functions} functions")
-        rate_limiter = RateLimiter(max_requests=rate_limit, window_seconds=rate_window)
-
-        # Build indexed items for the worker pool: (index, func_data)
-        indexed_items = list(enumerate(filtered_functions, 1))
-
-        async def _async_analyze_function(item):
-            """Async worker function that wraps the synchronous per-function analysis.
-
-            The rate limiter is acquired only on the LLM-analysis path. Cache hits
-            bypass it so they don't burn rate-limit slots while waiting for nothing.
-            """
-            index, func_data = item
-
-            # Check for cancellation
-            if not self._should_continue():
-                return False
-
-            loop = asyncio.get_running_loop()
-
-            # Cache check is fast (local SQLite/index lookup) — no rate limiting.
-            cache_result = await loop.run_in_executor(
-                None, _check_cache_and_handle_hit, func_data, index
-            )
-            if cache_result is not None:
-                return cache_result
-
-            # Cache miss — gate the LLM call behind the rate limiter.
-            await rate_limiter.acquire()
-            return await loop.run_in_executor(
-                None, _run_llm_analysis, func_data, index
-            )
-
-        def _on_error(item, exc):
-            """Handle worker errors gracefully."""
-            index, func_data = item
-            func_name = func_data['func_entry'].get('function', 'unknown')
-            self.logger.error(f"[{index}/{total_functions}] Worker error for {func_name}: {exc}")
-            with _counters_lock:
-                nonlocal failed_analyses
-                failed_analyses += 1
-
-        asyncio.run(
-            run_worker_pool(
-                items=indexed_items,
-                worker_fn=_async_analyze_function,
-                max_workers=max_workers,
-                on_error=_on_error,
-            )
-        )
-
-        # Finalize analyzer
-        try:
-            analyzer.finalize()
-            self.logger.info(f"Analyzer {analyzer.name()} finalized successfully")
-        except Exception as e:
-            self.logger.warning(f"Error finalizing analyzer: {e}")
-
-        self.logger.info(f"On-demand code analysis completed. Success: {successful_analyses}, Failed: {failed_analyses}")
-
-        # Log centralized token usage summary
-        if self.token_tracker and (successful_analyses > 0 or failed_analyses > 0):
-            self.token_tracker.log_summary()
-
-        return successful_analyses, failed_analyses
-
-    # ==================================================================
-    # Call-tree-at-once pipeline
-    # ==================================================================
-
-    def _run_call_tree_code_analysis(self, config: dict, output_base_dir: str, api_key: str = None) -> tuple:
-        """Call-tree-at-once code analysis.
-
-        Each filter-relative root is analyzed as a single LLM run, with the
-        entire subtree (root + reachable callees, cycle-safe, within budget)
-        in the prompt. Replaces the per-function Stage 4a + Stage 4b iteration.
-        """
-        self.logger.info("Starting call-tree code analysis...")
-
-        if not self.token_tracker:
-            llm_provider_type = get_llm_provider_type(config)
-            self.token_tracker = TokenTracker(llm_provider_type)
-            self.logger.info(f"Auto-initialized centralized token tracker for provider: {llm_provider_type}")
-
-        self._initialize_publisher_subscriber(config, output_base_dir)
-
-        if not api_key:
-            self.logger.info("API key not available from startup — retrying Apple Connect token fetch...")
-            api_key = get_api_key_from_config(config)
-
-        self._initialize_unified_issue_filter(api_key, config)
-
-        if not hasattr(self, 'call_graph_data') or not self.call_graph_data:
-            self.logger.error("No call graph data available for call-tree analysis")
-            return 0, 0
-
-        repo_path = config['path_to_repo']
-        self._current_repo_path = repo_path
-
-        results_dir = self.get_results_directory()
-        code_analysis_dir = f"{results_dir}/code_analysis"
-        os.makedirs(code_analysis_dir, exist_ok=True)
-        config['analysis_dir'] = code_analysis_dir
-
-        # 1. Build the "interesting set" using the existing filter logic.
-        #    Same filters as the legacy path — file/dir/function filters,
-        #    min/max body length, etc.
-        interesting: List[str] = []
-        for file_entry in self.call_graph_data:
-            for func_entry in file_entry.get('functions', []) or []:
-                if 'context' not in func_entry:
-                    func_entry['context'] = {}
-                if 'file' not in func_entry['context']:
-                    func_entry['context']['file'] = file_entry.get('file', '')
-                if self._should_analyze_function(func_entry, config):
-                    name = func_entry.get('function', '')
-                    if name:
-                        interesting.append(name)
-
-        if not interesting:
-            self.logger.warning("Call-tree analysis: no functions passed filtering criteria")
-            return 0, 0
-
-        self.logger.info(f"Call-tree analysis: {len(interesting)} functions passed filters")
-
-        # 2. Build the call-tree builder and selector.
-        builder = CallTreeBuilder(
-            nested_call_graph=self.call_graph_data,
-            repo_path=repo_path,
-            max_depth=config.get('call_tree_max_depth', CALL_TREE_ANALYSIS_MAX_DEPTH),
-            max_chars=config.get('call_tree_max_chars', CALL_TREE_ANALYSIS_MAX_CHARS),
-            max_nodes=config.get('call_tree_max_nodes', CALL_TREE_ANALYSIS_MAX_NODES),
-        )
-        selector = RootSelector(builder)
-        selection = selector.select_for_code(interesting)
-
-        if selection.skipped_orphans:
-            self.logger.info(
-                f"Call-tree analysis: skipped {len(selection.skipped_orphans)} orphan utility "
-                f"functions (no in-set caller, no callees): "
-                f"{selection.skipped_orphans[:5]}{'...' if len(selection.skipped_orphans) > 5 else ''}"
-            )
-
-        roots = selection.roots
-        total_roots = len(roots)
-        if total_roots == 0:
-            self.logger.warning("Call-tree analysis: no roots after selection")
-            return 0, 0
-
-        # Honour num_functions_to_analyze as a rough cap on roots.
-        num_to_analyze = config.get('num_functions_to_analyze', DEFAULT_NUM_FUNCTIONS_TO_ANALYZE)
-        if num_to_analyze and num_to_analyze < total_roots:
-            self.logger.info(f"Call-tree analysis: capping roots at {num_to_analyze} (of {total_roots})")
-            roots = roots[:num_to_analyze]
-            total_roots = len(roots)
-
-        self.logger.info(f"Call-tree analysis: {total_roots} roots will be analyzed")
-
-        # 3. Initialize the analyzer + MCP server (same shape as legacy path).
-        llm_provider_type = get_llm_provider_type(config)
-        analyzer = CodeAnalyzer()
-        self.logger.info(f"Using CodeAnalyzer (call-tree mode) llm_provider_type={llm_provider_type}")
-
-        analyzer_config = {
-            'api_key': api_key,
-            'repo_path': repo_path,
-            'file_content_provider': self.get_file_content_provider() if hasattr(self, 'get_file_content_provider') else None,
-            'api_end_point': config.get('api_end_point', DEFAULT_LLM_API_END_POINT),
-            'model': config.get('model', DEFAULT_LLM_MODEL),
-            'output_base_dir': output_base_dir,
-            'user_provided_prompts': self.user_provided_prompts,
-        }
-        analyzer_config.update(config)
-        analyzer.initialize(analyzer_config)
-        self.analyzer_instance = analyzer
-
-        if hasattr(analyzer, 'set_publisher') and self.results_publisher:
-            analyzer.set_publisher(self.results_publisher)
-
-        if not api_key:
-            self.logger.warning("No API key available — skipping call-tree analysis")
-            return 0, 0
-
-        # Build MCP server (same fields as legacy path).
-        try:
-            output_provider = get_output_directory_provider()
-            mcp_output_base_dir = output_provider.get_custom_base_dir()
-        except RuntimeError:
-            mcp_output_base_dir = None
-
-        mcp_ignore_dirs = set()
-        for dir_name in config.get('exclude_directories', []) or []:
-            mcp_ignore_dirs.add(dir_name)
-            mcp_ignore_dirs.add(dir_name.upper())
-            mcp_ignore_dirs.add(dir_name.lower())
-
-        mcp_file_content_provider = self.get_file_content_provider() if hasattr(self, 'get_file_content_provider') else None
-        try:
-            output_provider = get_output_directory_provider()
-            mcp_artifacts_dir = f"{output_provider.get_repo_artifacts_dir()}/code_insights"
-        except RuntimeError:
-            mcp_artifacts_dir = None
-
-        mcp_directory_tree_util = getattr(self, 'directory_tree_util', None)
-        mcp_server = AnalysisMCPServer(
-            repo_path=repo_path,
-            file_content_provider=mcp_file_content_provider,
-            artifacts_dir=mcp_artifacts_dir,
-            directory_tree_util=mcp_directory_tree_util,
-            ignore_dirs=mcp_ignore_dirs,
-            call_graph_data=self.call_graph_data,
-        )
-
-        max_workers = config.get('code_analyzer_workers', CODE_ANALYZER_DEFAULT_WORKERS)
-        rate_limit = config.get('code_analyzer_rate_limit', LLM_PROVIDER_RATE_LIMIT)
-        rate_window = config.get('code_analyzer_rate_window_seconds', LLM_PROVIDER_RATE_WINDOW_SECONDS)
-        self.logger.info(f"Call-tree analysis: max_workers={max_workers}, rate_limit={rate_limit} per {rate_window}s")
-
-        _publisher_lock = threading.Lock()
-        _counters_lock = threading.Lock()
-        successful_analyses = 0
-        failed_analyses = 0
-
-        # 4. Per-root work function.
-        def _analyze_one_root(root_name: str, index: int) -> bool:
-            """Build the tree, run analysis, fan out issues per defect_function."""
-            nonlocal successful_analyses, failed_analyses
-
-            tree = builder.build(root_name)
-            if tree is None:
-                self.logger.warning(f"[{index}/{total_roots}] Could not build tree for root {root_name}")
-                with _counters_lock:
-                    failed_analyses += 1
-                return False
-
-            self.logger.info(
-                f"[{index}/{total_roots}] Analyzing tree rooted at {root_name}: "
-                f"{tree.node_count()} nodes ({len(tree.stubbed_function_names())} stubbed), "
-                f"{tree.total_chars} chars"
-            )
-
-            tree_dict = tree.to_dict()
-            self._start_function_analysis_tracking(root_name)
-
-            result = analyzer.analyze_call_tree(tree_dict, mcp_server=mcp_server)
-            if result is None:
-                self._record_function_analysis_result(
-                    functions_analyzed=1, success=False, function_data=root_name
-                )
-                with _counters_lock:
-                    failed_analyses += 1
-                self.logger.error(f"[{index}/{total_roots}] Call-tree analysis failed for root {root_name}")
-                return False
-
-            # 5. Group issues by defect_function so the publisher can store them
-            #    under the function that actually contains the defect (matches the
-            #    existing storage key shape: file_path + function + checksum).
-            self._publish_call_tree_issues(
-                tree=tree,
-                issues=result,
-                repo_path=repo_path,
-                publisher_lock=_publisher_lock,
-                index=index,
-                total_roots=total_roots,
-            )
-
-            if hasattr(analyzer, '_last_analysis') and analyzer._last_analysis:
-                self.token_tracker.record_tokens_from_analysis(analyzer._last_analysis)
-
-            self._record_function_analysis_result(
-                functions_analyzed=1, success=True, function_data=root_name
-            )
-            with _counters_lock:
-                successful_analyses += 1
-            self.logger.info(
-                f"[{index}/{total_roots}] Root {root_name}: tree analyzed, {len(result)} raw issues"
-            )
-            return True
-
-        # 6. Worker pool.
-        rate_limiter = RateLimiter(max_requests=rate_limit, window_seconds=rate_window)
-        indexed_roots = list(enumerate(roots, 1))
-
-        async def _async_analyze_root(item):
-            index, root_name = item
-            if not self._should_continue():
-                return False
-            await rate_limiter.acquire()
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _analyze_one_root, root_name, index)
-
-        def _on_error(item, exc):
-            index, root_name = item
-            self.logger.error(f"[{index}/{total_roots}] Worker error for root {root_name}: {exc}")
-            with _counters_lock:
-                nonlocal failed_analyses
-                failed_analyses += 1
-
-        asyncio.run(
-            run_worker_pool(
-                items=indexed_roots,
-                worker_fn=_async_analyze_root,
-                max_workers=max_workers,
-                on_error=_on_error,
-            )
-        )
-
-        try:
-            analyzer.finalize()
-        except Exception as e:
-            self.logger.warning(f"Error finalizing analyzer: {e}")
-
-        self.logger.info(
-            f"Call-tree analysis complete. Roots succeeded: {successful_analyses}, failed: {failed_analyses}"
-        )
-        if self.token_tracker and (successful_analyses > 0 or failed_analyses > 0):
-            self.token_tracker.log_summary()
-
-        return successful_analyses, failed_analyses
-
-    def _publish_call_tree_issues(
-        self,
-        tree,                                # CallTree instance
-        issues: List[Dict[str, Any]],
-        repo_path: str,
-        publisher_lock: threading.Lock,
-        index: int,
-        total_roots: int,
-    ) -> None:
-        """Group call-tree issues by ``defect_function`` and publish each group
-        under the existing per-function storage key so downstream filters,
-        dedup, and the report generator continue to work unchanged.
-
-        Issues without a recognizable ``defect_function`` are attached to the
-        root.
-        """
-        if not issues:
-            # Even with zero issues we publish an empty entry for the root so
-            # the cache records "this root was analyzed → no defects".
-            repo_name = os.path.basename(repo_path.rstrip('/'))
-            with publisher_lock:
-                self.results_publisher.add_result(
-                    repo_name=repo_name,
-                    file_path=tree.root_file,
-                    function=tree.root,
-                    function_checksum=tree.root_checksum,
-                    results=[]
-                )
-            return
-
-        # Map function-name -> (file, checksum) from the tree so we can attach
-        # each issue to its defect-site function record.
-        node_lookup: Dict[str, Tuple[str, str]] = {
-            n.function: (n.file, n.checksum) for n in tree.nodes
-        }
-
-        groups: Dict[str, List[Dict[str, Any]]] = {}
-        for raw in issues:
-            if not isinstance(raw, dict):
-                continue
-            defect_fn = (
-                raw.get('defect_function')
-                or raw.get('function_name')
-                or tree.root
-            )
-            # Legacy schema compatibility: ensure file_path/function_name/line_number
-            # are populated from the new field names if the LLM only emitted the new shape.
-            normalized = dict(raw)
-            if 'function_name' not in normalized:
-                normalized['function_name'] = defect_fn
-            if 'file_path' not in normalized:
-                normalized['file_path'] = raw.get('defect_file', '')
-            if 'file_name' not in normalized and normalized.get('file_path'):
-                normalized['file_name'] = os.path.basename(normalized['file_path'])
-            if 'line_number' not in normalized:
-                normalized['line_number'] = str(raw.get('defect_line_number', ''))
-            if 'issueType' not in normalized:
-                normalized['issueType'] = normalized.get('category', 'logicBug')
-            if 'severity' not in normalized:
-                normalized['severity'] = 'medium'
-
-            groups.setdefault(defect_fn, []).append(normalized)
-
-        repo_name = os.path.basename(repo_path.rstrip('/'))
-        for defect_fn, fn_issues in groups.items():
-            file_path, checksum = node_lookup.get(defect_fn, (tree.root_file, tree.root_checksum))
-            # If the defect_function isn't a tree node (LLM cited an
-            # out-of-tree function), fall back to attaching to the root.
-            if defect_fn not in node_lookup:
+            repo_name = os.path.basename(repo_path.rstrip("/"))
+            existing = self.results_publisher.get_results(repo_name) or []
+            existing_count = len(existing)
+            if existing_count >= num_to_analyze:
                 self.logger.info(
-                    f"[{index}/{total_roots}] defect_function {defect_fn!r} not in tree, "
-                    f"attributing to root {tree.root}"
+                    f"Already have {existing_count} results (limit {num_to_analyze}); no new analysis"
                 )
-                defect_fn = tree.root
+                return existing_count, 0
+            num_to_analyze = max(0, num_to_analyze - existing_count)
 
-            # Apply unified filter per function group (matches legacy path).
-            if self.unified_issue_filter and fn_issues:
-                filtered = self.unified_issue_filter.filter_issues(fn_issues, None)
-                if len(filtered) != len(fn_issues):
-                    self.logger.info(
-                        f"[{index}/{total_roots}] Unified filter dropped "
-                        f"{len(fn_issues) - len(filtered)} issues for {defect_fn}, "
-                        f"kept {len(filtered)}"
-                    )
-                fn_issues = filtered
+        async def _run_async() -> tuple:
+            async with AnalysisSession.create(
+                ctx,
+                file_content_provider=fcp,
+                directory_tree_util=dtu,
+            ) as session:
+                # Preserve the existing prompts-sent layout — clear once per run.
+                session.conversation_logger.clear_older_prompts()
 
-            with publisher_lock:
-                self.results_publisher.add_result(
-                    repo_name=repo_name,
-                    file_path=file_path,
-                    function=defect_fn,
-                    function_checksum=checksum,
-                    results=fn_issues,
+                sink = AsyncResultSink(
+                    self.results_publisher,
+                    repo_name=ctx.repo_name,
+                )
+                pipeline = CodePipeline(
+                    session,
+                    sink,
+                    ast_index=getattr(self, "ast_index", None),
+                    issue_filter=issue_filter,
+                    token_callback=_token_callback,
                 )
 
-    # ==================================================================
-    # End call-tree pipeline
-    # ==================================================================
+                summary = await pipeline.analyze_repo(
+                    self.call_graph_data,
+                    filters,
+                    num_to_analyze=num_to_analyze,
+                    call_tree_builder=call_tree_builder,
+                )
+                self.logger.info(
+                    f"Async pipeline summary: selected={summary.selected} "
+                    f"successful={summary.successful} cached={summary.cached} "
+                    f"failed={summary.failed} duration={summary.duration_seconds:.1f}s"
+                )
+                if summary.error:
+                    self.logger.error(f"Async pipeline aborted: {summary.error}")
+                return summary.successful + summary.cached, summary.failed
+
+        try:
+            successful, failed = asyncio.run(_run_async())
+        except Exception as exc:
+            self.logger.error(f"Async orchestration crashed: {exc}")
+            traceback.print_exc()
+            return 0, 0
+
+        self.logger.info(f"Code analysis (async): success={successful}, failed={failed}")
+        if self.token_tracker and (successful > 0 or failed > 0):
+            self.token_tracker.log_summary()
+        return successful, failed
 
     def pull_results_from_directory(self, artifacts_dir: str) -> Dict[str, Any]:
         """
@@ -3260,16 +1936,13 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 self.logger.info(f"LLM analysis will be saved to: {config['analysis_dir']}")
                 self.logger.info(f"Logs will be saved to: {logs_dir}")
 
-            # Setup prompt logging - use the output base directory
-            Claude.setup_prompts_logging("code_analysis")
-            
-            # Clear older prompts at the beginning of analysis
-            Claude.clear_older_prompts()
-
-            # Get the actual directory used for logging from the singleton
+            # Prompt logging is handled per-session by `ConversationLogger`
+            # (see `hindsight.orchestration.session.AnalysisSession.create`).
+            # Each run clears `prompts_sent/code_analysis/` before writing
+            # new transcripts.
             output_provider = get_output_directory_provider()
             actual_prompts_dir = f"{output_provider.get_repo_artifacts_dir()}/prompts_sent/code_analysis"
-            self.logger.info(f"Prompt logging setup completed and older prompts cleared in: {actual_prompts_dir}")
+            self.logger.info(f"Prompt logging directory: {actual_prompts_dir}")
 
             # Create FileContentProvider instance for the repository
             repo_path_obj = Path(config["path_to_repo"])
@@ -3322,7 +1995,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 )
 
                 # Process the generated call graph
-                results, summary = self._process_call_graph(config, nested_call_graph_path, output_base_dir)
+                results, summary = self._process_call_graph(config, nested_call_graph_path)
 
                 self.logger.info("AST call graph processing completed successfully!")
                 self.logger.info(f"Results: {len(results)} processed entries")
@@ -3335,7 +2008,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
 
                 # Always load call graph data for on-demand processing, even if we skip generation
                 self.logger.info("Loading existing call graph data for on-demand processing...")
-                results, summary = self._process_call_graph(config, nested_call_graph_path, output_base_dir)
+                results, summary = self._process_call_graph(config, nested_call_graph_path)
                 self.logger.info("Call graph data loaded successfully!")
                 self.logger.info(f"Results: {len(results)} processed entries")
                 self.logger.info(f"Summary: {len(summary)} files processed")

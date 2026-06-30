@@ -8,7 +8,7 @@ Author: Sridhar Gurivireddy
 import hashlib
 import json
 from pathlib import Path
-from typing import Union, List, Dict, Any
+from typing import Union, List, Dict, Any, Optional
 
 
 class HashUtil:

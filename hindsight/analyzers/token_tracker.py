@@ -84,26 +84,21 @@ class TokenTracker:
     def record_tokens_from_analysis(self, code_analysis_instance) -> Tuple[int, int]:
         """
         Extract and record token usage from a CodeAnalysis instance.
-        
+
         Args:
-            code_analysis_instance: CodeAnalysis instance with token tracking
-            
+            code_analysis_instance: object exposing `total_input_tokens` and
+                `total_output_tokens` attributes
+
         Returns:
             Tuple[int, int]: (input_tokens, output_tokens) for this analysis
         """
-        try:
-            # Get real token counts from the analysis instance
-            input_tokens, output_tokens = code_analysis_instance.get_token_totals()
-            
-            # Use the new API to add tokens
-            self.add_token_usage(input_tokens, output_tokens)
-            
-            self.logger.debug(f"Recorded tokens from analysis - Input: {input_tokens:,}, Output: {output_tokens:,}")
-            return input_tokens, output_tokens
-            
-        except Exception as e:
-            self.logger.error(f"Error recording tokens from analysis: {e}")
-            return 0, 0
+        input_tokens = code_analysis_instance.total_input_tokens
+        output_tokens = code_analysis_instance.total_output_tokens
+
+        self.add_token_usage(input_tokens, output_tokens)
+
+        self.logger.debug(f"Recorded tokens from analysis - Input: {input_tokens:,}, Output: {output_tokens:,}")
+        return input_tokens, output_tokens
     
     def record_dummy_tokens(self) -> Tuple[int, int]:
         """

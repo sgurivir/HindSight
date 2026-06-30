@@ -17,14 +17,19 @@ class CodeAnalysysResultsLocalFSSubscriber(CodeAnalysisSubscriber):
     Maintains the exact same file structure and naming as the current implementation.
     """
 
-    def __init__(self, base_output_dir: str):
+    def __init__(self, base_output_dir: str, *, analysis_subdir: str = "code_analysis"):
         """
         Initialize the file subscriber
 
         Args:
-            base_output_dir: Base directory for output (e.g., ~/hindsight_artifacts)
+            base_output_dir: Base directory for output (e.g., ``~/hindsight_artifacts``)
+            analysis_subdir: Subdirectory under ``<base>/<repo>/results/`` where
+                per-function result files land. Defaults to ``"code_analysis"``;
+                the diff pipeline passes ``"diff_analysis"`` so a FastAPI consumer
+                can distinguish the two without changing the per-file schema.
         """
         self.base_output_dir = base_output_dir
+        self._analysis_subdir = analysis_subdir
         self._repo_dirs: Dict[str, str] = {}  # repo_name -> analysis_dir mapping
         self._lock = threading.RLock()  # Reentrant lock for thread safety
 
@@ -36,10 +41,10 @@ class CodeAnalysysResultsLocalFSSubscriber(CodeAnalysisSubscriber):
             repo_name: Name of the repository
         """
         with self._lock:
-            # Create the directory structure: base_output_dir/repo_name/results/code_analysis
+            # Layout: <base_output_dir>/<repo_name>/results/<analysis_subdir>/
             repo_artifacts_dir = os.path.join(self.base_output_dir, repo_name)
-            analysis_dir = os.path.join(repo_artifacts_dir, "results", "code_analysis")
-            
+            analysis_dir = os.path.join(repo_artifacts_dir, "results", self._analysis_subdir)
+
             os.makedirs(analysis_dir, exist_ok=True)
             self._repo_dirs[repo_name] = analysis_dir
 
@@ -243,17 +248,7 @@ class CodeAnalysysResultsLocalFSSubscriber(CodeAnalysisSubscriber):
         try:
             # Extract repository name from the result or use current repo name
             repo_name = self._extract_repo_name_with_fallback(result)
-            
-            # Check if this is a diff analysis result and use appropriate subdirectory
-            file_path_field = result.get('file_path', '')
-            if file_path_field == 'diff_analysis':
-                # This is a diff analysis result - use results/diff_analysis subdirectory
-                repo_artifacts_dir = os.path.join(self.base_output_dir, repo_name)
-                analysis_dir = os.path.join(repo_artifacts_dir, "results", "diff_analysis")
-                os.makedirs(analysis_dir, exist_ok=True)
-            else:
-                # Regular code analysis result - use existing logic
-                analysis_dir = self.get_analysis_dir(repo_name)
+            analysis_dir = self.get_analysis_dir(repo_name)
 
             # Generate filename using the same logic as current implementation
             filename = self._generate_filename(result)
