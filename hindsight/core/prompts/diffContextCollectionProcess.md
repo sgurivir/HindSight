@@ -79,10 +79,28 @@ Use tools in this strict order. Do not skip to a later tool if an earlier one is
 
 | Priority | Tool | When to Use |
 |----------|------|-------------|
-| 1 | `list_files` | Check file sizes before reading; explore directory structure |
-| 2 | `getSummaryOfFile` | Quick orientation on large files before deciding what to read |
-| 3 | `readFile` | Small files only (< 5,000 chars) |
-| 4 | `runTerminalCmd` | grep/find/explore when path is unknown or other tools are insufficient |
+| 1 | `lookup_knowledge` | **ALWAYS call first** for any function, file, or topic the diff touches. A prior diff analysis may have already characterized it. |
+| 2 | `list_files` | Check file sizes before reading; explore directory structure |
+| 3 | `getSummaryOfFile` | Quick orientation on large files before deciding what to read |
+| 4 | `readFile` | Small files only (< 5,000 chars) |
+| 5 | `runTerminalCmd` | grep/find/explore when path is unknown or other tools are insufficient |
+| — | `store_knowledge` | **Record after understanding** each callee/rule you rely on |
+
+### Knowledge store — mandatory workflow
+
+The knowledge store is a persistent, project-wide cache of **general technical knowledge** — function contracts, file/module roles, cross-cutting invariants. It is bound to `subject='diff'` for this stage; reads and writes scope to diff-mode learnings automatically.
+
+**Before reading source for any callee, caller, or file the diff touches that you don't already understand:**
+
+1. **Call `lookup_knowledge` first** with the function name, file path, or a topic phrase. One tool, one query — FTS5 ranks across summary, entity_key, function_name, file_path in one pass.
+2. **If a fresh hit is returned** (matching `checksum`, or no checksum given): use the stored summary — **do NOT call `readFile`/`getFileContentByLines`/`getImplementation`** for that entity.
+3. **If stale or empty**: read the source, then step 4.
+
+**After you understand the primary function or confirm a cross-cutting rule — before moving on:**
+
+4. **Call `store_knowledge`** with a 1-2 sentence summary and, when relevant, a line-anchored `behavior` note. Use `entity_key="<file_path>::<function_name>"` for functions, free-form for cross-cutting rules. Skipping this step forces every future diff over related code to redo the same work.
+
+**Store only general technical information — NOT bug findings or defects.** Issues belong in the analysis output.
 
 ### TOOL CALLING FORMAT (MANDATORY)
 
@@ -121,6 +139,14 @@ Use tools in this strict order. Do not skip to a later tool if an earlier one is
 
 ```json
 {"tool": "runTerminalCmd", "command": "grep -rn 'MyFunction' --include='*.swift' .", "reason": "Last resort: find files containing this function when path is unknown"}
+```
+
+```json
+{"tool": "lookup_knowledge", "query": "parseJSON src/util/JSON.swift", "reason": "Check whether prior diff analysis already characterized this callee"}
+```
+
+```json
+{"tool": "store_knowledge", "kind": "summary", "entity_key": "src/foo.swift::myFunc", "function_name": "myFunc", "file_path": "src/foo.swift", "checksum": "abc123", "summary": "Validates input, then dispatches to one of three handlers depending on payload kind.", "behavior": "LINE 42: guards on kind==.a/.b/.c; falls through to default handler on unknown kinds.", "confidence": 0.9, "reason": "Record so future diff runs over related code reuse this analysis"}
 ```
 
 - Each tool call must be in its **own** fenced block.

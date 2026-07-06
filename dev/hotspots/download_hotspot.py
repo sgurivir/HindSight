@@ -89,7 +89,10 @@ class HotspotDownloader:
             ssl_verify: Whether to verify SSL certificates (default: False)
         """
         self.daemon = daemon
-        self.dataset = dataset
+        # SpinDistill dataset identifiers use underscores, not spaces (a
+        # space-separated dataSet yields a misleading 401). Normalize so users
+        # can paste either form, e.g. "Rave Seed 2 (24A5370h)".
+        self.dataset = dataset.replace(" ", "_")
         self.device = device
         self.context_filter = context_filter
         self.country_code = country_code

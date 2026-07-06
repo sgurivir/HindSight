@@ -52,12 +52,45 @@ from .events import (
     RunStartedEvent,
 )
 from .session import AnalysisSession
+from .prior_knowledge import format_prior_knowledge_for_functions
 from .worker import bounded_gather
 
 logger = get_logger(__name__)
 
 
 TokenCallback = Callable[[int, int], None]
+
+
+def _iter_trace_frame_identities(work: "TraceWork"):
+    """Yield (function_name, file_path, checksum) for each frame in the trace's
+    callstack. Accepts several shapes: frames may be dicts with `function` or
+    `function_name` plus `file`/`file_path`, or the runner may have flattened
+    strings. `checksum` is unknown at this point — always None.
+    """
+    if not work.callstack:
+        return
+    for frame in work.callstack:
+        if isinstance(frame, str):
+            name = frame.strip()
+            if name:
+                yield (name, None, None)
+            continue
+        if not isinstance(frame, dict):
+            continue
+        name = (
+            frame.get("function_name")
+            or frame.get("function")
+            or frame.get("name")
+            or ""
+        ).strip()
+        if not name:
+            continue
+        file_path = (
+            frame.get("file_path")
+            or frame.get("file")
+            or frame.get("file_name")
+        )
+        yield (name, file_path or None, None)
 
 
 @dataclass(frozen=True)
@@ -123,26 +156,6 @@ PublishCallback = Callable[[TraceWork, List[Dict[str, Any]]], Awaitable[bool]]
 # `cache_check_callback(work) -> True` if the trace has already been
 # analyzed (cache hit). Awaited; expected to acquire any needed sync locks.
 CacheCheckCallback = Callable[[TraceWork], Awaitable[bool]]
-
-
-# Tool sets mirror legacy `TraceCodeAnalysis._get_supported_tools_stage_*`,
-# minus the legacy knowledge-store tools (those are not wired into the new
-# `ToolRegistry` and the new prompts don't reference them).
-_STAGE_TA_TOOLS = (
-    "readFile",
-    "runTerminalCmd",
-    "getSummaryOfFile",
-    "inspectDirectoryHierarchy",
-    "list_files",
-    "getFileContentByLines",
-    "getFileContent",
-    "checkFileSize",
-)
-_STAGE_TB_TOOLS = (
-    "readFile",
-    "runTerminalCmd",
-    "getFileContentByLines",
-)
 
 
 @dataclass
@@ -247,6 +260,8 @@ class TracePipeline:
         counts: _MutableCounts,
     ) -> None:
         display_path = work.display_file_path
+
+        logger.info(f"Analyzing [{idx}/{total}] {work.trace_id} ({display_path})")
 
         await self.session.emit(
             FunctionStartEvent(
@@ -356,6 +371,17 @@ class TracePipeline:
             logger.error(f"[{work.trace_id}] Stage Ta prompt is empty — cannot run")
             return None
 
+        # Hydrate the system prompt with prior learnings about every frame in
+        # the callstack. Janus-style: with the full callstack known upfront,
+        # cache hits let the LLM skip file reads on intermediate frames.
+        prior_block = format_prior_knowledge_for_functions(
+            self.session.knowledge_store,
+            subject="trace",
+            functions=_iter_trace_frame_identities(work),
+        )
+        if prior_block:
+            system_prompt = f"{system_prompt}\n\n{prior_block}"
+
         user_prompt = self._build_stage_ta_user_prompt(
             work.prompt_content, work.extracted_file_paths
         )
@@ -423,6 +449,18 @@ class TracePipeline:
         if not system_prompt:
             logger.error(f"[{work.trace_id}] Stage Tb prompt is empty — cannot run")
             return None
+
+        # Hydrate the analysis prompt with prior learnings for every frame in
+        # the callstack — same set Stage Ta was hydrated with. Cross-cutting
+        # invariants (threading rules, lock ordering) live only in the KB and
+        # would otherwise force Tb to re-issue `lookup_knowledge` to see them.
+        prior_block = format_prior_knowledge_for_functions(
+            self.session.knowledge_store,
+            subject="trace",
+            functions=_iter_trace_frame_identities(work),
+        )
+        if prior_block:
+            system_prompt = f"{system_prompt}\n\n{prior_block}"
 
         user_prompt = (
             "## Context Bundle\n\n"

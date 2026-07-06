@@ -22,11 +22,17 @@ registry serve full-toolset stages (Stage A) and reduced-toolset stages
 
 from __future__ import annotations
 
+from typing import Optional
+
 from .dir import inspect_directory_hierarchy_tool, list_files_tool
 from .fs import (
     check_file_size_tool,
     get_file_content_by_lines_tool,
     read_file_tool,
+)
+from .knowledge_tools import (
+    knowledge_tool_names,
+    register_knowledge_tools,
 )
 from .registry import (
     ALLOWED_TERMINAL_COMMANDS,
@@ -52,12 +58,19 @@ from .summary import get_summary_of_file_tool
 from .symbols import get_implementation_tool
 
 
-def build_default_registry(ctx: ToolContext) -> ToolRegistry:
+def build_default_registry(
+    ctx: ToolContext,
+    *,
+    knowledge_store: Optional["KnowledgeStore"] = None,  # noqa: F821 — forward ref
+    knowledge_subject: str = "code",
+) -> ToolRegistry:
     """Construct a `ToolRegistry` with every standard tool pre-registered.
 
-    Pipelines typically just need this — they pass the registry to the
-    `IterativeRunner` and rely on the per-call `allowed` set to gate which
-    tools each stage can use.
+    Pass `knowledge_store` to also register the 2 knowledge tools
+    (`lookup_knowledge`, `store_knowledge`) bound to `knowledge_subject`
+    (`'code' | 'trace' | 'diff'`). When omitted, the knowledge tools are
+    still registered but respond with an "unavailable" error — keeping the
+    tool surface uniform across deployments that lack a persistent store.
     """
     registry = ToolRegistry(ctx)
     registry.register("readFile", read_file_tool)
@@ -72,6 +85,7 @@ def build_default_registry(ctx: ToolContext) -> ToolRegistry:
     registry.register("runTerminalCmd", run_terminal_cmd_tool)
     registry.register("getImplementation", get_implementation_tool)
     registry.register("getSummaryOfFile", get_summary_of_file_tool)
+    register_knowledge_tools(registry, knowledge_store, subject=knowledge_subject)
     return registry
 
 
@@ -95,9 +109,11 @@ __all__ = [
     "get_tool_definition",
     "get_tool_names",
     "inspect_directory_hierarchy_tool",
+    "knowledge_tool_names",
     "list_files_tool",
     "normalize_parameters",
     "read_file_tool",
+    "register_knowledge_tools",
     "run_terminal_cmd_tool",
     "validate_tool_parameters",
 ]

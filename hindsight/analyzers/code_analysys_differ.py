@@ -626,7 +626,7 @@ class CodeAnalysisDiffer:
 
                         <details class="callout callout--solution">
                             <summary>Potential Solution</summary>
-                            <p>${{issue['Potential solution'] || issue.potentialSolution || 'No solution provided'}}</p>
+                            <p>${{issue.suggestion || 'No solution provided'}}</p>
                         </details>
                     </article>
                 `;

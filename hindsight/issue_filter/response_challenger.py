@@ -352,8 +352,17 @@ class LLMResponseChallenger:
             self.logger.error(f"Failed to initialize SyncStageRunner: {e}")
             return self._dummy_challenge_issues(issues)
 
-        # Build the tool registry (file-reading tools only, matching the
-        # legacy `supported_tools` list).
+        # Build the stage first so the advertised tool list in the prompt
+        # mirrors the stage spec's `supported_tools` — the only set the
+        # registry will actually permit at execute time. Hardcoding a
+        # separate list here is what previously caused the LLM to call
+        # tools the registry then rejected.
+        stage = stage_response_challenger(
+            system_prompt, max_iterations=RESPONSE_CHALLENGER_MAX_ITERATIONS
+        )
+
+        # Build the tool registry. The advertised list shown in each
+        # user prompt is derived from the stage spec.
         tools = None
         supported_tools: List[str] = []
         if self.file_content_provider:
@@ -385,9 +394,7 @@ class LLMResponseChallenger:
                     ignore_dirs=set(self.config.get('exclude_directories', [])),
                 )
                 tools = build_default_registry(tool_ctx)
-                supported_tools = [
-                    'readFile', 'getFileContentByLines', 'list_files', 'checkFileSize', 'runTerminalCmd'
-                ]
+                supported_tools = sorted(stage.supported_tools)
                 self.logger.info(
                     f"Tool registry initialized with {len(supported_tools)} tools for Level 3 challenging"
                 )
@@ -410,9 +417,6 @@ class LLMResponseChallenger:
                 )
             )
 
-        stage = stage_response_challenger(
-            system_prompt, max_iterations=RESPONSE_CHALLENGER_MAX_ITERATIONS
-        )
         try:
             verdicts = runner.run_many(stage, user_prompts, tools=tools)
         except Exception as e:

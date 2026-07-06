@@ -88,7 +88,7 @@ class CallTreeBuilderTests(unittest.TestCase):
         builder = CallTreeBuilder(self.graph, self.tmpdir)
         tree = builder.build("root")
         root_node = tree.nodes[0]
-        self.assertIn("entry", root_node.out_of_tree_callers)
+        self.assertIn("entry", root_node.other_callers)
 
     def test_cycle_marked_as_out_of_tree(self):
         # Make leaf call root → cycle.
@@ -101,7 +101,7 @@ class CallTreeBuilderTests(unittest.TestCase):
         names = [n.function for n in tree.nodes]
         self.assertEqual(names.count("root"), 1)
         leaf_node = next(n for n in tree.nodes if n.function == "leaf")
-        self.assertIn("root", leaf_node.callees_out_of_tree)
+        self.assertIn("root", leaf_node.other_callees)
 
     def test_depth_cap_stubs_deep_nodes(self):
         builder = CallTreeBuilder(self.graph, self.tmpdir, max_depth=1)
@@ -163,12 +163,16 @@ class CallTreeBuilderTests(unittest.TestCase):
         builder = CallTreeBuilder(self.graph, self.tmpdir)
         tree = builder.build("root")
         d = tree.to_dict()
-        self.assertEqual(d["schema_version"], "2.0")
+        self.assertEqual(d["schema_version"], "2.1")
         self.assertEqual(d["root"]["function"], "root")
         self.assertIn("nodes", d)
         self.assertIn("truncation", d)
         self.assertIn("stats", d)
         self.assertEqual(d["stats"]["node_count"], tree.node_count())
+        # Renamed edge fields must surface under their new keys.
+        root_dict = d["nodes"][0]
+        self.assertIn("expanded_calls", root_dict)
+        self.assertNotIn("callees_in_tree", root_dict)
 
 
 if __name__ == "__main__":

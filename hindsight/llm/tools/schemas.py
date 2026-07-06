@@ -109,6 +109,89 @@ TOOL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         },
         "aliases": {"paths": "path", "file_path": "path"},
     },
+    "lookup_knowledge": {
+        "description": (
+            "Search the persistent knowledge store for prior technical knowledge about this project — "
+            "function summaries, file/module roles, cross-cutting invariants (threading, ownership, "
+            "lifecycle, ordering rules). Returns a JSON array ranked by relevance (may be empty).\n\n"
+            "ALWAYS call this before `readFile`, `getFileContentByLines`, `getImplementation`, or "
+            "`getSummaryOfFile` for any function, file, or topic you don't already have context on. "
+            "If a fresh matching entry is returned, use its summary and skip the file read.\n\n"
+            "One tool, one query — pass a function name, file path, or free-text topic (e.g. "
+            "'FooManager threading', 'parseConfig', 'src/Core.swift'). FTS5 ranks across summary, "
+            "details, entity_key, function_name, and file_path in one pass."
+        ),
+        "parameters": {
+            "query": {
+                "type": "string",
+                "required": True,
+                "description": (
+                    "Function name, file path, or free-text topic. Examples: 'parseConfig', "
+                    "'src/Cache.swift', 'main-queue threading FooManager', 'reference counting in dispatch handlers'"
+                ),
+            },
+            "kind": {"type": "string", "required": False, "description": "Optional filter: 'summary' | 'invariant'"},
+            "max_results": {"type": "integer", "required": False, "description": "Maximum number of results (default 5)"},
+            "reason": {"type": "string", "required": False, "description": "Why you're looking this up"},
+        },
+        "aliases": {
+            "q": "query",
+            "topic": "query",
+            "function_name": "query",
+            "file_path": "query",
+            "name": "query",
+        },
+    },
+    "store_knowledge": {
+        "description": (
+            "Persist what you have learned about a function, file, or cross-cutting rule so future "
+            "analyses can recall it without re-reading source.\n\n"
+            "ALWAYS call this after you have understood a function's contract for the first time, "
+            "OR after you confirm a cross-cutting rule the codebase relies on. Record BEFORE moving "
+            "on to the next callee. Skipping this step forces future runs to redo the same work.\n\n"
+            "Store only general technical knowledge — NOT bug findings or defects. Defects belong "
+            "in your final output JSON.\n\n"
+            "Example (function summary with line-anchored behavior):\n"
+            "```json\n"
+            "{\n"
+            "  \"tool\": \"store_knowledge\",\n"
+            "  \"kind\": \"summary\",\n"
+            "  \"entity_key\": \"src/Cache.swift::Cache.evict\",\n"
+            "  \"function_name\": \"Cache.evict\",\n"
+            "  \"file_path\": \"src/Cache.swift\",\n"
+            "  \"summary\": \"Removes the LRU entry from _entries and returns it; caller owns lifetime.\",\n"
+            "  \"behavior\": \"LINE 82: _entries.removeLast() returns the entry without retaining. LINE 87: caller must use the return value before the next evict() call — no strong reference held.\",\n"
+            "  \"tags\": [\"cache\", \"lifecycle\"],\n"
+            "  \"confidence\": 0.9\n"
+            "}\n"
+            "```\n"
+            "Example (cross-cutting invariant):\n"
+            "```json\n"
+            "{\n"
+            "  \"tool\": \"store_knowledge\",\n"
+            "  \"kind\": \"invariant\",\n"
+            "  \"entity_key\": \"FooManager-main-queue-only\",\n"
+            "  \"summary\": \"All writes to FooManager state must happen on the main queue; read APIs are thread-safe but writes are not.\",\n"
+            "  \"tags\": [\"threading\", \"FooManager\"],\n"
+            "  \"confidence\": 0.9\n"
+            "}\n"
+            "```"
+        ),
+        "parameters": {
+            "entity_key": {"type": "string", "required": True, "description": "Identity: 'file::function' for function-level, 'file' for file-level, or free-form for cross-cutting rules (e.g. 'main-queue-only-FooManager')"},
+            "summary": {"type": "string", "required": True, "description": "1-2 sentence learning. Describe behavior/contract/invariant — not a defect."},
+            "kind": {"type": "string", "required": False, "description": "'summary' (default) | 'invariant'. Use 'invariant' for cross-cutting rules that span call sites."},
+            "confidence": {"type": "number", "required": False, "description": "Float in [0.0, 1.0]. Default 0.8 if omitted."},
+            "file_path": {"type": "string", "required": False, "description": "Repo-relative file path"},
+            "function_name": {"type": "string", "required": False, "description": "Exact function name"},
+            "checksum": {"type": "string", "required": False, "description": "Function source checksum — pass when the learning is tied to a specific source revision"},
+            "behavior": {"type": "string", "required": False, "description": "Concrete, line-anchored behavior notes (e.g. 'LINE 42: allocates X per call, no pooling'). Merged into `details` for storage."},
+            "details": {"type": "string", "required": False, "description": "Longer evidence / reasoning / context. If `behavior` is also provided, both are concatenated."},
+            "tags": {"type": "array", "required": False, "description": "Free-form tags for later topic search (e.g. 'threading', 'json', 'lifecycle')", "items": {"type": "string"}},
+            "reason": {"type": "string", "required": False, "description": "Why you're recording this"},
+        },
+        "aliases": {"filePath": "file_path", "name": "function_name"},
+    },
 }
 
 
@@ -151,6 +234,8 @@ def validate_tool_parameters(tool_name: str, params: Dict[str, Any]) -> Tuple[bo
             return False, f"Parameter '{param_name}' must be a string"
         if expected == "integer" and not isinstance(value, int):
             return False, f"Parameter '{param_name}' must be an integer"
+        if expected == "number" and not isinstance(value, (int, float)):
+            return False, f"Parameter '{param_name}' must be a number"
         if expected == "array" and not isinstance(value, list):
             return False, f"Parameter '{param_name}' must be an array"
     return True, None

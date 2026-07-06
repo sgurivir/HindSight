@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any, Mapping, Tuple
 
 from hindsight.core.constants import (
-    CALL_TREE_ANALYSIS_ENABLED,
     CALL_TREE_ANALYSIS_MAX_CHARS,
     CALL_TREE_ANALYSIS_MAX_DEPTH,
     CALL_TREE_ANALYSIS_MAX_NODES,
@@ -153,7 +152,7 @@ class AnalysisContext:
                 config_get("code_analyzer_rate_window_seconds", LLM_PROVIDER_RATE_WINDOW_SECONDS)
             ),
             enable_call_tree=bool(
-                config_get("call_tree_analysis_enabled", CALL_TREE_ANALYSIS_ENABLED)
+                config_get("call_tree_analysis_enabled", True)
             ),
             call_tree_max_depth=int(
                 config_get("call_tree_max_depth", CALL_TREE_ANALYSIS_MAX_DEPTH)

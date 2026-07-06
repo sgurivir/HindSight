@@ -78,10 +78,31 @@ Use tools in this strict order. Do not skip to a later tool if an earlier one is
 
 | Priority | Tool | When to Use |
 |----------|------|-------------|
-| 1 | `list_files` | Check file sizes before reading; explore directory structure |
-| 2 | `getSummaryOfFile` | Quick orientation on large files before deciding what to read |
-| 3 | `readFile` | Small files only (< 5,000 chars) |
-| 4 | `runTerminalCmd` | grep/find/explore when path is unknown or other tools are insufficient |
+| 1 | `lookup_knowledge` | **ALWAYS call first** for any function, file, or topic you don't already have context on. Prior analyses may have already characterized it. |
+| 2 | `list_files` | Check file sizes before reading; explore directory structure |
+| 3 | `getSummaryOfFile` | Quick orientation on large files before deciding what to read |
+| 4 | `readFile` | Small files only (< 5,000 chars) |
+| 5 | `runTerminalCmd` | grep/find/explore when path is unknown or other tools are insufficient |
+| — | `store_knowledge` | **Record after understanding** each callee, file role, or cross-cutting rule you rely on |
+
+### Knowledge store — mandatory workflow
+
+The knowledge store is a persistent, project-wide cache of **general technical knowledge** — function contracts, file/module roles, cross-cutting invariants (threading, ownership, lifecycle, ordering rules). It is populated across analyses and shared with every analyzer.
+
+**Before reading source for any callee, callers, data type, or file you don't already understand:**
+
+1. **Call `lookup_knowledge` first** with the function name, file path, or a topic phrase (e.g. `"parseConfig"`, `"src/Cache.swift"`, `"main-queue threading FooManager"`). One tool, one query — FTS5 ranks across summary, entity_key, function_name, file_path in one pass.
+2. **If a fresh hit is returned** (matching `checksum`, or no checksum given): use the stored summary verbatim — **do NOT call `readFile`/`getFileContentByLines`/`getImplementation`** for that entity.
+3. **If the hit is marked stale** (checksum has changed since the record was written): treat it as a hint, not truth. Verify against current source.
+4. **If nothing matches** (`[]`): read the source, then step 5.
+
+**After you understand a function or confirm a cross-cutting rule — before moving on to the next callee:**
+
+5. **Call `store_knowledge`** with a 1-2 sentence summary and, when relevant, a line-anchored `behavior` note. Use `entity_key="<file_path>::<function_name>"` for functions, `entity_key="<file_path>"` for files, and a free-form key for cross-cutting rules. Skipping this step forces every future run to redo the same work.
+
+**Store only general technical information — NOT bug findings or defects.** Issues belong in your analysis output later; the store's purpose is to accelerate understanding.
+
+The store warms up over runs, so early lookups may return `[]` — record aggressively so later runs benefit.
 
 ### TOOL CALLING FORMAT (MANDATORY)
 
@@ -99,6 +120,10 @@ Use tools in this strict order. Do not skip to a later tool if an earlier one is
 **Examples:**
 
 ```json
+{"tool": "lookup_knowledge", "query": "parseJSON src/util/JSON.swift", "reason": "Check whether prior analysis already characterized this callee"}
+```
+
+```json
 {"tool": "list_files", "path": "src/core", "recursive": false, "reason": "Explore directory structure and check file sizes before reading"}
 ```
 
@@ -111,7 +136,7 @@ Use tools in this strict order. Do not skip to a later tool if an earlier one is
 ```
 
 ```json
-{"tool": "readFile", "path": "src/core/config.json", "reason": "Read small non-class file (< 5,000 chars)"}
+{"tool": "readFile", "path": "src/core/config.json", "reason": "Read small non-class file (< 5,000 chars) after lookup_knowledge returned []"}
 ```
 
 ```json
@@ -120,6 +145,10 @@ Use tools in this strict order. Do not skip to a later tool if an earlier one is
 
 ```json
 {"tool": "runTerminalCmd", "command": "grep -rn 'MyFunction' --include='*.swift' .", "reason": "Last resort: find files containing this function when path is unknown"}
+```
+
+```json
+{"tool": "store_knowledge", "kind": "summary", "entity_key": "src/foo.swift::myFunc", "function_name": "myFunc", "file_path": "src/foo.swift", "checksum": "abc123", "summary": "Validates input, then dispatches to one of three handlers depending on payload kind. Owns the lifecycle of the returned handle.", "behavior": "LINE 42: guards on kind==.a/.b/.c — falls through to the default handler on unknown kinds. LINE 67: returned handle must be retained by caller.", "confidence": 0.9, "reason": "Record so future callstacks that touch this function skip re-derivation"}
 ```
 
 - Each tool call must be in its **own** fenced block.
@@ -172,6 +201,8 @@ For the primary function, collect:
 4. **Data types** — every class, struct, or enum the primary function or its callees/callers interact with directly. Collect the full type definition with line numbers.
 5. **Constants and globals** — every constant, global variable, or macro referenced by the primary function. Collect the declaration/definition with line numbers.
 6. **File-level context** — file path, file name, and the language/extension.
+
+Do not infer missing call edges — include a callee or caller relationship only when it is verified from the source or tool output, never guessed. Record any gaps in `collection_notes`.
 
 Stop at one level of depth: collect direct callees and callers, but do not recursively collect the callees-of-callees unless the primary function's logic cannot be understood without them.
 

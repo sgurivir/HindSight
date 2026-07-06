@@ -1404,7 +1404,7 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
 
                         <details class="callout callout--solution" open>
                             <summary>Potential Solution</summary>
-                            <p>${{issue['Potential solution'] || issue.potentialSolution || 'No solution provided'}}</p>
+                            <p>${{issue.suggestion || 'No solution provided'}}</p>
                         </details>
 
                         ${{issue.evidence ? `
@@ -1690,7 +1690,7 @@ def generate_html_report_with_callstacks(issues, output_file=DEFAULT_HTML_REPORT
 
                 const issueDescription = (issue.description || issue.issue || 'No description available').replace(/<br\s*\/?>/gi, '\\n');
                 const impactText = (issue.Impact || issue.impact || 'No impact information available').replace(/<br\s*\/?>/gi, '\\n');
-                const solutionText = (issue['Potential solution'] || issue.potentialSolution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
+                const solutionText = (issue.suggestion || issue.potential_solution || issue.solution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
                 const evidenceText = (issue.evidence || '').replace(/<br\s*\/?>/gi, '\\n');
 
                 const severityMeta = issue.severity || issue.kind || 'unknown';
@@ -1789,7 +1789,7 @@ Potential Solution:\\n${{solutionText}}${{callstackSection}}`;
 
             const issueDescription = (issue.description || issue.issue || 'No description available').replace(/<br\s*\/?>/gi, '\\n');
             const impactText = (issue.Impact || issue.impact || 'No impact information available').replace(/<br\s*\/?>/gi, '\\n');
-            const solutionText = (issue['Potential solution'] || issue.potentialSolution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
+            const solutionText = (issue.suggestion || issue.potential_solution || issue.solution || 'No solution provided').replace(/<br\s*\/?>/gi, '\\n');
             const evidenceText = (issue.evidence || '').replace(/<br\s*\/?>/gi, '\\n');
 
             const severityMeta = issue.severity || issue.kind || 'unknown';

@@ -45,50 +45,43 @@ The input is a callstack trace — a list of function names forming an execution
 
 ---
 
-## KNOWLEDGE BASE
-
-Before collecting context, check the knowledge base for prior learnings about functions in this callstack:
-
-```json
-{"tool": "lookup_knowledge", "query": "function_name_here", "reason": "Check for prior analysis learnings about this function"}
-```
-
-If the knowledge base has relevant entries, incorporate that information into your `prior_knowledge` field in the output. This avoids redundant analysis.
-
----
-
 ## TOOL USAGE PRIORITY
 
 **CRITICAL TOOL USAGE PRIORITY:**
-- **Prefer `get_function_body` over `readFile`** when you know the function name — it retrieves the exact source code without needing to locate the file first.
-- **Use `checkFileSize` BEFORE `readFile` or `getFileContentByLines`** if you need to read a file directly.
+- **Use `checkFileSize` BEFORE `readFile` or `getFileContentByLines`** to confirm the file is within size limits and learn the valid line range.
+- **Use `getSummaryOfFile` first for large files** to orient yourself before reading specific sections.
 
-**Code Navigation (preferred):**
-- `get_function_body`: Read source code of a function by name
-  When using `get_function_body` or `getFileContentByLines`, extend the start line
-  upward to include any contiguous comment block that immediately precedes the
-  function or its containing type declaration. A safe heuristic: read 40 lines
-  above the function start and trim to the first blank line or non-comment code.
-- `get_callers`: Get all functions that call a given function
-- `get_callees`: Get all functions called by a given function
-- `search_symbol`: Search for functions/methods by name substring
-- `get_symbol`: Get full info about a symbol
-- `get_file_ast`: List all functions defined in a file
+**Shared knowledge store — mandatory workflow (bound to `subject='trace'` for this stage):**
+
+The knowledge store is a persistent, project-wide cache of **general technical knowledge** — function contracts, file/module roles, cross-cutting invariants (threading, lifecycle, ownership). All analyzers share it; this stage sees trace-mode learnings automatically.
+
+**Before reading source for any function in the callstack (including intermediate frames) that you don't already understand:**
+
+1. **Call `lookup_knowledge` first** with the function name, file path, or a topic phrase. One tool, one query — FTS5 ranks across summary, entity_key, function_name, file_path in one pass. Intermediate stack frames are the common case; prior traces through the same frames likely already characterized them.
+2. **If a fresh hit is returned** (matching `checksum`, or no checksum given): use the stored summary — **do NOT call `readFile`/`getFileContentByLines`/`getImplementation`** for that frame.
+3. **If stale or empty**: read the source, then step 4.
+
+**After you understand a frame (especially leaf or repeated frames) — before moving on to the next frame:**
+
+4. **Call `store_knowledge`** with a 1-2 sentence summary and, when relevant, a line-anchored `behavior` note. Use `entity_key="<file_path>::<function_name>"`. Skipping this step forces every future trace through this frame to redo the same reasoning.
+
+**Store only general technical information — NOT bug findings or defects.** Issues belong in the analysis output. The store's purpose is to help future analyses understand the project.
 
 **File Access:**
-- `readFile`: File contents (check size first)
-- `getFileContentByLines`: Specific line ranges
 - `checkFileSize`: File size and line count verification
-- `list_files`: Directory structure
+- `readFile`: Read whole-file contents (only for small files — check size first)
+- `getFileContentByLines` / `getFileContent`: Read a specific line range from a larger file
+- `getSummaryOfFile`: Quick summary of a file's purpose before deeper reading
+
+**Directory Navigation:**
+- `list_files`: List files in a directory (use to discover correct filenames)
+- `inspectDirectoryHierarchy`: Detailed directory structure with file counts and sizes
 
 **Execution & Search:**
 - `runTerminalCmd`: grep/find when path is unknown
   - Use single quotes around patterns. Single distinctive words only.
   - ❌ Multi-word patterns, regex, OR patterns, wildcard paths
   - ✅ `grep -rn 'functionName' --include='*.swift' .`
-
-**Knowledge Base:**
-- `lookup_knowledge`: Query prior learnings about functions or patterns
 
 ### Tool Calling Format
 
@@ -97,22 +90,6 @@ If the knowledge base has relevant entries, incorporate that information into yo
 ```
 
 **Examples:**
-
-```json
-{"tool": "get_function_body", "symbol_id": "MyClass::processData", "reason": "Read source code of callstack function to analyze performance"}
-```
-
-```json
-{"tool": "get_callers", "symbol_id": "expensiveOperation", "reason": "Check what calls this function to understand invocation frequency"}
-```
-
-```json
-{"tool": "get_callees", "symbol_id": "handleRequest", "reason": "See what this function calls to trace the execution path"}
-```
-
-```json
-{"tool": "search_symbol", "query": "dispatch", "reason": "Find dispatch-related functions referenced in the trace"}
-```
 
 ```json
 {"tool": "checkFileSize", "path": "src/core/MyClass.swift", "reason": "Check file size and total line count before reading"}
@@ -127,7 +104,15 @@ If the knowledge base has relevant entries, incorporate that information into yo
 ```
 
 ```json
+{"tool": "getSummaryOfFile", "path": "src/core/MyClass.swift", "reason": "Quick orientation on the file before reading specific functions"}
+```
+
+```json
 {"tool": "list_files", "path": "src/core", "recursive": false, "reason": "Discover actual filenames in directory when a file is not found at expected path"}
+```
+
+```json
+{"tool": "inspectDirectoryHierarchy", "path": "src/core", "reason": "Understand directory layout of a subsystem"}
 ```
 
 ```json
@@ -135,7 +120,11 @@ If the knowledge base has relevant entries, incorporate that information into yo
 ```
 
 ```json
-{"tool": "lookup_knowledge", "query": "function_name_here", "reason": "Check for prior analysis learnings about this function"}
+{"tool": "lookup_knowledge", "query": "dispatch_async src/core/Dispatcher.swift", "reason": "Prior trace through this function may already describe its behavior"}
+```
+
+```json
+{"tool": "store_knowledge", "kind": "summary", "entity_key": "src/foo.swift::leafFn", "function_name": "leafFn", "file_path": "src/foo.swift", "checksum": "abc123", "summary": "Bottom-of-stack: serializes the queue then commits the batch under the I/O lock.", "behavior": "LINE 108: acquires _batchLock. LINE 112: commits via writer.flush(). LINE 118: releases lock unconditionally in defer.", "confidence": 0.85, "reason": "Record leaf summary so the next callstack through this function inherits the analysis"}
 ```
 
 - Each tool call must be in its **own** fenced block.
@@ -223,7 +212,7 @@ Your response MUST start with `{` and end with `}`.
 - `start_line` and `end_line` must be integers. If unavailable, omit and add a note to `collection_notes`.
 - The `call_path` array MUST list functions in order from root (top of stack) to leaf (bottom of stack).
 - The `functions` dict MUST contain at minimum the leaf function.
-- `prior_knowledge` should include any relevant information found via `lookup_knowledge`.
+- `prior_knowledge` may be left as `[]` — populate only if context already in this prompt names prior findings; this stage does not look them up.
 
 ---
 

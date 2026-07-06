@@ -70,9 +70,20 @@ FULL_CONTEXT_TOOLS = frozenset({
     "getFileContentByLines",
     "getFileContent",
     "checkFileSize",
+    "lookup_knowledge",
+    "store_knowledge",
 })
 
-ANALYSIS_TOOLS = frozenset({"readFile", "runTerminalCmd"})
+ANALYSIS_TOOLS = frozenset({
+    "readFile",
+    "runTerminalCmd",
+    "getFileContentByLines",
+    "getFileContent",
+    "checkFileSize",
+    "list_files",
+    "lookup_knowledge",
+    "store_knowledge",
+})
 
 CALL_TREE_TOOLS = frozenset({
     "readFile",
@@ -83,6 +94,8 @@ CALL_TREE_TOOLS = frozenset({
     "list_files",
     "inspectDirectoryHierarchy",
     "runTerminalCmd",
+    "lookup_knowledge",
+    "store_knowledge",
 })
 
 
@@ -649,6 +662,53 @@ def stage_call_tree_diff(system_prompt: str, *, max_iterations: int = MAX_TOOL_I
         fallback_guidance=_fallback_diff_issues,
         supported_tools=CALL_TREE_TOOLS,
         max_iterations=max_iterations,
+    )
+
+
+def stage_call_tree_context(system_prompt: str, *, max_iterations: int = MAX_TOOL_ITERATIONS) -> StageSpec:
+    """Context-collection stage that precedes call-tree analysis (Step 1).
+
+    The model walks the deterministically-built call tree, retrieves prior
+    learnings via `lookup_knowledge`, resolves what the tree omits (data-type
+    definitions, constant values, stubbed node bodies, function contracts) with
+    the read tools, and records durable, general knowledge via `store_knowledge`.
+
+    Output is a dict with an `additional_context` key — a plain-English
+    description of what was gathered. The analysis stage (Step 2) receives
+    this prose appended to its prompt under the line "Additional content which
+    you may find useful for analysis", on top of the unchanged tree. The stage
+    is tool-heavy by design (that is the whole point: warm the knowledge store
+    and gather the definitions the tree can't carry), so it uses the full
+    context toolset.
+    """
+    return StageSpec(
+        name="call_tree_context_collection",
+        system_prompt=system_prompt,
+        extract_json=_extract_dict_with_key("additional_context", "CallTreeContextAnalyzer"),
+        validate_json=_validate_dict_with_key("additional_context"),
+        fallback_guidance=_fallback_call_tree_context,
+        supported_tools=FULL_CONTEXT_TOOLS,
+        max_iterations=max_iterations,
+    )
+
+
+def _fallback_call_tree_context(reason: Optional[str]) -> str:
+    reason_block = f"Why your previous response was rejected: {reason}.\n\n" if reason else ""
+    return (
+        "CRITICAL: Your previous response did not contain a valid context summary.\n\n"
+        f"{reason_block}"
+        "You MUST respond with ONLY a valid JSON OBJECT containing an `additional_context` key "
+        "whose value is an ENGLISH prose description (a few short paragraphs) of the reusable "
+        "facts you gathered: data-type definitions, values/meaning of key constants, behavior "
+        "of any stubbed functions, and cross-cutting invariants (threading, ownership, "
+        "lifecycle, ordering). Do NOT list bug findings. An empty string is valid if the tree "
+        "already contained everything.\n\n"
+        "### Required schema\n"
+        "```json\n"
+        '{ "additional_context": "string — plain-English description; refer to real types, '
+        'functions, files, and line numbers" }\n'
+        "```\n\n"
+        "Your response MUST start with `{` and end with `}`. Return JSON ONLY — no markdown, no prose outside the JSON."
     )
 
 

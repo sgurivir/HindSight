@@ -42,7 +42,7 @@ Your response **MUST start with `[` and end with `]`**. No markdown, no prose, n
 - Report ONLY issues that satisfy the **CROSS-FUNCTION REPORTING RUBRIC** below. If a callee has a defect that no caller in this tree is affected by, **do NOT report it**.
 - Report ONLY issues with **confidence ≥ 0.8**.
 - Report ONLY `logicBug` and `performance` categories.
-- Do NOT report speculative, theoretical, or stylistic issues.
+- Do NOT report speculative, theoretical, or stylistic issues. If any required fact is not directly supported by the provided code or verified tool output, return `[]` instead of inferring it.
 - Do NOT report memory safety issues (null dereference, bounds checking, buffer overflow, use-after-free). Assume runtime values are safe.
 - Do NOT suggest caching mechanisms.
 - Every issue MUST cite an exact caller line number — the line in the affected caller where the defect's effect manifests. Without that line cite, drop the issue.
@@ -62,7 +62,7 @@ You receive a single JSON object describing the call tree:
 
 ```json
 {
-  "schema_version": "2.0",
+  "schema_version": "2.1",
   "root": {"function": "...", "file": "...", "checksum": "..."},
   "nodes": [
     {
@@ -74,9 +74,9 @@ You receive a single JSON object describing the call tree:
       "parent": null | "...",
       "source": "5-padded line-numbered source",     // present iff inlined
       "source_omitted_reason": "exceeds_char_budget | exceeds_max_depth",  // present iff stub
-      "callees_in_tree": ["..."],
-      "callees_out_of_tree": ["..."],                // callees not expanded in this tree
-      "out_of_tree_callers": ["..."],                // callers that exist in the repo but aren't in this tree
+      "expanded_calls": ["..."],                     // callees whose source IS shown as a node in this tree
+      "other_callees": ["..."],                        // callees NOT shown here (external, back-edge, or capped) — names only
+      "other_callers": ["..."],                      // functions elsewhere in the repo that call this one, not shown in this tree
       "data_types": ["..."],
       "constants": ["..."],
       "back_edge": true                              // recursion marker, no body to analyse
@@ -97,16 +97,34 @@ You receive a single JSON object describing the call tree:
 
 ## AVAILABLE TOOLS
 
-You have the full tool set. Use tools to fetch any node body that was stubbed (`source_omitted_reason` present), to inspect out-of-tree callers, or to verify a hypothesis.
+You have the full tool set. Use tools to fetch any node body that was stubbed (`source_omitted_reason` present), to inspect `other_callers`, or to verify a hypothesis.
 
 | Priority | Tool | When to Use |
 |----------|------|-------------|
-| 1 | `list_files` | Check file sizes before reading; explore directory structure |
-| 2 | `getSummaryOfFile` | Quick orientation on large files |
-| 3 | `getFileContentByLines` | **Fetch the body of any stubbed node** using `file`, `start_line`, `end_line` |
-| 4 | `readFile` | Small files (< 5,000 chars) not already provided |
-| 5 | `checkFileSize` | Confirm bounds before reading a large file |
-| 6 | `runTerminalCmd` | grep when path is unknown; inspect out-of-tree callers (last resort) |
+| 1 | `lookup_knowledge` | **ALWAYS call first** for any stubbed node or file you don't already understand. A prior analysis may have characterized it. |
+| 2 | `list_files` | Check file sizes before reading; explore directory structure |
+| 3 | `getSummaryOfFile` | Quick orientation on large files |
+| 4 | `getFileContentByLines` | **Fetch the body of any stubbed node** using `file`, `start_line`, `end_line` (after `lookup_knowledge` returned `[]`) |
+| 5 | `readFile` | Small files (< 5,000 chars) not already provided |
+| 6 | `checkFileSize` | Confirm bounds before reading a large file |
+| 7 | `runTerminalCmd` | grep when path is unknown; inspect `other_callers` (last resort) |
+| — | `store_knowledge` | **Record after** each node/rule you relied on to reach a conclusion |
+
+### Knowledge store — mandatory workflow
+
+The knowledge store is a persistent, project-wide cache of **general technical knowledge** — function contracts, file/module roles, cross-cutting invariants.
+
+**Before fetching the body of a stubbed node or reading any source you don't already understand:**
+
+1. **Call `lookup_knowledge` first** with the function name, file path, or a topic phrase. One tool, one query — FTS5 ranks across summary, entity_key, function_name, file_path in one pass.
+2. **If a fresh hit is returned**: use the stored summary — **do NOT fetch the body** for that node.
+3. **If stale or empty**: fetch the body, then step 4.
+
+**After you understand a node's behavior — before moving on:**
+
+4. **Call `store_knowledge`** with a 1-2 sentence summary and, when relevant, a line-anchored `behavior` note. Skipping this step forces every future call-tree analysis through this node to redo the same work.
+
+**Store only general technical information — NOT bug findings or defects.** Defects belong in your output JSON.
 
 ### TOOL CALLING FORMAT (MANDATORY)
 
@@ -117,7 +135,15 @@ Every tool call MUST be a JSON object in a fenced `json` code block using the `"
 ```
 
 ```json
-{"tool": "runTerminalCmd", "command": "grep -rn 'someCaller' --include='*.swift' .", "reason": "Inspect an out-of-tree caller to confirm propagation"}
+{"tool": "runTerminalCmd", "command": "grep -rn 'someCaller' --include='*.swift' .", "reason": "Inspect an other_callers entry to confirm propagation"}
+```
+
+```json
+{"tool": "lookup_knowledge", "query": "handleEvent src/core/MyClass.swift", "reason": "Check whether a prior analysis already characterized this stubbed node"}
+```
+
+```json
+{"tool": "store_knowledge", "kind": "summary", "entity_key": "src/core/MyClass.swift::handleEvent", "function_name": "handleEvent", "file_path": "src/core/MyClass.swift", "checksum": "abc12345", "summary": "Dispatches the event to the registered handler on the main queue. Assumes the registry has been initialized.", "confidence": 0.85, "reason": "Future analyses encountering this stubbed callee can use this instead of re-reading the source"}
 ```
 
 Parameters are flat (top-level keys alongside `"tool"`). One fenced block per call. Multiple calls per response are allowed.
@@ -144,7 +170,7 @@ The buggy callee throws or returns an error/nil under conditions where an in-tre
 > Cite: the line in the caller where the unhandled error escapes or is silently dropped.
 
 ### Case D — Contract / precondition mismatch
-An in-tree caller invokes the callee with arguments that violate the callee's stated or evident contract (range, ordering, nullability, threading), causing the callee to misbehave on the caller's behalf.
+An in-tree caller invokes the callee with arguments that violate the callee's contract (range, ordering, nullability, threading) as explicitly shown in code, comments, type signatures, or verified documentation — not an inferred or implicit contract — causing the callee to misbehave on the caller's behalf.
 
 > Cite: the line in the caller where the violating call is made.
 
@@ -160,12 +186,25 @@ A defect that lives entirely inside a single in-tree function (no callee involve
 - Defensive-programming patterns (unused enum cases, unreachable defaults, guarded edge cases).
 - Caching recommendations.
 
+### ⛔ Absence of evidence is NOT evidence of a defect
+
+The call tree is a **partial view** of the program. Code not shown here is NOT proof that the code does not exist — completions, callers, synchronization, validation, and error handling frequently live in nodes that were stubbed, capped, or wired through decoupled mechanisms a static call tree cannot capture (`NotificationCenter` / `addObserver`, delegates, KVO, target-action, completion handlers, dependency injection).
+
+Do NOT conclude that any of the following is missing simply because it is not shown in this tree:
+- a completion call (e.g. `setTaskCompleted`, a continuation, a callback)
+- synchronization / locking
+- a caller of the function (do not assume a re-entrant or concurrent caller exists either)
+- input validation
+- error handling
+
+Before reporting a "missing X" defect, actively look for X: grep for the symbol, inspect `other_callers` / `other_callees`, and search for decoupled dispatch (`NotificationCenter`, `addObserver`, delegate protocols, completion closures). Report the defect ONLY if you verified X's absence **directly from the code or from tool output**. If you cannot verify it, return `[]`.
+
 ---
 
 ## ANALYSIS PROCESS
 
 1. **Map the tree.** Read `nodes`. Identify the root and the call relationships. Note which nodes are stubs.
-2. **Walk callees first.** For each non-stub leaf or near-leaf node, ask: is this function correct on its own contract? If not, what is wrong (Case A/B/C/D)?
+2. **Start from evidence, not from suspicion.** Walk the callees, but do NOT begin by hunting for suspicious-looking patterns and then working to justify them. For each non-stub node, only pursue a defect once you can point to concrete code — present in this tree or fetched via tools — that demonstrates incorrect observable behaviour under a Case A/B/C/D path. A pattern that *could* be wrong under some unproven condition is not a finding. If confirming the defect would require assuming a fact you cannot verify from the code or tool output, stop and drop it.
 3. **Propagate upward.** For each suspected callee defect, walk up `parent` links. At each caller, find the line that consumes the callee's output/effect. If no caller is affected → drop the finding.
 4. **Cite exact lines.** Both `defect_line_number` (in the callee) and `affected_caller_line_number` (in the caller where the effect lands) are required.
 5. **Self-check before output.** Re-read every staged issue. If you cannot point to a specific caller line where the defect *changes observable behaviour*, drop it. If you are uncertain whether the caller actually exercises the buggy path, drop it. Low confidence → drop.
@@ -218,7 +257,7 @@ For schema-compatibility with the existing storage layer, ALSO include these leg
 
 ## OUTPUT LANGUAGE RULE
 
-Write issue text as a human code reviewer would. Refer only to source code, file paths, function names, and line numbers. Do **not** use internal pipeline terms like "context bundle", "tree node", "stub", or "propagation chain" in the user-facing text — keep that vocabulary out of `issue`, `description`, `suggestion`. (The `propagation` array carries the chain in structured form; that is where it belongs.)
+Write issue text as a human code reviewer would. Refer only to source code, file paths, function names, and line numbers. Do **not** use internal pipeline terms like "tree node", "stub", or "propagation chain" in the user-facing text — keep that vocabulary out of `issue`, `description`, `suggestion`. (The `propagation` array carries the chain in structured form; that is where it belongs.)
 
 ---
 

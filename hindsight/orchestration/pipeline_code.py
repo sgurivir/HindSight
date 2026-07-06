@@ -53,6 +53,7 @@ from hindsight.llm import (
     stage_4a_context_collection,
     stage_4b_analysis,
     stage_call_tree_code,
+    stage_call_tree_context,
 )
 from hindsight.utils.hash_util import HashUtil
 from hindsight.utils.log_util import get_logger
@@ -66,6 +67,11 @@ from .events import (
     RunStartedEvent,
 )
 from .function_selector import FunctionFilters, FunctionWorkItem, select_functions
+from .auto_seed import seed_call_tree_summaries
+from .prior_knowledge import (
+    format_prior_knowledge_for_function,
+    format_prior_knowledge_for_functions,
+)
 from .result_sink import AsyncResultSink
 from .session import AnalysisSession
 from .worker import bounded_gather
@@ -80,6 +86,121 @@ IssueFilter = Callable[[List[Dict[str, Any]], Optional[str]], List[Dict[str, Any
 # `token_callback(input_tokens, output_tokens)`. Fire-and-forget; exceptions
 # from the callback are swallowed so instrumentation can't crash analysis.
 TokenCallback = Callable[[int, int], None]
+
+
+def _iter_callee_identities(func_entry: Dict[str, Any]):
+    """Yield (function_name, file_path, checksum) for each callee in `func_entry`.
+
+    The AST index stores `functions_invoked` as a list of dicts like
+    `{"function": name, "context": {"file": path, ...}}`. Older shapes may
+    use bare strings — accept both. `checksum` is unknown at this pre-Stage-4a
+    point, so we always pass None (prior_knowledge.py will treat entries
+    without matching checksum as stale and mark them).
+    """
+    invoked = func_entry.get("functions_invoked") or []
+    if not isinstance(invoked, list):
+        return
+    for item in invoked:
+        if isinstance(item, str):
+            name = item.strip()
+            if name:
+                yield (name, None, None)
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = (
+            item.get("function")
+            or item.get("function_name")
+            or item.get("name")
+            or ""
+        ).strip()
+        if not name:
+            continue
+        ctx = item.get("context") or {}
+        file_path = (
+            ctx.get("file")
+            or item.get("file_path")
+            or item.get("file")
+            or None
+        )
+        yield (name, file_path or None, None)
+
+
+def _bundle_primary_file(bundle: Dict[str, Any]) -> Optional[str]:
+    """Best-effort primary function file path from a Stage 4a bundle."""
+    if not isinstance(bundle, dict):
+        return None
+    primary = bundle.get("primary_function") or {}
+    if isinstance(primary, dict):
+        return primary.get("file_path") or primary.get("file") or None
+    return None
+
+
+def _bundle_primary_checksum(bundle: Dict[str, Any]) -> Optional[str]:
+    """Best-effort primary function checksum from a Stage 4a bundle."""
+    if not isinstance(bundle, dict):
+        return None
+    primary = bundle.get("primary_function") or {}
+    if isinstance(primary, dict):
+        return primary.get("checksum")
+    return None
+
+
+def _iter_bundle_callee_identities(bundle: Dict[str, Any]):
+    """Yield (function_name, file_path, checksum) for each callee/caller in a
+    Stage 4a / call-tree bundle. Accepts several shapes: dict entries under
+    `callees` / `callers` with `function_name` + `file_path` fields."""
+    if not isinstance(bundle, dict):
+        return
+    for key in ("callees", "callers"):
+        items = bundle.get(key) or []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = (
+                item.get("function_name")
+                or item.get("function")
+                or item.get("name")
+                or ""
+            ).strip()
+            if not name:
+                continue
+            file_path = (
+                item.get("file_path")
+                or item.get("file")
+                or None
+            )
+            yield (name, file_path or None, item.get("checksum"))
+
+
+def _iter_tree_node_identities(tree_dict: Dict[str, Any]):
+    """Yield (function_name, file_path, checksum) for each node in a call-tree
+    dict. Walks the tree breadth-first, capped by the caller via
+    `format_prior_knowledge_for_functions`'s built-in total-entries cap."""
+    if not isinstance(tree_dict, dict):
+        return
+    stack = [tree_dict]
+    seen: set = set()
+    while stack:
+        node = stack.pop(0)
+        if not isinstance(node, dict):
+            continue
+        name = (
+            node.get("function")
+            or node.get("function_name")
+            or node.get("name")
+            or ""
+        ).strip()
+        file_path = node.get("file") or node.get("file_path")
+        key = (name, file_path)
+        if name and key not in seen:
+            seen.add(key)
+            yield (name, file_path or None, node.get("checksum"))
+        children = node.get("children") or node.get("callees") or []
+        if isinstance(children, list):
+            stack.extend(children)
 
 
 @dataclass(frozen=True)
@@ -192,9 +313,10 @@ class CodePipeline:
                 --include/exclude options to a typed object.
             num_to_analyze: Optional cap on the work-list size (legacy
                 `--num-functions-to-analyze`).
-            call_tree_builder: When provided AND `session.ctx.enable_call_tree`
-                is True, drives the call-tree mode. Built externally so the
-                CLI rewire keeps owning the builder's lifecycle.
+            call_tree_builder: When provided, drives the call-tree mode (the
+                default and only code-analysis mode). Built externally so the
+                CLI rewire keeps owning the builder's lifecycle. When None
+                (builder init failed), falls back to per-function mode.
 
         Returns:
             A `CodeRunSummary`. The run is "ok" iff `summary.error is None`;
@@ -211,9 +333,10 @@ class CodePipeline:
         selected = 0
 
         try:
-            use_call_tree = bool(
-                self.session.ctx.enable_call_tree and call_tree_builder is not None
-            )
+            # Call-tree is the code analyzer's only analysis mode. The sole
+            # fallback to per-function is when the builder failed to construct
+            # (call_tree_builder is None), preserved as a safety net.
+            use_call_tree = call_tree_builder is not None
 
             if use_call_tree:
                 roots = self._select_call_tree_roots(call_graph_data, filters, num_to_analyze)
@@ -310,6 +433,8 @@ class CodePipeline:
         function_name = w.function_name
         file_path = w.primary_file
         function_checksum = self._function_source_checksum(w.func_entry, file_path)
+
+        logger.info(f"Analyzing [{idx}/{total}] {function_name} ({file_path})")
 
         await self.session.emit(
             FunctionStartEvent(
@@ -621,6 +746,39 @@ class CodePipeline:
             self._build_stage_4a_prompts, func_entry
         )
 
+        # Inject any prior learnings about this function AND its known callees
+        # from the knowledge store so the LLM can verify or expand on them
+        # rather than re-deriving from scratch. Cheap miss, expensive hit — see
+        # plan section "Cache aggression". Janus-style: hydrate the whole
+        # callstack, not just the primary function.
+        function_name = (
+            func_entry.get("function")
+            or func_entry.get("function_name")
+            or func_entry.get("name")
+            or ""
+        )
+        file_path = (
+            func_entry.get("context", {}).get("file")
+            or func_entry.get("file_path")
+            or ""
+        )
+        function_checksum = self._function_source_checksum(func_entry, file_path) if file_path else None
+        primary_block = format_prior_knowledge_for_function(
+            self.session.knowledge_store,
+            subject="code",
+            function_name=function_name,
+            file_path=file_path,
+            function_checksum=function_checksum,
+        )
+        callee_block = format_prior_knowledge_for_functions(
+            self.session.knowledge_store,
+            subject="code",
+            functions=_iter_callee_identities(func_entry),
+        )
+        prior_blocks = [b for b in (primary_block, callee_block) if b]
+        if prior_blocks:
+            system_prompt = system_prompt + "\n\n" + "\n\n".join(prior_blocks)
+
         runner = IterativeRunner(
             self.session.llm, conversation_logger=self.session.conversation_logger
         )
@@ -663,6 +821,29 @@ class CodePipeline:
             config=self.session.ctx.raw_config,
         )
 
+        # Hydrate the analysis prompt with prior learnings on the primary
+        # function AND every callee the bundle mentions — Stage 4a already
+        # collected code, but cross-cutting invariants (threading rules,
+        # ownership) live only in the knowledge store. Without this, Stage 4b
+        # would have to re-issue `lookup_knowledge` calls to see them.
+        primary_file = _bundle_primary_file(context_bundle)
+        primary_checksum = _bundle_primary_checksum(context_bundle)
+        primary_block = format_prior_knowledge_for_function(
+            self.session.knowledge_store,
+            subject="code",
+            function_name=function_name,
+            file_path=primary_file,
+            function_checksum=primary_checksum,
+        )
+        callee_block = format_prior_knowledge_for_functions(
+            self.session.knowledge_store,
+            subject="code",
+            functions=_iter_bundle_callee_identities(context_bundle),
+        )
+        prior_blocks = [b for b in (primary_block, callee_block) if b]
+        if prior_blocks:
+            system_prompt = system_prompt + "\n\n" + "\n\n".join(prior_blocks)
+
         runner = IterativeRunner(
             self.session.llm, conversation_logger=self.session.conversation_logger
         )
@@ -692,12 +873,32 @@ class CodePipeline:
         tree_dict = tree.to_dict()
         user_prompts = list(self.session.ctx.user_provided_prompts) or None
 
+        # --- Step 1: context collection (LLM-initiated knowledge retrieval + storage) ---
+        # Fresh, tool-heavy pass whose whole purpose is to warm the knowledge
+        # store and gather what the deterministic tree can't carry (data-type
+        # definitions, constant values, stubbed bodies, cross-cutting invariants).
+        # Its English summary is appended to the analysis prompt below.
+        additional_context = await self._run_call_tree_context(tree, tree_dict, root_name)
+
+        # --- Step 2: analysis (fresh context window; produces the issues JSON) ---
         system_prompt, user_prompt = await asyncio.to_thread(
             PromptBuilder.build_call_tree_prompt,
             tree_dict=tree_dict,
             config=self.session.ctx.raw_config,
             user_provided_prompts=user_prompts,
+            additional_context=additional_context,
         )
+
+        # Hydrate the prompt with prior knowledge for every node in the tree.
+        # `format_prior_knowledge_for_functions` caps at 12 total entries so
+        # large trees don't blow up the system prompt.
+        prior_block = format_prior_knowledge_for_functions(
+            self.session.knowledge_store,
+            subject="code",
+            functions=_iter_tree_node_identities(tree_dict),
+        )
+        if prior_block:
+            system_prompt = f"{system_prompt}\n\n{prior_block}"
 
         runner = IterativeRunner(
             self.session.llm, conversation_logger=self.session.conversation_logger
@@ -717,7 +918,120 @@ class CodePipeline:
             )
             return None
 
-        return self._parse_issue_list(outcome.text)
+        issues = self._parse_issue_list(outcome.text)
+        seed_call_tree_summaries(
+            self.session.knowledge_store,
+            subject="code",
+            tree_dict=tree_dict,
+            issues=issues,
+        )
+        return issues
+
+    async def _run_call_tree_context(
+        self,
+        tree: Any,
+        tree_dict: Dict[str, Any],
+        root_name: str,
+    ) -> Optional[str]:
+        """Step 1 of call-tree analysis: LLM-driven knowledge retrieval/storage.
+
+        Returns the plain-English `additional_context` prose (appended to the
+        analysis prompt), or None on failure — the analysis stage degrades
+        gracefully to tree-only. Cached on disk by the tree's `tree_signature`:
+        a cache hit means the knowledge store was already warmed by the run that
+        produced it, so we skip the LLM call and reuse the summary.
+        """
+        from hindsight.llm.prompts import PromptBuilder  # lazy: see _run_stage_4b note
+
+        tree_signature = getattr(tree, "tree_signature", "") or (
+            (tree_dict.get("stats") or {}).get("tree_signature", "")
+        )
+
+        cached = await self._load_cached_ctree_context(tree_signature)
+        if cached is not None:
+            return cached.get("additional_context")
+
+        user_prompts = list(self.session.ctx.user_provided_prompts) or None
+        system_prompt, user_prompt = await asyncio.to_thread(
+            PromptBuilder.build_call_tree_context_prompt,
+            tree_dict=tree_dict,
+            config=self.session.ctx.raw_config,
+            user_provided_prompts=user_prompts,
+        )
+
+        runner = IterativeRunner(
+            self.session.llm, conversation_logger=self.session.conversation_logger
+        )
+        outcome = await runner.run(
+            stage_call_tree_context(system_prompt),
+            user_prompt=user_prompt,
+            tools=self.session.tools,
+            context_info=f"context:{root_name}",
+            token_callback=self._token_usage_relay(),
+        )
+
+        if outcome.error or outcome.text is None:
+            logger.warning(
+                f"Call-tree context stage failed for {root_name} "
+                f"(error={outcome.error}, iterations={outcome.iterations}); "
+                "proceeding with tree-only analysis"
+            )
+            return None
+
+        prose = self._parse_additional_context(outcome.text)
+        if prose and tree_signature:
+            await self._save_ctree_context(tree_signature, {"additional_context": prose})
+        return prose
+
+    @staticmethod
+    def _parse_additional_context(text: str) -> Optional[str]:
+        """Extract the `additional_context` string from the Step-1 output text."""
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            logger.warning(f"Call-tree context JSON decode failed: {exc}")
+            return None
+        if isinstance(value, list):
+            value = next(
+                (b for b in value if isinstance(b, dict) and "additional_context" in b),
+                None,
+            )
+            if value is None:
+                return None
+        if not isinstance(value, dict):
+            return None
+        result = value.get("additional_context")
+        return result if isinstance(result, str) else None
+
+    def _ctree_context_path(self, tree_signature: str) -> str:
+        return os.path.join(
+            self.session.ctx.context_bundles_dir, f"calltree_ctx_{tree_signature}.json"
+        )
+
+    async def _load_cached_ctree_context(
+        self, tree_signature: str
+    ) -> Optional[Dict[str, Any]]:
+        if not tree_signature:
+            return None
+        path = self._ctree_context_path(tree_signature)
+        if not await asyncio.to_thread(os.path.exists, path):
+            return None
+        try:
+            raw = await asyncio.to_thread(self._read_text, path)
+            data = json.loads(raw)
+        except Exception as exc:  # noqa: BLE001 — soft-fail on bad cache
+            logger.warning(f"Failed to read cached call-tree context at {path}: {exc}")
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def _save_ctree_context(
+        self, tree_signature: str, bundle: Dict[str, Any]
+    ) -> None:
+        path = self._ctree_context_path(tree_signature)
+        try:
+            await asyncio.to_thread(self._write_bundle_sync, path, bundle)
+        except Exception as exc:  # noqa: BLE001 — cache write must not fail the run
+            logger.warning(f"Could not save call-tree context to {path}: {exc}")
 
     # ------------------------------------------------------------------
     # Prompt assembly (Stage 4a needs AST index data)

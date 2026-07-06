@@ -64,9 +64,9 @@ class CallTreeNode:
     source: str = ""                        # numbered source lines (empty when stubbed)
     source_omitted_reason: Optional[str] = None
     checksum: str = ""
-    callees_in_tree: List[str] = field(default_factory=list)
-    callees_out_of_tree: List[str] = field(default_factory=list)  # callees skipped (back-edge, cap, etc.)
-    out_of_tree_callers: List[str] = field(default_factory=list)  # callers known to call graph but not in this tree
+    expanded_calls: List[str] = field(default_factory=list)  # callees whose source IS shown as a child node below
+    other_callees: List[str] = field(default_factory=list)  # callees not shown here (back-edge, external, cap, etc.)
+    other_callers: List[str] = field(default_factory=list)  # functions elsewhere in the repo that call this one
     data_types: List[str] = field(default_factory=list)
     constants: List[str] = field(default_factory=list)
     back_edge: bool = False                 # this node is a recursion back-edge marker (no children expanded)
@@ -83,16 +83,16 @@ class CallTreeNode:
             "depth": self.depth,
             "parent": self.parent,
             "checksum": self.checksum,
-            "callees_in_tree": self.callees_in_tree,
+            "expanded_calls": self.expanded_calls,
         }
         if self.source:
             out["source"] = self.source
         else:
             out["source_omitted_reason"] = self.source_omitted_reason or "exceeds_budget"
-        if self.callees_out_of_tree:
-            out["callees_out_of_tree"] = self.callees_out_of_tree
-        if self.out_of_tree_callers:
-            out["out_of_tree_callers"] = self.out_of_tree_callers
+        if self.other_callees:
+            out["other_callees"] = self.other_callees
+        if self.other_callers:
+            out["other_callers"] = self.other_callers
         if self.data_types:
             out["data_types"] = self.data_types
         if self.constants:
@@ -124,7 +124,7 @@ class CallTree:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "schema_version": "2.0",
+            "schema_version": "2.1",
             "root": {
                 "function": self.root,
                 "file": self.root_file,
@@ -270,10 +270,10 @@ class CallTreeBuilder:
             parent=None,
             source=root_source,
             checksum=root_checksum,
-            callees_in_tree=[],
+            expanded_calls=[],
             data_types=list(root_entry.get("data_types_used", []) or []),
             constants=self._extract_constant_names(root_entry.get("constants_used", {})),
-            out_of_tree_callers=sorted(self._callers.get(root, set())),
+            other_callers=sorted(self._callers.get(root, set())),
         )
 
         nodes: List[CallTreeNode] = [root_node]
@@ -302,14 +302,14 @@ class CallTreeBuilder:
             for callee_name in self._callees.get(parent_name, []):
                 if callee_name in visited:
                     # Cycle / shared callee — mark on parent, don't re-expand.
-                    if callee_name not in parent_node.callees_in_tree:
-                        parent_node.callees_out_of_tree.append(callee_name)
+                    if callee_name not in parent_node.expanded_calls:
+                        parent_node.other_callees.append(callee_name)
                     continue
 
                 callee_entry = self._index_by_name.get(callee_name)
                 if not callee_entry:
                     # Callee not in our index (framework/external) — surface to parent.
-                    parent_node.callees_out_of_tree.append(callee_name)
+                    parent_node.other_callees.append(callee_name)
                     continue
 
                 visited.add(callee_name)
@@ -319,7 +319,7 @@ class CallTreeBuilder:
                 # marker rather than a full node.
                 if len(nodes) >= self.max_nodes:
                     truncated_at_nodes = True
-                    parent_node.callees_out_of_tree.append(callee_name)
+                    parent_node.other_callees.append(callee_name)
                     continue
 
                 ctx = callee_entry.get("context", {}) or {}
@@ -358,15 +358,15 @@ class CallTreeBuilder:
                     source=source,
                     source_omitted_reason=omit_reason,
                     checksum=checksum,
-                    callees_in_tree=[],
+                    expanded_calls=[],
                     data_types=list(callee_entry.get("data_types_used", []) or []),
                     constants=self._extract_constant_names(callee_entry.get("constants_used", {})),
-                    out_of_tree_callers=sorted(
+                    other_callers=sorted(
                         c for c in self._callers.get(callee_name, set()) if c != parent_name
                     ),
                 )
                 nodes.append(child_node)
-                parent_node.callees_in_tree.append(callee_name)
+                parent_node.expanded_calls.append(callee_name)
 
                 # Only continue descending when the body is actually inlined.
                 # Stubbed nodes still appear, but we don't enqueue their children —

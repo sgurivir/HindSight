@@ -41,6 +41,8 @@ def test_schemas_define_every_tool():
         "inspectDirectoryHierarchy",
         "getImplementation",
         "getSummaryOfFile",
+        "lookup_knowledge",
+        "store_knowledge",
     }
 
 

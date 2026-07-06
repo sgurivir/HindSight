@@ -150,7 +150,6 @@ CALL_TREE_ENABLED = True              # Feature flag for call tree context
 CALL_TREE_ANALYSIS_MAX_DEPTH = 7              # max depth from root for inlined source
 CALL_TREE_ANALYSIS_MAX_CHARS = 1_500_000      # ~430K tokens; leaves >500K for system/tools/output under Opus 4.7's 1M cap
 CALL_TREE_ANALYSIS_MAX_NODES = 300            # hard cap on inlined nodes per tree (pathological fan-out guard)
-CALL_TREE_ANALYSIS_ENABLED = True             # feature flag — when False, falls back to legacy per-function pipeline
 
 DEFAULT_LLM_API_END_POINT = "https://api.anthropic.com/v1/messages"
 DEFAULT_LLM_MODEL = "claude-sonnet-4-5"

@@ -55,20 +55,6 @@ logger = get_logger(__name__)
 TokenCallback = Callable[[int, int], None]
 
 
-# Tool sets — match the legacy `PerfAnalysis._run_context_collection` /
-# `_run_performance_analysis` lists verbatim.
-_STAGE_A_TOOLS = (
-    "readFile",
-    "runTerminalCmd",
-    "getSummaryOfFile",
-    "inspectDirectoryHierarchy",
-    "list_files",
-    "getFileContentByLines",
-    "checkFileSize",
-)
-_STAGE_B_TOOLS = ("readFile", "runTerminalCmd", "getFileContentByLines")
-
-
 @dataclass(frozen=True)
 class PerfPathWork:
     """One call-path work item built by the perf runner.
@@ -250,6 +236,8 @@ class PerfPipeline:
             work.function_bodies.get(work.path[0], {}).get("file", "")
             if work.path else ""
         )
+
+        logger.info(f"Analyzing [{idx}/{total}] {path_id} ({first_file})")
 
         await self.session.emit(
             FunctionStartEvent(

@@ -584,6 +584,7 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
                 else None,
             directory_tree_util=getattr(self, "directory_tree_util", None),
             analyzer_name="trace_analysis",
+            knowledge_subject="trace",
         ) as session:
             pipeline = TracePipeline(
                 session,

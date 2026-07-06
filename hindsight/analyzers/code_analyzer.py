@@ -78,7 +78,6 @@ from ..core.constants import (DEFAULT_LOGS_DIR, DEFAULT_MAX_TOKENS,
                               PROCESSED_OUTPUT_DIR, DEFAULT_LLM_MODEL, DEFAULT_LLM_API_END_POINT,
                               CODE_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT,
                               LLM_PROVIDER_RATE_WINDOW_SECONDS,
-                              CALL_TREE_ANALYSIS_ENABLED,
                               CALL_TREE_ANALYSIS_MAX_DEPTH,
                               CALL_TREE_ANALYSIS_MAX_CHARS,
                               CALL_TREE_ANALYSIS_MAX_NODES)
@@ -553,23 +552,23 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             api_key=api_key,
         )
 
-        # --- Build a CallTreeBuilder when call-tree mode is on ---
+        # --- Build a CallTreeBuilder (call-tree is the only code-analysis mode) ---
+        # Only when init fails do we fall back to the per-function pipeline.
         call_tree_builder = None
-        if ctx.enable_call_tree:
-            try:
-                call_tree_builder = CallTreeBuilder(
-                    nested_call_graph=self.call_graph_data,
-                    repo_path=repo_path,
-                    max_depth=ctx.call_tree_max_depth,
-                    max_chars=ctx.call_tree_max_chars,
-                    max_nodes=ctx.call_tree_max_nodes,
-                )
-                self.logger.info("Code analysis: call-tree mode enabled")
-            except Exception as exc:
-                self.logger.warning(
-                    f"CallTreeBuilder init failed; falling back to per-function mode: {exc}"
-                )
-                call_tree_builder = None
+        try:
+            call_tree_builder = CallTreeBuilder(
+                nested_call_graph=self.call_graph_data,
+                repo_path=repo_path,
+                max_depth=ctx.call_tree_max_depth,
+                max_chars=ctx.call_tree_max_chars,
+                max_nodes=ctx.call_tree_max_nodes,
+            )
+            self.logger.info("Code analysis: call-tree mode enabled")
+        except Exception as exc:
+            self.logger.warning(
+                f"CallTreeBuilder init failed; falling back to per-function mode: {exc}"
+            )
+            call_tree_builder = None
 
         # --- Hooks into the legacy components ---
         issue_filter = (
@@ -910,6 +909,51 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                 "Final-issues writeback: no JSON files needed updating"
             )
 
+    def _writeback_final_issues_to_publisher(
+        self,
+        final_issues: list,
+        repo_name: str,
+    ) -> None:
+        """Reconcile the publisher's per-result issue lists with the
+        deduped/filtered ``final_issues`` set so that later calls to
+        ``results_publisher.get_results()`` reflect the same view as the
+        HTML report and the on-disk JSONs.
+
+        Without this, downstream consumers (e.g. the analysis-complete
+        banner) that re-derive counts from the publisher see the
+        pre-filter snapshot instead.
+
+        Identity-based reconciliation is safe here: the issue deduper
+        returns ``raw_data`` refs (same dicts, not copies), radar dedup
+        annotates in place, and the FP CSV filter returns a subset of
+        the input list.  So each surviving issue is the exact same dict
+        object stored under ``_results[result_id]['results']``.
+        """
+        if not self.results_publisher or not repo_name:
+            return
+
+        surviving_ids = {id(issue) for issue in final_issues}
+
+        result_ids = self.results_publisher._repo_results.get(repo_name, [])
+        total_before = 0
+        total_after = 0
+        for result_id in result_ids:
+            result = self.results_publisher._results.get(result_id)
+            if not result or not isinstance(result.get('results'), list):
+                continue
+            original = result['results']
+            total_before += len(original)
+            kept = [issue for issue in original if id(issue) in surviving_ids]
+            total_after += len(kept)
+            result['results'] = kept
+
+        if total_before != total_after:
+            self.logger.info(
+                f"Publisher writeback: {total_before} -> {total_after} issues "
+                f"({total_before - total_after} filtered) across "
+                f"{len(result_ids)} results for repo '{repo_name}'"
+            )
+
     def _generate_report(self, config: dict, writeback_final_issues: bool = False) -> tuple:
         """Generate HTML report from analysis results."""
         self.logger.info("Starting report generation...")
@@ -1041,6 +1085,13 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
                         "FP CSV Filter raised an unexpected error, "
                         "continuing with all issues: %s", exc
                     )
+
+            # ── Reconcile publisher's in-memory results with final set ─────
+            # After dedup/radar-dedup/FP-CSV filtering, the publisher still
+            # holds the pre-filter results.  Reconcile so any consumer that
+            # queries the publisher after this point (e.g. the analysis
+            # banner) sees the same view as the report.
+            self._writeback_final_issues_to_publisher(all_issues, repo_name)
 
             # ── Write final issue set back to per-function JSONs ───────────
             # Only done after a full analysis run (writeback_final_issues=True)

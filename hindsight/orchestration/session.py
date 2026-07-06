@@ -35,10 +35,12 @@ disk (because `AsyncResultSink.publish` is write-through).
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, List, Optional
 
+from hindsight.core.knowledge import KnowledgeStore
 from hindsight.llm import (
     AsyncLLMClient,
     AsyncRateLimiter,
@@ -77,12 +79,14 @@ class AnalysisSession:
         logger_: ConversationLogger,
         tools: ToolRegistry,
         rate_limiter: AsyncRateLimiter,
+        knowledge_store: Optional[KnowledgeStore] = None,
     ):
         self.ctx = ctx
         self.llm = llm
         self.conversation_logger = logger_
         self.tools = tools
         self.rate_limiter = rate_limiter
+        self.knowledge_store = knowledge_store
 
         # Fan-out machinery.
         self._subscribers: List[EventCallback] = []
@@ -102,6 +106,7 @@ class AnalysisSession:
         file_content_provider: Any = None,
         directory_tree_util: Any = None,
         analyzer_name: str = "code_analysis",
+        knowledge_subject: str = "code",
     ) -> "AnalysisSession":
         """Build a session and all its long-lived components.
 
@@ -115,6 +120,12 @@ class AnalysisSession:
         common entry point (CodePipeline) needs no extra config; the diff and
         trace pipelines pass their own values to preserve the legacy
         on-disk layout.
+
+        `knowledge_subject` binds the 4 knowledge tools (`recallByFunction`,
+        `recallByFile`, `recallByTopic`, `recordLearning`) to a single
+        subject — `'code'`, `'trace'`, or `'diff'`. The LLM never sees the
+        subject; it's fixed at registration time so a code-pipeline session
+        can never accidentally write into the trace subject.
         """
         ctx.ensure_directories()
 
@@ -134,12 +145,41 @@ class AnalysisSession:
             directory_tree_util=directory_tree_util,
             ignore_dirs=set(ctx.exclude_directories),
         )
-        tools = build_default_registry(tool_ctx)
+        knowledge_store = cls._open_knowledge_store(ctx)
+        tools = build_default_registry(
+            tool_ctx,
+            knowledge_store=knowledge_store,
+            knowledge_subject=knowledge_subject,
+        )
         rate_limiter = AsyncRateLimiter(
             max_requests=ctx.rate_limit,
             window_seconds=ctx.rate_window_seconds,
         )
-        return cls(ctx, llm=llm, logger_=conv_logger, tools=tools, rate_limiter=rate_limiter)
+        return cls(
+            ctx,
+            llm=llm,
+            logger_=conv_logger,
+            tools=tools,
+            rate_limiter=rate_limiter,
+            knowledge_store=knowledge_store,
+        )
+
+    @staticmethod
+    def _open_knowledge_store(ctx: AnalysisContext) -> Optional[KnowledgeStore]:
+        """Open the per-repo knowledge DB at `{artifacts_dir}/knowledge.db`.
+
+        On any failure (permissions, corrupt DB, etc.) log and return None —
+        the pipeline must degrade gracefully when the store is unavailable.
+        """
+        db_path = os.path.join(ctx.artifacts_dir, "knowledge.db")
+        try:
+            return KnowledgeStore(db_path=db_path, repo_name=ctx.repo_name)
+        except Exception as exc:  # noqa: BLE001 — never let store failure crash a run
+            logger.warning(
+                f"KnowledgeStore unavailable at {db_path}: {exc}. "
+                "Analysis will proceed without persistent knowledge."
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Async-context-manager lifecycle
@@ -170,6 +210,11 @@ class AnalysisSession:
             await self.llm.aclose()
         except Exception as exc:  # noqa: BLE001 — closing pool must never raise
             logger.warning(f"AsyncLLMClient.aclose failed: {exc}")
+        if self.knowledge_store is not None:
+            try:
+                self.knowledge_store.close()
+            except Exception as exc:  # noqa: BLE001 — closing store must never raise
+                logger.warning(f"KnowledgeStore.close failed: {exc}")
 
     # ------------------------------------------------------------------
     # Event fan-out

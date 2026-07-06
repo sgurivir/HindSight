@@ -58,7 +58,7 @@ All tool commands MUST stay within the repository root (`.`).
 
 ```json
 {
-  "schema_version": "2.0",
+  "schema_version": "2.1",
   "root": {"function": "...", "file": "...", "checksum": "..."},
   "diff_context": {
     "all_changed_files": ["..."],
@@ -76,9 +76,9 @@ All tool commands MUST stay within the repository root (`.`).
       "source_omitted_reason": "...",
       "is_modified": bool,        // true iff this node has at least one changed line
       "changed_lines": [N, ...],  // lines within this node that changed
-      "callees_in_tree": ["..."],
-      "callees_out_of_tree": ["..."],
-      "out_of_tree_callers": ["..."]
+      "expanded_calls": ["..."],       // callees whose source IS shown as a node in this tree
+      "other_callees": ["..."],           // callees NOT shown here (external, back-edge, or capped) — names only
+      "other_callers": ["..."]          // functions elsewhere in the repo that call this one, not shown in this tree
     }
   ],
   "truncation": {...}
@@ -91,20 +91,46 @@ All tool commands MUST stay within the repository root (`.`).
 
 ## AVAILABLE TOOLS
 
-Full tool set is available. Use it to fetch stubbed bodies, inspect out-of-tree callers, or verify hypotheses.
+Full tool set is available. Use it to fetch stubbed bodies, inspect `other_callers`, or verify hypotheses.
 
 | Priority | Tool | When to Use |
 |----------|------|-------------|
-| 1 | `getFileContentByLines` | Fetch any stubbed node body, or surrounding context for a changed function |
-| 2 | `readFile` | Small files (< 5,000 chars) |
-| 3 | `getSummaryOfFile` | Orient on large files before targeted reads |
-| 4 | `list_files`, `checkFileSize` | Explore / size-check |
-| 5 | `runTerminalCmd` | grep when path is unknown; inspect out-of-tree callers |
+| 1 | `lookup_knowledge` | **ALWAYS call first** for any stubbed node or file you don't already understand |
+| 2 | `getFileContentByLines` | Fetch any stubbed node body, or surrounding context for a changed function (after `lookup_knowledge` returned `[]`) |
+| 3 | `readFile` | Small files (< 5,000 chars) |
+| 4 | `getSummaryOfFile` | Orient on large files before targeted reads |
+| 5 | `list_files`, `checkFileSize` | Explore / size-check |
+| 6 | `runTerminalCmd` | grep when path is unknown; inspect `other_callers` |
+| — | `store_knowledge` | **Record after** each node/rule you relied on |
+
+### Knowledge store — mandatory workflow
+
+Bound to `subject='diff'` for this stage. The knowledge store is a persistent, project-wide cache of **general technical knowledge** — function contracts, file/module roles, cross-cutting invariants.
+
+**Before fetching a stubbed node body or reading any source you don't already understand:**
+
+1. **Call `lookup_knowledge` first** with the function name, file path, or a topic phrase. One tool, one query — FTS5 ranks across summary, entity_key, function_name, file_path in one pass.
+2. **If a fresh hit is returned**: use the stored summary — **do NOT fetch the body**.
+3. **If stale or empty**: fetch the body, then step 4.
+
+**After you understand a node's behavior — before moving on:**
+
+4. **Call `store_knowledge`** with a 1-2 sentence summary and, when relevant, a line-anchored `behavior` note. Skipping this step forces every future diff call-tree analysis through this node to redo the same work.
+
+**Store only general technical information — NOT bug findings or regressions.** Defects belong in the analysis output.
 
 ### TOOL CALLING FORMAT
 
 ```json
 {"tool": "getFileContentByLines", "path": "src/X.swift", "startLine": 40, "endLine": 120, "reason": "fetch stubbed callee body"}
+```
+
+```json
+{"tool": "lookup_knowledge", "query": "handleEvent src/core/MyClass.swift", "reason": "Check whether a prior analysis already characterized this stubbed node"}
+```
+
+```json
+{"tool": "store_knowledge", "kind": "summary", "entity_key": "src/core/MyClass.swift::handleEvent", "function_name": "handleEvent", "file_path": "src/core/MyClass.swift", "checksum": "abc12345", "summary": "Dispatches the event to the registered handler on the main queue. Caller is expected to have registered a handler beforehand.", "confidence": 0.85, "tags": ["dispatch"], "reason": "Cache the contract for future diff analyses through this node"}
 ```
 
 Each tool call in its own fenced `json` block. Flat parameters alongside `"tool"`.
@@ -129,12 +155,18 @@ Same four-case rubric as the non-diff pipeline. A defect is reportable only if A
 - Pre-existing defects unrelated to the diff (those belong to the periodic code review, not the diff review).
 - Memory safety, naming, stylistic, defensive-programming issues.
 
+### ⛔ Absence of evidence is NOT evidence of a defect
+
+The tree is a **partial view** of the program. Code not shown here is NOT proof that it does not exist — completions, callers, synchronization, validation, and error handling often live in stubbed/capped nodes or are wired through decoupled mechanisms a static call tree cannot capture (`NotificationCenter` / `addObserver`, delegates, KVO, target-action, completion handlers).
+
+Do NOT conclude that a completion call, synchronization, a caller (re-entrant or concurrent included), input validation, or error handling is missing simply because it is absent from this tree. Before reporting a "missing X" regression, actively look for X — grep for the symbol, inspect `other_callers` / `other_callees`, and search for decoupled dispatch. Report the regression ONLY if you verified X's absence **directly from the code or from tool output**; otherwise return `[]`.
+
 ---
 
 ## ANALYSIS PROCESS
 
 1. **Locate the change.** From `diff_context.changed_lines_per_file` and each node's `is_modified` / `changed_lines`, build a mental map of what actually changed.
-2. **Analyse changed callees first.** For each modified leaf/near-leaf, identify whether its observable behaviour (return value, side effects, error contract) changed. If yes, walk upward.
+2. **Start from evidence, not from suspicion.** For each modified leaf/near-leaf, determine whether its observable behaviour (return value, side effects, error contract) *actually* changed — proven from the diff-marked source or tool output, not inferred. Do NOT begin by hunting for suspicious-looking patterns and then working to justify them. Only walk upward once you can point to concrete changed code that demonstrably alters behaviour. If confirming the regression would require assuming a fact you cannot verify from the code or tool output, drop it.
 3. **Walk parent links upward.** At each ancestor, find the line that consumes the changed callee's output/effect. If no in-tree caller is affected → drop.
 4. **Analyse changed callers second.** Self-contained defects on changed lines (Case "self-contained" above). Cite the changed line.
 5. **Self-check before output.** Re-read each staged issue. Two questions:

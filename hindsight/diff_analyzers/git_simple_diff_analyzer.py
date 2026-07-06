@@ -33,7 +33,7 @@ from .affected_function_detector import AffectedFunctionDetector, extract_change
 from ..analyzers.analysis_runner_mixins import UnifiedIssueFilterMixin, ReportGeneratorMixin
 from ..issue_filter.unified_issue_filter import create_unified_filter
 from ..core.lang_util.all_supported_extensions import ALL_SUPPORTED_EXTENSIONS
-from ..core.constants import MAX_CHARACTERS_PER_DIFF_ANALYSIS, DEFAULT_NUM_BLOCKS_TO_ANALYZE, DEFAULT_LLM_MODEL, MAX_FILES_PER_DIFF_CHUNK, DEFAULT_LLM_API_END_POINT, MAX_SUPPORTED_FILE_COUNT, MAX_FUNCTION_BODY_LENGTH, DEFAULT_MAX_TOKENS, DIFF_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT, LLM_PROVIDER_RATE_WINDOW_SECONDS, CALL_TREE_ANALYSIS_ENABLED, CALL_TREE_ANALYSIS_MAX_DEPTH, CALL_TREE_ANALYSIS_MAX_CHARS, CALL_TREE_ANALYSIS_MAX_NODES
+from ..core.constants import MAX_CHARACTERS_PER_DIFF_ANALYSIS, DEFAULT_NUM_BLOCKS_TO_ANALYZE, DEFAULT_LLM_MODEL, MAX_FILES_PER_DIFF_CHUNK, DEFAULT_LLM_API_END_POINT, MAX_SUPPORTED_FILE_COUNT, MAX_FUNCTION_BODY_LENGTH, DEFAULT_MAX_TOKENS, DIFF_ANALYZER_DEFAULT_WORKERS, LLM_PROVIDER_RATE_LIMIT, LLM_PROVIDER_RATE_WINDOW_SECONDS, CALL_TREE_ANALYSIS_MAX_DEPTH, CALL_TREE_ANALYSIS_MAX_CHARS, CALL_TREE_ANALYSIS_MAX_NODES
 from ..core.call_tree import CallTreeBuilder, RootSelector
 from ..core.errors import AnalyzerErrorCode, AnalysisResult
 from ..core.proj_util.file_or_directory_summary_generator import FileOrDirectorySummaryGenerator
@@ -614,6 +614,7 @@ class GitSimpleCommitAnalyzer(UnifiedIssueFilterMixin, ReportGeneratorMixin, Bas
                 file_content_provider=fcp,
                 directory_tree_util=dtu,
                 analyzer_name="diff_analysis",
+                knowledge_subject="diff",
             ) as session:
                 session.conversation_logger.clear_older_prompts()
                 sink = AsyncResultSink(self.results_publisher, repo_name=ctx.repo_name)

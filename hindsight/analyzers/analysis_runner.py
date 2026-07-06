@@ -774,6 +774,43 @@ class AnalysisRunner:
             shutil.rmtree(llm_analysis_out_dir)
             self.logger.info("LLM analysis output directory cleared")
 
+        # Drop the 'code' subject from the shared knowledge store so the next
+        # run starts from empty for code analysis. Trace and diff rows are
+        # untouched — force-LLM only resets the analyzer the user explicitly
+        # asked to re-run.
+        self._clear_knowledge_store_for_code(config, output_base_dir)
+
+    def _clear_knowledge_store_for_code(
+        self, config: dict, output_base_dir: Optional[str],
+    ) -> None:
+        """Best-effort: open the per-repo knowledge.db and call delete_subject('code').
+
+        Quiet about errors — a missing/corrupt DB shouldn't block a force-rerun.
+        """
+        if not output_base_dir:
+            return
+        repo_path = config.get("path_to_repo")
+        if not repo_path:
+            return
+        repo_name = os.path.basename(str(repo_path).rstrip("/"))
+        db_path = os.path.join(output_base_dir, repo_name, "knowledge.db")
+        if not os.path.exists(db_path):
+            return
+        try:
+            from ..core.knowledge import KnowledgeStore
+            store = KnowledgeStore(db_path=db_path, repo_name=repo_name)
+            try:
+                deleted = store.delete_subject("code")
+                self.logger.info(
+                    f"Force-rerun: cleared {deleted} 'code' learnings from {db_path}"
+                )
+            finally:
+                store.close()
+        except Exception as exc:  # noqa: BLE001 — never block force-rerun on store failure
+            self.logger.warning(
+                f"Could not clear 'code' subject in knowledge store at {db_path}: {exc}"
+            )
+
     def _write_directory_tree_with_issues(self, file_handle, node, indent_level):
         """Write directory tree with issues to file handle."""
         if not node:

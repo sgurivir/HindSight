@@ -166,9 +166,7 @@ def _transform_results_for_report(results: list) -> list:
             'impact': result.get('impact'),
             'Impact': result.get('impact'),  # Capitalized variant
             'potential_solution': result.get('potential_solution'),
-            'suggestion': result.get('potential_solution'),  # Report uses 'suggestion'
-            'Potential solution': result.get('potential_solution'),  # Space variant
-            'potentialSolution': result.get('potential_solution'),  # camelCase variant
+            'suggestion': result.get('potential_solution'),  # Canonical report field
         }
         
         transformed.append(transformed_result)

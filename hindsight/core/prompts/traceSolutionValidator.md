@@ -49,19 +49,31 @@ You will receive:
 
 ## LOOKING UP ADDITIONAL CONTEXT
 
-If the context bundle does not contain a symbol, struct field, constant, or call site you need to judge safety, you have tools available and MAY call them. Emit a tool request JSON object on its own (NOT as your final verdict) and you will receive the result in the next turn:
+If the context bundle does not contain a symbol, struct field, constant, or call site you need to judge safety, you have tools available and MAY call them. Emit a tool request JSON object on its own (NOT as your final verdict) and you will receive the result in the next turn.
+
+**Before any `readFile`/`getFileContentByLines` call — check the knowledge store first.** Prior trace analyses may already describe the symbol you're looking up (threading contract, lifetime rule, invariant), which is exactly the kind of information you need to judge safety.
 
 ```json
-{"tool": "getFileContentByLines", "path": "Absolute/Or/Repo-Relative/Path.mm", "start_line": 60, "end_line": 80, "reason": "Need to see the kMTimeModificationPeriod definition"}
+{"tool": "lookup_knowledge", "query": "kMTimeModificationPeriod threading", "reason": "Prior analysis may have recorded the constant's semantics or a related invariant"}
+```
+
+Only if `lookup_knowledge` returns `[]` should you fall through to reading source:
+
+```json
+{"tool": "getFileContentByLines", "path": "Absolute/Or/Repo-Relative/Path.mm", "startLine": 60, "endLine": 80, "reason": "Need to see the kMTimeModificationPeriod definition"}
 ```
 
 Other useful tools:
+- `{"tool": "lookup_knowledge", "query": "..."}` — **always call first** before source reads
 - `{"tool": "readFile", "path": "..."}` — full file (prefer `getFileContentByLines` for large files)
-- `{"tool": "getFileContent", "path": "..."}` — file contents
-- `{"tool": "lookup_knowledge", "query": "..."}` — prior learnings
-- `{"tool": "lookup_function_optimization", "function_name": "..."}` — prior fixes for a function
+- `{"tool": "getFileContent", "path": "..."}` — alias for `getFileContentByLines`
+- `{"tool": "checkFileSize", "path": "..."}` — confirm file size and line count before reading
+- `{"tool": "list_files", "path": "..."}` — discover filenames when a path lookup fails
+- `{"tool": "runTerminalCmd", "command": "grep -rn 'symbol' --include='*.swift' ."}` — last-resort cross-file search
 
 Use tools sparingly — only when the missing piece is directly needed to decide safety. Do not browse.
+
+You may also call `store_knowledge` when the safety verdict itself derives a general invariant worth persisting (e.g. "this dispatch handler runs on main queue only") — this is optional and stops at cross-cutting rules; per-issue verdicts do not belong in the store.
 
 ---
 

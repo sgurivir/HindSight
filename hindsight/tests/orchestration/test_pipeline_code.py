@@ -53,21 +53,28 @@ class FakeLLM(AsyncLLMClient):
         context_responses: Optional[List[str]] = None,
         analysis_responses: Optional[List[str]] = None,
         call_tree_responses: Optional[List[str]] = None,
+        call_tree_context_responses: Optional[List[str]] = None,
     ):
         self.config = LLMClientConfig(api_url="http://fake", model="claude-sonnet-4-5", max_tokens=64000)
         self._ctx_q = list(context_responses or [])
         self._ana_q = list(analysis_responses or [])
         self._ct_q = list(call_tree_responses or [])
+        self._ct_ctx_q = list(call_tree_context_responses or [])
         self.sends: List[Dict[str, Any]] = []
 
     async def send(self, system_prompt, messages, *, enable_system_cache=True, cache_ttl="1h") -> LLMResponse:
         self.sends.append({"system": system_prompt[:80] if system_prompt else None, "messages": messages})
         # Route based on system prompt content (the stage spec injects its system prompt).
         sp = (system_prompt or "").lower()
-        if "context" in sp and "diff" not in sp and "trace" not in sp and "perf" not in sp:
-            text = self._next(self._ctx_q, "context")
-        elif "call tree" in sp or "call_tree" in sp:
+        is_call_tree = "call tree" in sp or "call-tree" in sp or "call_tree" in sp
+        if is_call_tree and "context collection" in sp:
+            # Call-tree Step 1 (context collection). Default "{}" → no extra
+            # context, so tests that don't script it still analyze tree-only.
+            text = self._next(self._ct_ctx_q, "call_tree_context", default="{}")
+        elif is_call_tree:
             text = self._next(self._ct_q, "call_tree")
+        elif "context" in sp and "diff" not in sp and "trace" not in sp and "perf" not in sp:
+            text = self._next(self._ctx_q, "context")
         else:
             text = self._next(self._ana_q, "analysis")
         return LLMResponse(
@@ -81,9 +88,9 @@ class FakeLLM(AsyncLLMClient):
         pass
 
     @staticmethod
-    def _next(queue: List[str], kind: str) -> str:
+    def _next(queue: List[str], kind: str, default: str = "[]") -> str:
         if not queue:
-            return "[]"  # safe default: empty issue array (no defects)
+            return default  # safe default: empty issue array / empty context object
         return queue.pop(0)
 
 

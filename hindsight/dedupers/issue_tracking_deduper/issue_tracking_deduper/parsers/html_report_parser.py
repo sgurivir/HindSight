@@ -512,7 +512,7 @@ class StaticIntelligenceParser(BaseReportParser):
                 description_parts.append(evidence)
             
             # Add potential solution
-            solution = raw_issue.get('potentialSolution', '') or raw_issue.get('suggestion', '')
+            solution = raw_issue.get('suggestion', '') or raw_issue.get('potentialSolution', '')
             if solution:
                 description_parts.append(f"Suggested fix: {solution}")
             

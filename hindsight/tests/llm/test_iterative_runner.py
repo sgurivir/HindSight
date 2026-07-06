@@ -150,3 +150,60 @@ async def test_runner_returns_last_text_on_max_iterations():
     )
     assert outcome.iterations == 2
     assert outcome.text == "nope 2"
+
+
+@pytest.mark.asyncio
+async def test_runner_defers_reads_when_batched_with_lookup_knowledge():
+    """Janus-style: when the LLM batches `lookup_knowledge` with a file
+    read in the same turn, only the lookup runs. The read is deferred so
+    the LLM can decide whether it's still needed after seeing the lookup
+    result. This prevents cache hits from being followed by redundant
+    reads on the same turn."""
+    responses = [
+        # Turn 1: LLM batches a lookup and a read.
+        '```json\n{"tool": "lookup_knowledge", "query": "foo"}\n```\n'
+        '```json\n{"tool": "readFile", "path": "src/foo.py", "reason": "explore"}\n```',
+        # Turn 2: after seeing the lookup, LLM decides the read isn't needed.
+        "[]",
+    ]
+    client = FakeClient(responses)
+    tools = FakeTools({
+        "lookup_knowledge": '[{"summary":"cached"}]',
+        "readFile": "SHOULD NOT BE READ",
+    })
+    runner = IterativeRunner(client)
+
+    outcome = await runner.run(
+        stage_4b_analysis("sys"),
+        user_prompt="analyze",
+        tools=tools,
+    )
+    assert outcome.text == "[]"
+    # Only the lookup ran on turn 1 — the read was deferred.
+    executed_names = [c.name for c in tools.calls]
+    assert executed_names == ["lookup_knowledge"]
+    # Turn 2's messages must include the deferred-reads note.
+    second_user_msgs = [m for m in client.sends[1]["messages"] if m["role"] == "user"]
+    assert any("deferred" in m["content"].lower() for m in second_user_msgs)
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_defer_when_no_lookup_present():
+    """No `lookup_knowledge` in the turn → no deferral; reads run as usual."""
+    responses = [
+        '```json\n{"tool": "readFile", "path": "a.py", "reason": "x"}\n```\n'
+        '```json\n{"tool": "readFile", "path": "b.py", "reason": "y"}\n```',
+        "[]",
+    ]
+    client = FakeClient(responses)
+    tools = FakeTools({"readFile": "content"})
+    runner = IterativeRunner(client)
+
+    outcome = await runner.run(
+        stage_4b_analysis("sys"),
+        user_prompt="analyze",
+        tools=tools,
+    )
+    assert outcome.text == "[]"
+    assert [c.name for c in tools.calls] == ["readFile", "readFile"]
+

@@ -3,9 +3,13 @@
 Writes markdown transcripts of every LLM call to
 `{artifacts}/prompts_sent/{analyzer}/[{issue_n}/]stepN_{stage}.md`. This is
 the same on-disk layout as the legacy logger that lived on `Claude` as class
-statics; the difference is that **every bit of state is now an instance
-attribute** so two FastAPI requests can log concurrently without trampling
-each other.
+statics.
+
+The "currently active conversation" is a **handle returned from
+`start_conversation()` and passed back into `record_turn()`/`finalize()`**,
+so concurrent async workers sharing one `ConversationLogger` cannot trample
+each other's in-flight transcripts. Only truly shared state (step counter,
+issue directory) lives on the instance.
 
 Errors that exceed token limits also get dumped to
 `{artifacts}/results/errors/too_large_context_error_{ts}.txt`, preserving the
@@ -15,11 +19,17 @@ Lifecycle:
   logger = ConversationLogger(artifacts_dir, analyzer="code_analysis")
   logger.clear_older_prompts()        # once per run
   logger.start_issue(issue_number=42) # before each function (optional)
-  with logger.conversation(stage="context_collection", context_info="..."):
-      logger.record_turn(messages_sent, response_received)
-      ...
-      logger.finalize(final_result=json_str)
+  conv = logger.start_conversation("context_collection", "MyClass.method")
+  logger.record_turn(conv, messages_sent, response_received)
+  ...
+  logger.finalize(conv, final_result=json_str)
   logger.end_issue()
+
+Or use the context manager, which yields the handle and auto-finalizes on
+exit if the caller didn't:
+  with logger.conversation("context_collection", "...") as conv:
+      logger.record_turn(conv, ...)
+      logger.finalize(conv, final_result=...)
 """
 
 from __future__ import annotations
@@ -41,19 +51,27 @@ logger = get_logger(__name__)
 
 @dataclass
 class _Conversation:
-    """One conversation = one LLM run = one .md file when finalized."""
+    """One conversation = one LLM run = one .md file when finalized.
+
+    Instances are handed to callers by `start_conversation()` and passed
+    back into `record_turn()`/`finalize()`. Each concurrent worker holds
+    its own handle, so no cross-task state is shared here.
+    """
 
     stage: str
     context_info: str
     started_at: str
     turns: List[Dict[str, Any]] = field(default_factory=list)
+    finalized: bool = False
 
 
 class ConversationLogger:
     """Per-session markdown logger for LLM conversations.
 
-    Thread-safe for use from async code where the loop and worker threads
-    may interleave: every mutation is guarded by an instance lock.
+    Safe for concurrent use: every call is scoped to a `_Conversation`
+    handle owned by the caller, so two workers sharing one logger cannot
+    trample each other's transcripts. The instance lock only guards the
+    shared step counter and issue-directory fields.
     """
 
     def __init__(self, artifacts_dir: str, analyzer: str):
@@ -71,7 +89,6 @@ class ConversationLogger:
         self._counter = 0
         self._current_issue_number: Optional[int] = None
         self._current_issue_dir: Optional[str] = None
-        self._current: Optional[_Conversation] = None
 
         ensure_directory_exists(self._prompts_dir)
         ensure_directory_exists(self._errors_dir)
@@ -122,64 +139,73 @@ class ConversationLogger:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def conversation(self, stage: str, context_info: str = "") -> Iterator[None]:
+    def conversation(self, stage: str, context_info: str = "") -> Iterator[_Conversation]:
         """Context manager around one LLM run.
 
-        Use::
-
-            with logger.conversation("context_collection", "MyClass.method"):
-                # ... iterations ...
-                logger.finalize(final_result=json_str)
-
-        Exiting the block without `finalize()` still flushes whatever turns
-        were recorded so failures leave a transcript on disk.
+        Yields the conversation handle. Exiting the block without an
+        explicit `finalize(handle, ...)` still flushes whatever turns were
+        recorded so failures leave a transcript on disk.
         """
-        self.start_conversation(stage, context_info)
+        conv = self.start_conversation(stage, context_info)
         try:
-            yield
+            yield conv
         finally:
-            if self._current is not None:
-                # finalize() was not called — write what we have.
-                self.finalize(final_result=None)
+            if not conv.finalized:
+                self.finalize(conv, final_result=None)
 
-    def start_conversation(self, stage: str, context_info: str = "") -> None:
-        """Begin a new conversation. Prefer the `conversation()` context manager."""
-        with self._lock:
-            self._current = _Conversation(
-                stage=stage,
-                context_info=context_info,
-                started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-            )
+    def start_conversation(self, stage: str, context_info: str = "") -> _Conversation:
+        """Begin a new conversation and return its handle.
 
-    def record_turn(self, messages: List[Dict[str, Any]], response: Optional[Dict[str, Any]]) -> None:
-        """Record one request/response pair on the active conversation."""
-        with self._lock:
-            if self._current is None:
-                logger.warning("record_turn called with no active conversation; ignoring")
-                return
-            self._current.turns.append(
-                {
-                    "messages": [dict(m) for m in messages],
-                    "response": dict(response) if response else {"error": "No response"},
-                }
-            )
-
-    def finalize(self, final_result: Optional[str] = None) -> Optional[str]:
-        """Flush the active conversation to a markdown file.
-
-        Returns the file path on success.
+        Callers pass the returned handle back into `record_turn()` and
+        `finalize()`. Nothing about the active conversation is stored on
+        the logger itself, so concurrent workers cannot trample each other.
         """
+        return _Conversation(
+            stage=stage,
+            context_info=context_info,
+            started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    def record_turn(
+        self,
+        conv: _Conversation,
+        messages: List[Dict[str, Any]],
+        response: Optional[Dict[str, Any]],
+    ) -> None:
+        """Record one request/response pair on `conv`."""
+        if conv.finalized:
+            logger.warning(
+                f"record_turn called on already-finalized conversation ({conv.stage}); ignoring"
+            )
+            return
+        conv.turns.append(
+            {
+                "messages": [dict(m) for m in messages],
+                "response": dict(response) if response else {"error": "No response"},
+            }
+        )
+
+    def finalize(
+        self,
+        conv: _Conversation,
+        final_result: Optional[str] = None,
+    ) -> Optional[str]:
+        """Flush `conv` to a markdown file.
+
+        Returns the file path on success. Idempotent: a second call on the
+        same handle is a no-op.
+        """
+        if conv.finalized:
+            return None
         with self._lock:
-            if self._current is None:
-                return None
             self._counter += 1
-            stage_safe = self._current.stage.replace(" ", "_").replace("/", "_").replace("\\", "_")
-            filename = f"step{self._counter}_{stage_safe}.md"
+            step_n = self._counter
             target_dir = self._current_issue_dir or self._prompts_dir
-            path = os.path.join(target_dir, filename)
-            content = self._render(self._current, final_result, self._counter)
-            self._current = None
-        # write_file is plain file I/O, fine to do outside the lock
+        stage_safe = conv.stage.replace(" ", "_").replace("/", "_").replace("\\", "_")
+        filename = f"step{step_n}_{stage_safe}.md"
+        path = os.path.join(target_dir, filename)
+        content = self._render(conv, final_result, step_n)
+        conv.finalized = True
         if write_file(path, content):
             logger.info(f"Logged conversation: {filename}")
             return path

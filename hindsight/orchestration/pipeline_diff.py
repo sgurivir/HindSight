@@ -46,6 +46,10 @@ from .events import (
     RunFailedEvent,
     RunStartedEvent,
 )
+from .prior_knowledge import (
+    format_prior_knowledge_for_function,
+    format_prior_knowledge_for_functions,
+)
 from .result_sink import AsyncResultSink
 from .session import AnalysisSession
 from .worker import bounded_gather
@@ -70,6 +74,93 @@ TokenCallback = Callable[[int, int], None]
 # change*. A neighborhood of 2 captures that "adjacent" relationship without
 # admitting unrelated pre-existing issues.
 DIFF_LINE_NEIGHBORHOOD = 2
+
+
+def _iter_diff_callee_identities(prompt_data: Dict[str, Any]):
+    """Yield (function_name, file_path, checksum) for each callee mentioned in
+    the diff `prompt_data`. Accepts several shapes because different callers
+    build the dict differently (analyzer vs. call-tree runner). Empty when
+    the shape doesn't include callees — the caller tolerates a `None` return
+    from the prior-knowledge helpers.
+    """
+    for key in ("callees", "functions_invoked"):
+        items = prompt_data.get(key) or []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, str):
+                name = item.strip()
+                if name:
+                    yield (name, None, None)
+                continue
+            if not isinstance(item, dict):
+                continue
+            name = (
+                item.get("function_name")
+                or item.get("function")
+                or item.get("name")
+                or ""
+            ).strip()
+            if not name:
+                continue
+            file_path = (
+                item.get("file_path")
+                or item.get("file")
+                or (item.get("context") or {}).get("file")
+            )
+            yield (name, file_path or None, item.get("checksum"))
+
+
+def _iter_diff_bundle_callee_identities(bundle: Dict[str, Any]):
+    """Yield (function_name, file_path, checksum) for each callee/caller in a
+    Stage Da bundle (post-collection). Accepts several shapes."""
+    if not isinstance(bundle, dict):
+        return
+    for key in ("callees", "callers"):
+        items = bundle.get(key) or []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = (
+                item.get("function_name")
+                or item.get("function")
+                or item.get("name")
+                or ""
+            ).strip()
+            if not name:
+                continue
+            file_path = item.get("file_path") or item.get("file") or None
+            yield (name, file_path, item.get("checksum"))
+
+
+def _iter_diff_tree_node_identities(tree_dict: Dict[str, Any]):
+    """Yield (function_name, file_path, checksum) for each node in a diff call-tree.
+    Walks breadth-first; caller-side cap in `format_prior_knowledge_for_functions`
+    keeps the injected block bounded."""
+    if not isinstance(tree_dict, dict):
+        return
+    stack = [tree_dict]
+    seen: set = set()
+    while stack:
+        node = stack.pop(0)
+        if not isinstance(node, dict):
+            continue
+        name = (
+            node.get("function")
+            or node.get("function_name")
+            or node.get("name")
+            or ""
+        ).strip()
+        file_path = node.get("file") or node.get("file_path")
+        key = (name, file_path)
+        if name and key not in seen:
+            seen.add(key)
+            yield (name, file_path or None, node.get("checksum"))
+        children = node.get("children") or node.get("callees") or []
+        if isinstance(children, list):
+            stack.extend(children)
 
 
 def _parse_line_number(value: Any) -> Optional[Tuple[int, int]]:
@@ -309,6 +400,16 @@ class DiffPipeline:
             logger.error(f"build_diff_call_tree_prompt raised for {root_name}: {exc}")
             return None
 
+        # Hydrate with prior knowledge for every node in the diff tree —
+        # capped internally at 12 entries.
+        prior_block = format_prior_knowledge_for_functions(
+            self.session.knowledge_store,
+            subject="diff",
+            functions=_iter_diff_tree_node_identities(tree_dict),
+        )
+        if prior_block:
+            system_prompt = f"{system_prompt}\n\n{prior_block}"
+
         runner = IterativeRunner(
             self.session.llm, conversation_logger=self.session.conversation_logger
         )
@@ -433,6 +534,8 @@ class DiffPipeline:
         total: int,
         counts: _MutableCounts,
     ) -> None:
+        logger.info(f"Analyzing [{idx}/{total}] {work.function_name} ({work.file_path})")
+
         await self.session.emit(
             FunctionStartEvent(
                 pipeline="diff",
@@ -594,6 +697,8 @@ class DiffPipeline:
         total: int,
         counts: _MutableCounts,
     ) -> None:
+        logger.info(f"Analyzing [{idx}/{total}] {work.root_name} ({work.root_file})")
+
         await self.session.emit(
             FunctionStartEvent(
                 pipeline="diff",
@@ -705,6 +810,29 @@ class DiffPipeline:
             logger.error(f"Could not load Stage Da prompt: {exc}")
             return None
 
+        # Hydrate the system prompt with prior learnings about the primary
+        # function AND any callees the diff-analyzer already knows about.
+        # Janus-style: reuse cached summaries across diffs so the LLM only
+        # reads sources it hasn't seen before.
+        primary_name = prompt_data.get("function") or ""
+        primary_file = prompt_data.get("file_path") or ""
+        primary_checksum = prompt_data.get("function_checksum")
+        primary_block = format_prior_knowledge_for_function(
+            self.session.knowledge_store,
+            subject="diff",
+            function_name=primary_name,
+            file_path=primary_file or None,
+            function_checksum=primary_checksum,
+        )
+        callee_block = format_prior_knowledge_for_functions(
+            self.session.knowledge_store,
+            subject="diff",
+            functions=_iter_diff_callee_identities(prompt_data),
+        )
+        prior_blocks = [b for b in (primary_block, callee_block) if b]
+        if prior_blocks:
+            system_prompt = system_prompt + "\n\n" + "\n\n".join(prior_blocks)
+
         user_message = self._build_function_user_message(prompt_data)
         user_message += (
             "\n\nCollect all context needed for this function diff and return a "
@@ -747,6 +875,26 @@ class DiffPipeline:
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Could not load Stage Db prompt: {exc}")
             return None
+
+        # Hydrate the analysis prompt with prior learnings for the primary
+        # function AND every callee the Da bundle mentions. Cross-cutting
+        # invariants live only in the KB and would otherwise force Db to
+        # re-issue `lookup_knowledge` to see them.
+        primary_block = format_prior_knowledge_for_function(
+            self.session.knowledge_store,
+            subject="diff",
+            function_name=function_name,
+            file_path=file_path or None,
+            function_checksum=None,
+        )
+        callee_block = format_prior_knowledge_for_functions(
+            self.session.knowledge_store,
+            subject="diff",
+            functions=_iter_diff_bundle_callee_identities(bundle),
+        )
+        prior_blocks = [b for b in (primary_block, callee_block) if b]
+        if prior_blocks:
+            system_prompt = system_prompt + "\n\n" + "\n\n".join(prior_blocks)
 
         user_message_parts = [
             "## Diff Code for Analysis\n",
@@ -820,11 +968,44 @@ class DiffPipeline:
         parts.append("")
 
         if data_types_used:
+            from hindsight.llm.prompts import PromptBuilder  # lazy — see pipeline_code
             parts.append("## Data Types Used")
-            parts.append("The following data types are used by this function:")
-            for dt in data_types_used:
-                parts.append(f"- `{dt}`")
+            parts.append(
+                "Each type below lists all known definition sites "
+                "(file + line range). Full body is inlined when ≤300 lines; "
+                "otherwise fetch it via `getFileContentByLines` using the "
+                "listed range."
+            )
             parts.append("")
+            merged_data_types_data = PromptBuilder._load_merged_data_types_data()
+            for dt in data_types_used:
+                parts.append(f"### `{dt}`")
+                bodies = PromptBuilder._lookup_data_type_bodies(dt, merged_data_types_data)
+                if not bodies:
+                    parts.append("_No definition site found in AST index._")
+                    parts.append("")
+                    continue
+                primary = bodies[0]
+                primary_file = primary.get("file", "unknown")
+                primary_start = primary.get("start_line")
+                primary_end = primary.get("end_line")
+                primary_code = primary.get("code")
+                parts.append(
+                    f"**Defined in**: `{primary_file}` "
+                    f"(lines {primary_start}-{primary_end})"
+                )
+                if primary_code and (primary_code.count("\n") + 1) <= 300:
+                    parts.append("```")
+                    parts.append(primary_code)
+                    parts.append("```")
+                if len(bodies) > 1:
+                    parts.append(f"**Also defined in**:")
+                    for extra in bodies[1:]:
+                        parts.append(
+                            f"- `{extra.get('file', 'unknown')}` "
+                            f"(lines {extra.get('start_line', '?')}-{extra.get('end_line', '?')})"
+                        )
+                parts.append("")
 
         if constants_used:
             parts.append("## Constants Used")

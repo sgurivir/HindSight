@@ -55,6 +55,25 @@ class ToolExecutor(Protocol):
 TokenUsageCallback = Callable[[LLMResponse, int], None]
 
 
+# Tool names that hit the shared knowledge store. If any of these appear in
+# the same turn as a file-reading tool, we execute the knowledge lookups first
+# and defer the reads — Janus-style — so cache hits can short-circuit the
+# corresponding reads without spending an extra LLM turn.
+_KB_LOOKUP_TOOLS = frozenset({"lookup_knowledge"})
+
+# Tool names whose results we're happy to defer when a knowledge lookup is
+# also requested in the same turn. Reads on the file system are exactly the
+# kind of work a cache hit is meant to avoid; grep/list are cheap and don't
+# usually gate on the knowledge lookup outcome, so leave them alone.
+_KB_DEFERRABLE_READ_TOOLS = frozenset({
+    "readFile",
+    "getFileContent",
+    "getFileContentByLines",
+    "getImplementation",
+    "getSummaryOfFile",
+})
+
+
 @dataclass
 class IterationOutcome:
     """Result of one full stage run."""
@@ -107,8 +126,11 @@ class IterativeRunner:
         state.set_original_request(user_prompt)
         state.add_user(user_prompt)
 
-        if self._logger is not None:
+        conversation = (
             self._logger.start_conversation(stage.name, context_info)
+            if self._logger is not None
+            else None
+        )
 
         total_input = 0
         total_output = 0
@@ -139,8 +161,8 @@ class IterativeRunner:
                     )
                 except LLMError as exc:
                     logger.error(f"[{stage.name}] API error in iteration {iteration}: {exc}")
-                    if self._logger is not None:
-                        self._logger.record_turn(messages, {"error": str(exc)})
+                    if self._logger is not None and conversation is not None:
+                        self._logger.record_turn(conversation, messages, {"error": str(exc)})
                     return IterationOutcome(
                         text=None,
                         iterations=iteration,
@@ -149,8 +171,8 @@ class IterativeRunner:
                         error=str(exc),
                     )
 
-                if self._logger is not None:
-                    self._logger.record_turn(messages, response.raw)
+                if self._logger is not None and conversation is not None:
+                    self._logger.record_turn(conversation, messages, response.raw)
                 if token_callback is not None:
                     try:
                         token_callback(response, iteration)
@@ -167,17 +189,37 @@ class IterativeRunner:
 
                 if tool_calls and tools_enabled:
                     state.add_assistant(assistant_text)
-                    logger.info(
-                        f"[{stage.name}] Iteration {iteration}: dispatching "
-                        f"{len(tool_calls)} tool request(s) concurrently"
-                    )
+                    executed_calls, deferred_reads = _split_lookups_first(tool_calls)
+                    if deferred_reads:
+                        logger.info(
+                            f"[{stage.name}] Iteration {iteration}: dispatching "
+                            f"{len(executed_calls)} lookup(s); deferring "
+                            f"{len(deferred_reads)} read(s) until the LLM sees the lookup results"
+                        )
+                    else:
+                        logger.info(
+                            f"[{stage.name}] Iteration {iteration}: dispatching "
+                            f"{len(executed_calls)} tool request(s) concurrently"
+                        )
                     results = await _execute_tools_concurrently(
-                        tool_calls, tools, allowed=stage.supported_tools  # type: ignore[arg-type]
+                        executed_calls, tools, allowed=stage.supported_tools  # type: ignore[arg-type]
                     )
-                    for idx, (call, result) in enumerate(zip(tool_calls, results)):
+                    for idx, (call, result) in enumerate(zip(executed_calls, results)):
                         tool_id = call.make_id(iteration, idx)
                         state.add_tool_result(tool_id, result)
                         logger.info(f"[{stage.name}] Tool result added for {call.name} (id: {tool_id})")
+                    if deferred_reads:
+                        deferred_names = ", ".join(
+                            f"{c.name}({_short_target(c)})" for c in deferred_reads
+                        )
+                        state.add_user(
+                            "NOTE: Executed your `lookup_knowledge` call(s) first and deferred the "
+                            f"following read(s) so you can decide whether they're still needed after "
+                            f"seeing the lookup results: {deferred_names}. "
+                            "If a lookup returned a fresh matching entry, use its summary instead of "
+                            "re-issuing the read. If a lookup returned `[]` or a stale entry, re-issue "
+                            "the read in your next turn."
+                        )
                     continue
 
                 # No tool calls — try to extract the stage's expected JSON.
@@ -237,9 +279,9 @@ class IterativeRunner:
                 output_tokens=total_output,
             )
         finally:
-            if self._logger is not None:
+            if self._logger is not None and conversation is not None:
                 # Finalize the markdown transcript regardless of success path.
-                self._logger.finalize(final_result=last_text)
+                self._logger.finalize(conversation, final_result=last_text)
 
     # ------------------------------------------------------------------
     # Iteration guidance — soft reminder + final-iteration forcing
@@ -294,6 +336,38 @@ async def _execute_tools_concurrently(
             return f"Error executing tool '{call.name}': {exc}"
 
     return await asyncio.gather(*[_safe_execute(c) for c in calls])
+
+
+def _split_lookups_first(
+    tool_calls: list[ToolCall],
+) -> tuple[list[ToolCall], list[ToolCall]]:
+    """When a turn mixes `lookup_knowledge` with a deferrable read tool
+    (`readFile`, `getFileContentByLines`, `getImplementation`, `getSummaryOfFile`,
+    `getFileContent`), execute only the non-read calls (lookups plus anything
+    else the LLM asked for) and defer the reads. Cache hits then short-circuit
+    the reads without spending an extra LLM turn.
+
+    Returns `(to_execute_now, deferred_reads)`. When there's no such mix,
+    everything goes in the first list and the second is empty.
+    """
+    has_lookup = any(c.name in _KB_LOOKUP_TOOLS for c in tool_calls)
+    has_deferrable_read = any(c.name in _KB_DEFERRABLE_READ_TOOLS for c in tool_calls)
+    if not (has_lookup and has_deferrable_read):
+        return tool_calls, []
+    to_execute = [c for c in tool_calls if c.name not in _KB_DEFERRABLE_READ_TOOLS]
+    deferred = [c for c in tool_calls if c.name in _KB_DEFERRABLE_READ_TOOLS]
+    return to_execute, deferred
+
+
+def _short_target(call: ToolCall) -> str:
+    """Best-effort short label of what a call is reading, for the deferred-reads
+    note back to the LLM. Falls back to an empty string when nothing useful
+    is on the call."""
+    for key in ("path", "file_path", "file", "filePath", "name"):
+        value = call.args.get(key) if isinstance(call.args, dict) else None
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def _describe_validation_failure(parsed: Any) -> str:

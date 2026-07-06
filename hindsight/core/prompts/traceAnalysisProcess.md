@@ -90,63 +90,35 @@ You MUST completely avoid suggesting caching mechanisms of ANY kind:
 
 ---
 
-## KNOWLEDGE BASE
-
-### Looking Up Prior Findings
-
-**IMPORTANT:** Before analyzing each function, ALWAYS check if it has been analyzed before. The same function appears in many callstacks — reuse prior findings instead of re-analyzing from scratch.
-
-```json
-{"tool": "lookup_function_optimization", "function_name": "functionName", "reason": "Check for cached function-level findings"}
-```
-
-This uses loose/fuzzy matching — partial function names work (e.g., "processData" matches "MyClass::processData"). You can optionally narrow by file path:
-
-```json
-{"tool": "lookup_function_optimization", "function_name": "drain", "file_path": "src/queue", "reason": "Find cached findings for drain functions in queue module"}
-```
-
-For callstack-level patterns (e.g., "is this dispatch pattern known to be inefficient?"):
-
-```json
-{"tool": "lookup_knowledge", "query": "dispatch queue blocking", "reason": "Check for prior callstack-level learnings"}
-```
-
-### Storing New Findings
-
-**Function-level findings are the PRIMARY storage unit.** A function appears in many callstacks — storing its optimization findings once makes them available everywhere that function is traced.
-
-**ALWAYS store function_optimization findings for every function you analyze:**
-
-```json
-{"tool": "store_function_optimization", "file_path": "relative/path/to/file.swift", "function_name": "MyClass::expensiveMethod", "summary": "O(n²) loop at line 45 — iterates all items for each lookup", "details": "The nested for-loop on lines 45-52 performs linear search inside a linear scan. Could be O(n) with a dictionary.", "severity": "high", "confidence": 0.9, "reason": "Cache finding for future traces hitting this function"}
-```
-
-For callstack-level learnings (patterns spanning multiple functions):
-
-```json
-{"tool": "store_learning", "entity_key": "dispatch_queue_drain_pattern", "summary": "Unnecessary queue hop between X and Y adds latency without benefit", "confidence": 0.85, "reason": "Persist callstack pattern learning"}
-```
-
-**Storage rules:**
-- `file_path`: Relative path from repo root (disambiguates same-named functions across files)
-- `function_name`: Exact function/method name as it appears in code
-- Store findings for EVERY function you analyze, even "no issues found" (with summary like "No performance issues identified in this function")
-- This prevents re-analysis of clean functions in future traces
-
----
-
 ## AVAILABLE TOOLS
 
-You have limited tools available during analysis (context was already collected):
+You have limited tools available during analysis (context was already collected). Use them only when the bundle is missing a specific piece you need to confirm a finding.
 
-- `readFile`: Read file contents if you need additional context
-- `runTerminalCmd`: Safe exploration commands
-- `getFileContentByLines`: Read specific line ranges
-- `lookup_knowledge`: Check for prior callstack-level learnings
-- `store_learning`: Persist callstack-level learnings for future analyses
-- `lookup_function_optimization`: Look up cached function-level optimization findings (uses fuzzy matching — partial names work)
-- `store_function_optimization`: Cache function-level optimization findings (keyed by file_path + function_name)
+| Priority | Tool | When to Use |
+|----------|------|-------------|
+| 1 | `lookup_knowledge` | **ALWAYS call first** before any `readFile`/`getFileContentByLines` for a frame the bundle doesn't already show. A prior trace may have already characterized it. |
+| 2 | `readFile` | Small files (< 5,000 chars) not already in the bundle, only after `lookup_knowledge` returned `[]` |
+| 3 | `checkFileSize` | Confirm file size and line count before `readFile` or `getFileContentByLines` |
+| 4 | `getFileContentByLines` / `getFileContent` | Targeted line ranges of a larger file |
+| 5 | `list_files` | Discover filenames when a referenced path is wrong or missing |
+| 6 | `runTerminalCmd` | Cross-file search (grep/find) as a last resort |
+| — | `store_knowledge` | **Record after** each frame/rule you relied on to reach a conclusion |
+
+### Knowledge store — mandatory workflow
+
+Bound to `subject='trace'` for this stage. The knowledge store is a persistent, project-wide cache of **general technical knowledge** — function contracts, threading models, lock patterns, ownership rules.
+
+**Before reading source outside the bundle:**
+
+1. **Call `lookup_knowledge` first** with the function name, file path, or a topic phrase. One tool, one query — FTS5 ranks across summary, entity_key, function_name, file_path in one pass.
+2. **If a fresh hit is returned**: use the stored summary — **do NOT call `readFile`/`getFileContentByLines`** for that frame.
+3. **If stale or empty**: read the source, then step 4.
+
+**Before returning your final output:**
+
+4. **Call `store_knowledge`** for every frame (especially leaf and repeated frames) whose behavior you relied on to reach your conclusion. Include a `behavior` note with line-anchored specifics when relevant (e.g. lock acquisition, allocation, sync boundaries). This is not optional — future traces through this frame inherit your understanding.
+
+**Store only general technical information — NOT bug findings or defects.** Defects belong in your output JSON.
 
 ### Tool Calling Format
 
@@ -157,7 +129,15 @@ You have limited tools available during analysis (context was already collected)
 **Examples:**
 
 ```json
-{"tool": "readFile", "path": "src/core/config.json", "reason": "Read small file for additional context"}
+{"tool": "lookup_knowledge", "query": "commitBatch src/io/Writer.swift", "reason": "Prior trace through this leaf may already describe its lock pattern"}
+```
+
+```json
+{"tool": "readFile", "path": "src/core/config.json", "reason": "Read small file for additional context after lookup_knowledge returned []"}
+```
+
+```json
+{"tool": "checkFileSize", "path": "src/core/MyClass.swift", "reason": "Check size and line count before reading"}
 ```
 
 ```json
@@ -165,23 +145,15 @@ You have limited tools available during analysis (context was already collected)
 ```
 
 ```json
+{"tool": "list_files", "path": "src/core", "recursive": false, "reason": "Find the correct filename when path lookup fails"}
+```
+
+```json
 {"tool": "runTerminalCmd", "command": "grep -rn 'MyFunction' --include='*.swift' .", "reason": "Find files containing this function name"}
 ```
 
 ```json
-{"tool": "lookup_function_optimization", "function_name": "functionName", "reason": "Check for cached function-level findings"}
-```
-
-```json
-{"tool": "store_function_optimization", "file_path": "relative/path/to/file.swift", "function_name": "MyClass::expensiveMethod", "summary": "O(n²) loop at line 45", "details": "Detailed description of the finding", "severity": "high", "confidence": 0.9, "reason": "Cache finding for future traces"}
-```
-
-```json
-{"tool": "lookup_knowledge", "query": "dispatch queue blocking", "reason": "Check for prior callstack-level learnings"}
-```
-
-```json
-{"tool": "store_learning", "entity_key": "dispatch_queue_drain_pattern", "summary": "Unnecessary queue hop adds latency", "confidence": 0.85, "reason": "Persist callstack pattern learning"}
+{"tool": "store_knowledge", "kind": "summary", "entity_key": "src/io/Writer.swift::commitBatch", "function_name": "commitBatch", "file_path": "src/io/Writer.swift", "checksum": "abc123", "summary": "Leaf: acquires _batchLock, flushes the writer, releases in defer.", "behavior": "LINE 108: _batchLock.lock(). LINE 118: defer _batchLock.unlock(). Blocking I/O on the current thread — not queued.", "confidence": 0.85, "reason": "Record leaf behavior for the next trace through this frame"}
 ```
 
 - Each tool call must be in its **own** fenced block.

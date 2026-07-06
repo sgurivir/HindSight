@@ -1145,7 +1145,7 @@ class ResultsRepository:
                         result.get('issueType') or result.get('category'),
                         result.get('description') or result.get('issue', ''),
                         result.get('Impact') or result.get('impact'),
-                        result.get('Potential solution') or result.get('potentialSolution') or result.get('suggestion'),
+                        result.get('suggestion') or result.get('potential_solution') or result.get('Potential solution') or result.get('potentialSolution'),
                         result.get('evidence', '')  # Extract evidence field
                     ))
                 

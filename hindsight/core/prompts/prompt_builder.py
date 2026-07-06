@@ -60,6 +60,7 @@ ANALYSIS_PROCESS_FILE = "analysisProcess.md"
 DIFF_CONTEXT_COLLECTION_PROCESS_FILE = "diffContextCollectionProcess.md"
 DIFF_ANALYSIS_PROCESS_FILE = "diffAnalysisProcess.md"
 CALL_TREE_ANALYSIS_PROCESS_FILE = "callTreeAnalysisProcess.md"
+CALL_TREE_CONTEXT_COLLECTION_PROCESS_FILE = "callTreeContextCollectionProcess.md"
 DIFF_CALL_TREE_ANALYSIS_PROCESS_FILE = "diffCallTreeAnalysisProcess.md"
 
 # Get logger using logUtil
@@ -536,46 +537,56 @@ class PromptBuilder:
                         result.append("//====================================================")
                         result.append("")
 
-                        # Try to look up data type body for used data types
-                        data_type_context = PromptBuilder._lookup_data_type_body(data_type_name, merged_data_types_data)
+                        # Resolve ALL definition sites for this data type.
+                        data_type_bodies = PromptBuilder._lookup_data_type_bodies(
+                            data_type_name, merged_data_types_data
+                        )
 
-                        if data_type_context and data_type_context.get('code'):
-                            # Found data type body - include it if < 300 lines
-                            data_type_code = data_type_context['code']
-                            data_type_file_path = data_type_context.get('file', 'Unknown')
-                            data_type_start_line = data_type_context.get('start_line')
-                            data_type_end_line = data_type_context.get('end_line')
+                        if data_type_bodies:
+                            # Primary location: emit full body (if <= 300 lines)
+                            # or just the file/line range for large types.
+                            primary = data_type_bodies[0]
+                            data_type_code = primary.get('code')
+                            data_type_file_path = primary.get('file', 'Unknown')
+                            data_type_start_line = primary.get('start_line')
+                            data_type_end_line = primary.get('end_line')
 
                             data_type_line_count = len(data_type_code.split('\n')) if data_type_code else 0
 
                             result.append(f"// Data Type - {data_type_name}")
                             result.append(f"// file : {data_type_file_path}")
 
-                            if data_type_line_count > 300:
-                                # Large data type - show only file path and line numbers
+                            if not data_type_code or data_type_line_count > 300:
                                 if data_type_start_line is not None:
                                     result.append(f"// start line number: {data_type_start_line}")
                                 if data_type_end_line is not None:
                                     result.append(f"// end line number: {data_type_end_line}")
                                 result.append("")
                             else:
-                                # Small data type - include full body
                                 result.append("")
-                                if data_type_code:
-                                    # Apply code context pruning and add line numbers with original line numbers
-                                    pruned_code = CodeContextPruner.prune_comments_simple(data_type_code)
-                                    if not has_line_number_prefix(pruned_code.split('\n')[0]):
-                                        # Use the same mechanism as file_util.py to preserve original line numbers
-                                        lines = pruned_code.split('\n')
-                                        if data_type_start_line is not None:
-                                            numbered_lines = [f"{data_type_start_line+i:4d} | {line}"
-                                                            for i, line in enumerate(lines)]
-                                            pruned_code = '\n'.join(numbered_lines)
-                                        else:
-                                            # Fallback to sequential numbering if start_line not available
-                                            pruned_code = CodeContextPruner.add_line_numbers(pruned_code, 1)
-                                    result.append(pruned_code)
-                                    result.append("")
+                                # Apply code context pruning and add line numbers
+                                # with original line numbers where available.
+                                pruned_code = CodeContextPruner.prune_comments_simple(data_type_code)
+                                if not has_line_number_prefix(pruned_code.split('\n')[0]):
+                                    lines = pruned_code.split('\n')
+                                    if data_type_start_line is not None:
+                                        numbered_lines = [f"{data_type_start_line+i:4d} | {line}"
+                                                        for i, line in enumerate(lines)]
+                                        pruned_code = '\n'.join(numbered_lines)
+                                    else:
+                                        pruned_code = CodeContextPruner.add_line_numbers(pruned_code, 1)
+                                result.append(pruned_code)
+                                result.append("")
+
+                            # Additional locations: list file + line range only.
+                            if len(data_type_bodies) > 1:
+                                result.append(f"// {data_type_name} is also defined in:")
+                                for extra in data_type_bodies[1:]:
+                                    result.append(
+                                        f"//   - {extra.get('file', 'Unknown')}:"
+                                        f"{extra.get('start_line', '?')}-{extra.get('end_line', '?')}"
+                                    )
+                                result.append("")
                         else:
                             # Data type body not found - show fallback message
                             result.append(f"// Data Type - {data_type_name}")
@@ -1030,10 +1041,120 @@ class PromptBuilder:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _format_additional_context(additional_context: Optional[Any]) -> str:
+        """Render the Step-1 English context as a trailing user-prompt block, or ''.
+
+        The block is intentionally minimal: a fixed lead-in line followed by the
+        collector's prose. No JSON, no headings, no internal-pipeline vocabulary —
+        the analysis prompt stays what it was, plus this paragraph.
+        """
+        if additional_context is None:
+            return ""
+        if isinstance(additional_context, str):
+            text = additional_context.strip()
+        else:
+            # Defensive: if a structured value slips through, stringify readably.
+            try:
+                text = json.dumps(additional_context, ensure_ascii=False).strip()
+            except (TypeError, ValueError):
+                text = str(additional_context).strip()
+        if not text:
+            return ""
+        return (
+            "\n\nAdditional content which you may find useful for analysis\n\n"
+            f"{text}\n"
+        )
+
+    @staticmethod
+    def build_call_tree_context_prompt(
+        tree_dict: Dict[str, Any],
+        config: Optional[Dict[str, Any]] = None,
+        user_provided_prompts: Optional[List[str]] = None,
+    ) -> Tuple[str, str]:
+        """Build (system_prompt, user_prompt) for the call-tree CONTEXT stage (Step 1).
+
+        This precedes ``build_call_tree_prompt``. The model retrieves prior
+        learnings (`lookup_knowledge`), resolves what the deterministic tree
+        omits (data-type definitions, constant values, stubbed bodies,
+        contracts), and records durable general knowledge (`store_knowledge`).
+        The system prompt is ``callTreeContextCollectionProcess.md``; the user
+        prompt embeds the same tree JSON the analysis stage will see.
+        """
+        try:
+            process_content = _read_package_file(CALL_TREE_CONTEXT_COLLECTION_PROCESS_FILE)
+            if not process_content:
+                logger.warning(
+                    f"{CALL_TREE_CONTEXT_COLLECTION_PROCESS_FILE} not found, using fallback"
+                )
+                process_content = FALLBACK_ANALYSIS_FROM_CONTEXT_SYSTEM
+
+            system_prompt = process_content
+
+            if config:
+                project_name = config.get("project_name", "")
+                project_description = config.get("description", "")
+                if project_name or project_description:
+                    system_prompt += "\n\n## Project Context\n\n"
+                    if project_name:
+                        system_prompt += f"**Project Name**: {project_name}\n\n"
+                    if project_description:
+                        system_prompt += f"**Project Description**: {project_description}\n\n"
+
+            if user_provided_prompts and any(p.strip() for p in user_provided_prompts):
+                system_prompt += "\n\n## Additional Focus Areas\n\n"
+                for i, prompt in enumerate(user_provided_prompts, 1):
+                    if prompt.strip():
+                        system_prompt += f"{i}. {prompt.strip()}\n\n"
+
+            root = tree_dict.get("root", {}) or {}
+            root_function = root.get("function", "unknown")
+            root_file = root.get("file", "unknown")
+            node_count = (tree_dict.get("stats") or {}).get("node_count", "?")
+
+            # Same enrichment the analysis stage gets, so definition sites for
+            # data types are visible to the collector too.
+            PromptBuilder._enrich_tree_data_types(tree_dict)
+
+            user_prompt = (
+                "## Call Tree for Context Collection\n\n"
+                f"**Root function**: `{root_function}` in `{root_file}`\n"
+                f"**Nodes in tree**: {node_count}\n\n"
+                "The JSON below is the entire call tree that will be analyzed in the next "
+                "step. Your job now is NOT to find bugs — it is to gather and record the "
+                "reusable technical context that the tree does not already contain: "
+                "definitions of the `data_types` referenced, values/meaning of key "
+                "`constants`, behavior of any stubbed node (`source_omitted_reason` present), "
+                "and cross-cutting invariants (threading, ownership, lifecycle, ordering). "
+                "Follow the knowledge-store workflow in the system prompt: `lookup_knowledge` "
+                "first, fetch only what is missing, then `store_knowledge` for each durable "
+                "fact.\n\n"
+                "```json\n"
+                f"{json.dumps(tree_dict, indent=2, ensure_ascii=False)}\n"
+                "```\n\n"
+                "When done, return ONLY a JSON object with an `additional_context` key whose "
+                "value is a plain-English description (a few short paragraphs) of what you "
+                "gathered — see the schema in the system prompt."
+            )
+
+            logger.info(
+                "Built call-tree context prompts - System: %d chars, User: %d chars",
+                len(system_prompt), len(user_prompt),
+            )
+            return system_prompt, user_prompt
+
+        except Exception as e:
+            logger.error(f"Error building call-tree context prompt: {e}")
+            return (
+                FALLBACK_ANALYSIS_FROM_CONTEXT_WITH_FORMAT,
+                f"Collect reusable context for this call tree:\n{json.dumps(tree_dict, indent=2)}",
+            )
+
+    @staticmethod
     def build_call_tree_prompt(
         tree_dict: Dict[str, Any],
         config: Optional[Dict[str, Any]] = None,
         user_provided_prompts: Optional[List[str]] = None,
+        additional_context: Optional[str] = None,
     ) -> Tuple[str, str]:
         """Build (system_prompt, user_prompt) for the call-tree analysis stage.
 
@@ -1042,6 +1163,12 @@ class PromptBuilder:
         context + user-provided prompts. The user prompt embeds the entire
         tree as a single JSON object and reminds the LLM of the JSON-array
         output contract.
+
+        ``additional_context`` is the plain-English description produced by the
+        preceding context-collection stage (Step 1). When present it is appended
+        verbatim to the end of the user prompt under a fixed lead-in line, so the
+        analysis prompt is otherwise byte-for-byte what it was before the
+        two-step split — only a trailing English paragraph is added.
         """
         try:
             process_content = _read_package_file(CALL_TREE_ANALYSIS_PROCESS_FILE)
@@ -1072,6 +1199,10 @@ class PromptBuilder:
             root_file = root.get("file", "unknown")
             node_count = (tree_dict.get("stats") or {}).get("node_count", "?")
 
+            # Enrich each node's `data_types` with definition sites (file + body
+            # when small) so the LLM doesn't have to re-fetch them via tools.
+            PromptBuilder._enrich_tree_data_types(tree_dict)
+
             user_prompt = (
                 "## Call Tree for Analysis\n\n"
                 f"**Root function**: `{root_function}` in `{root_file}`\n"
@@ -1079,7 +1210,10 @@ class PromptBuilder:
                 "The JSON below contains the entire call tree to analyze. Line numbers in "
                 "`source` fields are original source-file line numbers — cite them directly. "
                 "Nodes without a `source` field are stubs — fetch them with "
-                "`getFileContentByLines` if you need their body to confirm a defect.\n\n"
+                "`getFileContentByLines` if you need their body to confirm a defect. "
+                "Each node's `data_types` lists the types it references, with definition "
+                "sites (`locations[*].file`, `start_line`, `end_line`) and inline `code` "
+                "for small types.\n\n"
                 "```json\n"
                 f"{json.dumps(tree_dict, indent=2, ensure_ascii=False)}\n"
                 "```\n\n"
@@ -1087,6 +1221,10 @@ class PromptBuilder:
                 "prompt. Return ONLY a JSON array of issue objects, starting with `[` and "
                 "ending with `]`. If no defects meet the rubric, return exactly `[]`."
             )
+
+            collected_block = PromptBuilder._format_additional_context(additional_context)
+            if collected_block:
+                user_prompt += collected_block
 
             logger.info(
                 "Built call-tree prompts - System: %d chars, User: %d chars",
@@ -1145,6 +1283,10 @@ class PromptBuilder:
             bundle = dict(tree_dict)
             bundle["diff_context"] = diff_context
 
+            # Enrich each node's `data_types` with definition sites (file + body
+            # when small). Same behavior as the non-diff call-tree prompt.
+            PromptBuilder._enrich_tree_data_types(bundle)
+
             root = tree_dict.get("root", {}) or {}
             root_function = root.get("function", "unknown")
             root_file = root.get("file", "unknown")
@@ -1160,7 +1302,10 @@ class PromptBuilder:
                 "diff context. Lines beginning with `+ ` were added, `- ` were removed, "
                 "`  ` are unchanged context. Cite original source line numbers in your output. "
                 "Nodes without a `source` field are stubs — fetch them with "
-                "`getFileContentByLines` if you need their body to confirm a defect.\n\n"
+                "`getFileContentByLines` if you need their body to confirm a defect. "
+                "Each node's `data_types` lists the types it references, with definition "
+                "sites (`locations[*].file`, `start_line`, `end_line`) and inline `code` "
+                "for small types.\n\n"
                 "```json\n"
                 f"{json.dumps(bundle, indent=2, ensure_ascii=False)}\n"
                 "```\n\n"
@@ -1689,3 +1834,217 @@ class PromptBuilder:
                 return context
 
         return None
+
+    @staticmethod
+    def _load_merged_data_types_data() -> Optional[Dict[str, Any]]:
+        """Load merged_defined_classes.json from the configured artifacts dir."""
+        try:
+            output_provider = get_output_directory_provider()
+            artifacts_dir = output_provider.get_repo_artifacts_dir()
+            path = f"{artifacts_dir}/code_insights/merged_defined_classes.json"
+            if not os.path.exists(path):
+                logger.debug(f"merged_defined_classes.json not found at {path}")
+                return None
+            return read_json_file(path)
+        except Exception as e:
+            logger.debug(f"Failed to load merged data types data: {e}")
+            return None
+
+    @staticmethod
+    def _build_data_type_locations_lookup(
+        merged_data_types_data: Optional[Dict[str, Any]]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Build name -> [{file, start, end}] preserving ALL locations per type.
+
+        Handles both schema variants: `data_type_to_location_and_checksum`
+        (from language helpers, with per-file code) and `data_type_to_location`
+        (from ast_merger, locations only).
+        """
+        lookup: Dict[str, List[Dict[str, Any]]] = {}
+        if not isinstance(merged_data_types_data, dict):
+            return lookup
+
+        entries = merged_data_types_data.get('data_type_to_location_and_checksum')
+        if isinstance(entries, dict):
+            for dt_name, dt_info in entries.items():
+                if not isinstance(dt_info, dict):
+                    continue
+                code_locations = dt_info.get('code')
+                if not isinstance(code_locations, list):
+                    continue
+                locs: List[Dict[str, Any]] = []
+                for loc in code_locations:
+                    if not isinstance(loc, dict):
+                        continue
+                    file_name = loc.get('file_name', '')
+                    if not file_name:
+                        continue
+                    locs.append({
+                        'file': file_name,
+                        'start': loc.get('start', 0),
+                        'end': loc.get('end', 0),
+                    })
+                if locs:
+                    lookup[dt_name] = locs
+                    normalized = PromptBuilder._normalize_data_type_name(dt_name)
+                    if normalized and normalized != dt_name:
+                        lookup.setdefault(normalized, locs)
+
+        # Fallback: `data_type_to_location` schema (from ast_merger). File
+        # entries here look like {"file_name": ..., "start": ..., "end": ...}
+        # inside a `files` list keyed by `data_type_name`.
+        location_only = merged_data_types_data.get('data_type_to_location')
+        if isinstance(location_only, list):
+            for entry in location_only:
+                if not isinstance(entry, dict):
+                    continue
+                dt_name = entry.get('data_type_name', '')
+                if not dt_name or dt_name in lookup:
+                    continue
+                files = entry.get('files', [])
+                if not isinstance(files, list):
+                    continue
+                locs = []
+                for loc in files:
+                    if not isinstance(loc, dict):
+                        continue
+                    file_name = loc.get('file_name', '')
+                    if not file_name:
+                        continue
+                    locs.append({
+                        'file': file_name,
+                        'start': loc.get('start', 0),
+                        'end': loc.get('end', 0),
+                    })
+                if locs:
+                    lookup[dt_name] = locs
+                    normalized = PromptBuilder._normalize_data_type_name(dt_name)
+                    if normalized and normalized != dt_name:
+                        lookup.setdefault(normalized, locs)
+
+        return lookup
+
+    @staticmethod
+    def _lookup_data_type_bodies(
+        data_type_name: str,
+        merged_data_types_data: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return ALL definition sites for a data type.
+
+        Each entry has ``file``, ``start_line``, ``end_line``, and ``code``
+        (or ``code=None`` when the body could not be read). Returns an empty
+        list if the type isn't found.
+        """
+        try:
+            try:
+                file_provider = FileContentProvider.get()
+            except RuntimeError:
+                logger.debug("FileContentProvider not available for data type lookup")
+                file_provider = None
+
+            if merged_data_types_data is None:
+                merged_data_types_data = PromptBuilder._load_merged_data_types_data()
+            if not merged_data_types_data:
+                return []
+
+            lookup = PromptBuilder._build_data_type_locations_lookup(merged_data_types_data)
+            locations = PromptBuilder._find_data_type_context_in_lookup(data_type_name, lookup)
+            if not locations:
+                return []
+            if isinstance(locations, dict):
+                # Backward-compat: singular-shape value.
+                locations = [locations]
+
+            results: List[Dict[str, Any]] = []
+            for loc in locations:
+                file_path = loc.get('file')
+                start_line = loc.get('start')
+                end_line = loc.get('end')
+                entry = {
+                    'file': file_path,
+                    'start_line': start_line,
+                    'end_line': end_line,
+                    'code': None,
+                }
+                if not file_provider or not file_path or start_line is None or end_line is None:
+                    results.append(entry)
+                    continue
+                filename = os.path.basename(file_path)
+                resolved = file_provider.guess_path(filename) or file_provider.resolve_file_path(filename)
+                if not resolved:
+                    results.append(entry)
+                    continue
+                full_content = file_provider.read_text(resolved)
+                if not full_content:
+                    results.append(entry)
+                    continue
+                lines = full_content.split('\n')
+                if start_line < 1 or end_line < 1 or start_line > len(lines) or end_line > len(lines):
+                    results.append(entry)
+                    continue
+                entry['code'] = '\n'.join(lines[start_line - 1:end_line])
+                results.append(entry)
+            return results
+        except Exception as e:
+            logger.debug(f"Error looking up data type bodies for {data_type_name}: {e}")
+            return []
+
+    @staticmethod
+    def _enrich_tree_data_types(
+        tree_dict: Dict[str, Any],
+        merged_data_types_data: Optional[Dict[str, Any]] = None,
+        max_inline_lines: int = 300,
+    ) -> None:
+        """Rewrite each node's ``data_types`` from ``[name]`` to
+        ``[{name, locations: [{file, start_line, end_line, code}]}]``.
+
+        Bodies larger than ``max_inline_lines`` are dropped (``code=None``);
+        the file path and line range are always kept so the LLM knows where
+        to look. Missing types collapse to ``locations=[]``. Operates in
+        place on the dict produced by ``CallTree.to_dict()``.
+        """
+        if not isinstance(tree_dict, dict):
+            return
+        nodes = tree_dict.get('nodes')
+        if not isinstance(nodes, list) or not nodes:
+            return
+
+        if merged_data_types_data is None:
+            merged_data_types_data = PromptBuilder._load_merged_data_types_data()
+        # Even without merged data, we still normalize the shape so downstream
+        # consumers see a consistent structure.
+
+        cache: Dict[str, List[Dict[str, Any]]] = {}
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            names = node.get('data_types')
+            if not isinstance(names, list) or not names:
+                continue
+            enriched: List[Dict[str, Any]] = []
+            seen: set = set()
+            for raw in names:
+                name = raw if isinstance(raw, str) else (raw.get('name') if isinstance(raw, dict) else None)
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                if name in cache:
+                    bodies = cache[name]
+                else:
+                    bodies = PromptBuilder._lookup_data_type_bodies(name, merged_data_types_data)
+                    cache[name] = bodies
+                locations = []
+                for b in bodies:
+                    loc = {
+                        'file': b.get('file'),
+                        'start_line': b.get('start_line'),
+                        'end_line': b.get('end_line'),
+                    }
+                    code = b.get('code')
+                    if code:
+                        line_count = code.count('\n') + 1
+                        if line_count <= max_inline_lines:
+                            loc['code'] = code
+                    locations.append(loc)
+                enriched.append({'name': name, 'locations': locations})
+            node['data_types'] = enriched
