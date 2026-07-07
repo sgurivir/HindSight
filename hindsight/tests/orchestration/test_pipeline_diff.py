@@ -129,7 +129,7 @@ class StubPublisher:
 def session_pub_sink(tmp_path):
     ctx = AnalysisContext.from_config(
         repo_path=str(tmp_path / "repo"),
-        config={"model": "claude-sonnet-4-5", "code_analyzer_workers": 2},
+        config={"model": "claude-sonnet-4-5", "max_analysis_workers": 2},
         output_base_dir=str(tmp_path / "out"),
         api_key="dummy",
     )

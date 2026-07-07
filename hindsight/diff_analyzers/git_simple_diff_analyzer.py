@@ -1662,6 +1662,13 @@ Examples:
     )
 
     parser.add_argument(
+        "--max-analysis-workers",
+        type=int,
+        default=1,
+        help="Number of functions/chunks analyzed concurrently (LLM analysis fan-out). Overrides 'max_analysis_workers' in the config. Default: 1"
+    )
+
+    parser.add_argument(
         "--generate-report-from-existing-issues",
         action="store_true",
         help="Generate HTML report from existing analysis files without running analysis. Requires --config to locate artifacts."
@@ -1689,6 +1696,11 @@ Examples:
         from ..analyzers.token_tracker import TokenTracker
         
         config = load_and_validate_config(args.config)
+
+        # Set the analysis fan-out (concurrent function/chunk analyses).
+        # CLI-authoritative; becomes AnalysisContext.max_workers. Default 1.
+        config['max_analysis_workers'] = args.max_analysis_workers
+        print(f"🔧 Using max_analysis_workers: {args.max_analysis_workers}")
 
         if args.generate_report_from_existing_issues:
             if not args.config:

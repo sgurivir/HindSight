@@ -145,7 +145,7 @@ class AnalysisContext:
             model=str(config_get("model", DEFAULT_LLM_MODEL)),
             max_tokens=int(config_get("max_tokens", DEFAULT_MAX_TOKENS)),
             max_workers=int(
-                config_get("code_analyzer_workers", CODE_ANALYZER_DEFAULT_WORKERS)
+                config_get("max_analysis_workers", CODE_ANALYZER_DEFAULT_WORKERS)
             ),
             rate_limit=int(config_get("code_analyzer_rate_limit", LLM_PROVIDER_RATE_LIMIT)),
             rate_window_seconds=int(

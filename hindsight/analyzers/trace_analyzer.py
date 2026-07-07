@@ -507,7 +507,8 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
 
         self.logger.info(
             f"Generated prompts for {len(work_items)} callstacks; "
-            f"starting async pipeline with {TRACE_ANALYZER_DEFAULT_WORKERS} workers"
+            f"starting async pipeline with "
+            f"{config.get('max_analysis_workers', TRACE_ANALYZER_DEFAULT_WORKERS)} workers"
         )
 
         # Drive the async pipeline.
@@ -555,12 +556,7 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
 
         analysis_ctx = AnalysisContext.from_config(
             repo_path=self.repo_path,
-            config={
-                **config,
-                "code_analyzer_workers": config.get(
-                    "trace_analyzer_workers", TRACE_ANALYZER_DEFAULT_WORKERS
-                ),
-            },
+            config=config,
             output_base_dir=output_base,
             api_key=api_key,
         )
@@ -1059,7 +1055,7 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             return False
 
 
-    def run(self, config_file: str, repo_path: str, hotspot_file: str, out_dir: str, num_traces_to_analyze: int = 100, batch_index: int = 0, issue_dedupe_keyword: str = None):
+    def run(self, config_file: str, repo_path: str, hotspot_file: str, out_dir: str, num_traces_to_analyze: int = 100, batch_index: int = 0, issue_dedupe_keyword: str = None, max_analysis_workers: int = 1):
         """Main entry point for the Trace Analysis tool."""
         try:
             # Store parameters for use in other methods
@@ -1073,6 +1069,11 @@ class TraceAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysi
             self.logger.info(f"Loading configuration from: {config_file}")
             config = load_config_tolerant(config_file)
             config['issue_dedupe_keyword'] = issue_dedupe_keyword
+
+            # Set the analysis fan-out (concurrent callstack analyses).
+            # CLI-authoritative; becomes AnalysisContext.max_workers. Default 1.
+            config['max_analysis_workers'] = max_analysis_workers
+            self.logger.info(f"Using max_analysis_workers: {max_analysis_workers}")
 
             # Skip analytics session - using centralized TokenTracker instead
             # self._start_analytics_session(repo_path)
@@ -1277,6 +1278,12 @@ def main():
         metavar="KEYWORD",
         help="Run radar deduplication: download radars matching KEYWORD, then highlight matching issues in the HTML report"
     )
+    parser.add_argument(
+        "--max-analysis-workers",
+        type=int,
+        default=1,
+        help="Number of traces/callstacks analyzed concurrently (LLM analysis fan-out). Overrides 'max_analysis_workers' in the config. Default: 1"
+    )
 
     args = parser.parse_args()
 
@@ -1333,6 +1340,7 @@ def main():
             num_traces_to_analyze=args.num_traces_to_analyze,
             batch_index=args.batch_index,
             issue_dedupe_keyword=args.issue_dedupe,
+            max_analysis_workers=args.max_analysis_workers,
         )
 
     # Print token usage summary after analysis

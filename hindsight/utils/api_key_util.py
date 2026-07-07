@@ -8,6 +8,7 @@ with automatic token refresh support for long-running analyses.
 
 import logging
 import subprocess
+import threading
 import time
 from typing import Optional, Callable
 
@@ -121,6 +122,12 @@ class AppleConnectTokenManager:
         self._current_token: Optional[str] = None
         self._token_acquired_at: Optional[float] = None
         self._is_apple_connect_token = False
+        # Guards the check-then-act refresh path. The async LLM client calls
+        # refresh_auth_if_needed() -> get_token() from many worker threads
+        # (via asyncio.to_thread) against this singleton; without a lock,
+        # concurrent needs_refresh()/refresh_token() races fire redundant
+        # `appleconnect` subprocesses and can interleave token/header writes.
+        self._refresh_lock = threading.Lock()
         self._initialized = True
         
         self._logger.debug(
@@ -167,14 +174,19 @@ class AppleConnectTokenManager:
     def refresh_token(self) -> Optional[str]:
         """
         Force refresh the AppleConnect token.
-        
+
         Returns:
             str: New token if successful, None otherwise
         """
         if self._is_using_static_api_key():
             self._logger.debug("Using static API key, no refresh needed")
             return self._config_api_key
-        
+
+        with self._refresh_lock:
+            return self._refresh_token_locked()
+
+    def _refresh_token_locked(self) -> Optional[str]:
+        """Refresh body; caller must hold `self._refresh_lock`."""
         self._logger.debug("Refreshing AppleConnect token...")
         new_token = get_apple_connect_token()
 
@@ -187,26 +199,28 @@ class AppleConnectTokenManager:
         else:
             self._logger.warning("Failed to refresh AppleConnect token")
             return self._current_token  # Return old token if refresh fails
-    
+
     def get_token(self) -> Optional[str]:
         """
         Get the current token, refreshing if necessary.
-        
+
         This is the main method to use for getting tokens. It automatically
         handles refresh logic based on token age.
-        
+
         Returns:
             str: Current valid token, or None if unavailable
         """
-        # Static API key - return directly
+        # Static API key - return directly (no lock needed; immutable).
         if self._is_using_static_api_key():
             return self._config_api_key
-        
-        # Check if we need to refresh
-        if self.needs_refresh():
-            return self.refresh_token()
-        
-        return self._current_token
+
+        # Serialize the check-then-act so concurrent callers don't each kick
+        # off their own `appleconnect` subprocess. Re-check under the lock:
+        # a peer thread may have refreshed while we were blocked.
+        with self._refresh_lock:
+            if self.needs_refresh():
+                return self._refresh_token_locked()
+            return self._current_token
     
     def get_token_age_seconds(self) -> Optional[float]:
         """

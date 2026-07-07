@@ -86,7 +86,7 @@ class FakePerfLLM(AsyncLLMClient):
 def session(tmp_path):
     ctx = AnalysisContext.from_config(
         repo_path=str(tmp_path / "repo"),
-        config={"model": "claude-sonnet-4-5", "code_analyzer_workers": 2},
+        config={"model": "claude-sonnet-4-5", "max_analysis_workers": 2},
         output_base_dir=str(tmp_path / "out"),
         api_key="dummy",
     )
@@ -98,7 +98,7 @@ def session_serial(tmp_path):
     """Single-worker session for tests that need deterministic ordering."""
     ctx = AnalysisContext.from_config(
         repo_path=str(tmp_path / "repo"),
-        config={"model": "claude-sonnet-4-5", "code_analyzer_workers": 1},
+        config={"model": "claude-sonnet-4-5", "max_analysis_workers": 1},
         output_base_dir=str(tmp_path / "out"),
         api_key="dummy",
     )

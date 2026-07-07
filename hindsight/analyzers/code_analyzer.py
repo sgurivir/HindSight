@@ -1782,7 +1782,8 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             num_functions_to_analyze: int = DEFAULT_NUM_FUNCTIONS_TO_ANALYZE,
             force_in_process_ast: bool = False,
             use_parallel: bool = True,
-            max_workers: int = None):
+            max_workers: int = None,
+            max_analysis_workers: int = 1):
 
         """
         Main entry point for the Hindsight Analysis tool.
@@ -1803,7 +1804,8 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             num_functions_to_analyze: Maximum number of functions to analyze (default: 300)
             force_in_process_ast: Force AST generation to run in-process instead of using subprocess (default: False)
             use_parallel: Whether to use parallel processing for AST generation (default: True)
-            max_workers: Maximum number of worker processes for parallel processing (default: None, uses system default)
+            max_workers: Maximum number of worker processes for parallel AST generation (default: None, uses system default)
+            max_analysis_workers: Number of functions analyzed concurrently — the LLM analysis fan-out. Sets config['max_analysis_workers'] (default: 1)
         """
 
         computed_include_directories, computed_exclude_directories = self.merge_include_exclude_directories_from_config_and_params(config_dict, include_directories, exclude_directories)
@@ -1826,6 +1828,7 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
         self.logger.info(f"  force_in_process_ast: {force_in_process_ast}")
         self.logger.info(f"  use_parallel: {use_parallel}")
         self.logger.info(f"  max_workers: {max_workers}")
+        self.logger.info(f"  max_analysis_workers: {max_analysis_workers}")
 
         # Store the force_in_process_ast parameter
         self.force_in_process_ast = force_in_process_ast
@@ -1929,6 +1932,12 @@ class CodeAnalysisRunner(UnifiedIssueFilterMixin, ReportGeneratorMixin, Analysis
             # Set num_functions_to_analyze in config
             config['num_functions_to_analyze'] = num_functions_to_analyze
             self.logger.info(f"Using num_functions_to_analyze: {num_functions_to_analyze}")
+
+            # Set the analysis fan-out (concurrent function analyses). This
+            # becomes AnalysisContext.max_workers, which bounds the pipeline's
+            # bounded_gather concurrency. CLI-authoritative; default is 1.
+            config['max_analysis_workers'] = max_analysis_workers
+            self.logger.info(f"Using max_analysis_workers: {max_analysis_workers}")
 
             # Set repo_path in config for compatibility with existing code
             config['path_to_repo'] = repo_path
@@ -2413,10 +2422,16 @@ EXAMPLES:
         help="Disable parallel AST generation. By default, AST generation uses multiple processes for better performance."
     )
     parser.add_argument(
-        "--max-workers",
+        "--max-ast-workers",
         type=int,
         default=None,
         help="Maximum number of worker processes for parallel AST generation (default: 4 or CPU count, whichever is smaller)"
+    )
+    parser.add_argument(
+        "--max-analysis-workers",
+        type=int,
+        default=1,
+        help="Number of functions analyzed concurrently (LLM analysis fan-out). Overrides 'max_analysis_workers' in the config. Default: 1"
     )
 
     args = parser.parse_args()
@@ -2531,7 +2546,8 @@ EXAMPLES:
                 num_functions_to_analyze=args.num_functions_to_analyze,
                 force_in_process_ast=args.force_in_process_ast,
                 use_parallel=not args.no_parallel,
-                max_workers=args.max_workers,
+                max_workers=args.max_ast_workers,
+                max_analysis_workers=args.max_analysis_workers,
                 )
 
     # Generate report after analysis completes (for standalone usage)

@@ -248,7 +248,7 @@ class PerfAnalysisRunner(ReportGeneratorMixin, AnalysisRunner):
                 **config,
                 # Surface the perf-specific worker limit so AnalysisContext
                 # picks it up (defaults to PERF_DEFAULT_MAX_WORKERS).
-                "code_analyzer_workers": config.get(
+                "max_analysis_workers": config.get(
                     "max_concurrent_analyses", PERF_DEFAULT_MAX_WORKERS
                 ),
             },

@@ -88,7 +88,7 @@ def _build_session(tmp_path):
 
     ctx = AnalysisContext.from_config(
         repo_path=str(repo),
-        config={"model": "claude-sonnet-4-5", "code_analyzer_workers": 1},
+        config={"model": "claude-sonnet-4-5", "max_analysis_workers": 1},
         output_base_dir=str(tmp_path / "out"),
         api_key="dummy",
     )
@@ -210,7 +210,7 @@ async def test_no_store_no_prior_block(tmp_path):
     )
     ctx = AnalysisContext.from_config(
         repo_path=str(repo),
-        config={"model": "claude-sonnet-4-5", "code_analyzer_workers": 1},
+        config={"model": "claude-sonnet-4-5", "max_analysis_workers": 1},
         output_base_dir=str(tmp_path / "out"),
         api_key="dummy",
     )

@@ -35,9 +35,10 @@ R = TypeVar("R")
 class WorkerOutcome(Generic[T, R]):
     """Result of one worker invocation.
 
-    Exactly one of `result` and `error` is set. `duration_seconds` is the
-    wall-clock cost of the worker including waits on the semaphore and rate
-    limiter (so it's a useful telemetry signal for throughput tuning).
+    Exactly one of `result` and `error` is set. `duration_seconds` is measured
+    from just after the semaphore is acquired, so it covers the rate-limiter
+    wait plus the `fn` call itself but NOT time spent queued on the semaphore
+    (still a useful telemetry signal for throughput tuning).
     """
 
     item: T
@@ -49,7 +50,6 @@ class WorkerOutcome(Generic[T, R]):
     @property
     def ok(self) -> bool:
         return self.error is None
-
 
 async def bounded_gather(
     items: List[T],

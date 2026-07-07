@@ -43,9 +43,27 @@ Your response **MUST start with `[` and end with `]`**. No markdown, no prose, n
 - Report ONLY issues with **confidence ≥ 0.8**.
 - Report ONLY `logicBug` and `performance` categories.
 - Do NOT report speculative, theoretical, or stylistic issues. If any required fact is not directly supported by the provided code or verified tool output, return `[]` instead of inferring it.
-- Do NOT report memory safety issues (null dereference, bounds checking, buffer overflow, use-after-free). Assume runtime values are safe.
+- Do NOT report memory-safety or input-validity issues — this is a HARD BLOCK. See "MEMORY SAFETY & INPUT VALIDITY — HARD BLOCK" and "LANGUAGE SEMANTICS — VERIFY BEFORE FLAGGING" below. Assume runtime values are safe.
 - Do NOT suggest caching mechanisms.
 - Every issue MUST cite an exact caller line number — the line in the affected caller where the defect's effect manifests. Without that line cite, drop the issue.
+
+### 🚫 MEMORY SAFETY & INPUT VALIDITY — HARD BLOCK
+
+You MUST assume all code operates in a memory-safe environment where **all runtime values are inherently safe and valid**, **all pointers and references are valid and non-null**, and **all array accesses are within bounds**. Do NOT analyze, flag, report, or mention:
+
+- Out-of-bounds access or array index violations — report a bounds issue ONLY when there is a clear, explicit off-by-one error in the code shown; never a generic "could exceed" / "might overflow the buffer" concern.
+- Buffer overflows or underflows.
+- Null / nil pointer dereferences, missing null checks of any kind, or optional-unwrapping issues — regardless of context.
+- Uninitialized variables, use-after-free, or dangling pointers.
+- Unsafe casting that could fail on null or invalid types.
+- Any finding whose failure mode requires the input data to be null, empty, invalid, or malformed.
+- Any memory safety concern whatsoever.
+
+These are NOT reportable defects: they only manifest when invalid data is exercised, which contradicts the safe-runtime assumption above. If a staged finding's impact depends on any such condition, drop it (return `[]` for it).
+
+### 🔍 LANGUAGE SEMANTICS — VERIFY BEFORE FLAGGING
+
+Before reporting any issue, confirm the programming language's actual semantics for the construct in question. Different languages handle edge cases differently — e.g. messaging `nil` objects, default values, implicit conversions, heterogeneous operator overloads (such as C++ `std::optional<T>` compared against `T`). Research the real behavior — using tools if needed — before flagging. If language semantics make the pattern safe, drop the finding.
 
 ### ⛔ CRITICAL: Repository Boundary Constraint
 
@@ -181,7 +199,9 @@ A defect that lives entirely inside a single in-tree function (no callee involve
 
 - Defects in a callee that no in-tree caller is affected by (caller doesn't use the broken output, handles the error, can't reach the buggy branch). **Skip silently.**
 - Defects in stubbed callees that you cannot verify with tools. If a body wasn't provided and a quick `getFileContentByLines` doesn't confirm the defect, skip.
-- Memory safety issues of any kind.
+- Memory safety issues of any kind (null/nil dereference, missing null checks, out-of-bounds, buffer overflow, uninitialized values, unsafe casts) — see the HARD BLOCK above.
+- Findings whose impact requires null, empty, invalid, or malformed input data.
+- Patterns that are safe under the language's actual semantics (nil-messaging, default values, implicit conversions, heterogeneous operator overloads).
 - Stylistic / naming / documentation / dead-code issues.
 - Defensive-programming patterns (unused enum cases, unreachable defaults, guarded edge cases).
 - Caching recommendations.

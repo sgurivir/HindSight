@@ -1939,6 +1939,36 @@ def generate_dropped_issues_html_report(dropped_issues, output_file=None, projec
             border-color: #f59e0b;
         }}
 
+        .copy-btn {{
+            background: #d97706; /* amber-600 */
+            color: #fff;
+            border: none;
+            border-radius: 12px;
+            padding: 4px 10px;
+            font-size: 0.8em;
+            cursor: pointer;
+            margin-left: 15px;
+            transition: background-color 0.2s ease;
+            font-weight: 600;
+            height: 24px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }}
+
+        .copy-btn:hover {{
+            background: #b45309; /* amber-700 */
+        }}
+
+        .copy-btn:active {{
+            background: #92400e; /* amber-800 */
+            transform: translateY(1px);
+        }}
+
+        .copy-btn.copied {{
+            background: #16a34a; /* green-600 */
+        }}
+
         .issues-container {{
             padding: 30px;
             display: grid;
@@ -2134,7 +2164,10 @@ def generate_dropped_issues_html_report(dropped_issues, output_file=None, projec
                 <h1>🗑️ {analysis_type}</h1>
                 <div style="display: flex; align-items: center; font-size: 1.1em; opacity: 0.9;">
                     <span style="flex: 0 0 50%;">{repository_text}</span>
-                    <span style="flex: 0 0 50%; text-align: right;">{date_text}</span>
+                    <span style="flex: 0 0 50%; text-align: right; display: flex; align-items: center; justify-content: flex-end;">
+                        {date_text}
+                        <button class="copy-btn" onclick="copyAllDroppedIssues()">Copy All</button>
+                    </span>
                 </div>
             </div>
 
@@ -2285,6 +2318,9 @@ def generate_dropped_issues_html_report(dropped_issues, output_file=None, projec
             directory: 'all'
         }};
 
+        // Stores the issues matching the current filters (for Copy All functionality)
+        let allFilteredIssues = droppedIssuesData.issues;
+
         function getIssueDirectory(filePath) {{
             if (!filePath) return 'uncategorized';
             if (filePath === "Unknown") return "Unknown";
@@ -2319,6 +2355,9 @@ def generate_dropped_issues_html_report(dropped_issues, output_file=None, projec
             }}
             
             renderDroppedIssues(filteredIssues);
+
+            // Remember what's currently shown so Copy All respects the active filters
+            allFilteredIssues = filteredIssues;
         }}
 
         function filterByLevel(level) {{
@@ -2329,6 +2368,81 @@ def generate_dropped_issues_html_report(dropped_issues, output_file=None, projec
         function filterByDirectory(directory) {{
             currentFilters.directory = directory;
             applyFilters();
+        }}
+
+        function copyAllDroppedIssues() {{
+            // Use allFilteredIssues which contains ALL dropped issues matching the
+            // current filters (level + directory selection)
+            const issuesToCopy = allFilteredIssues.length > 0 ? allFilteredIssues : droppedIssuesData.issues;
+
+            if (issuesToCopy.length === 0) {{
+                alert('No dropped issues to copy');
+                return;
+            }}
+
+            const separator = '\\n======================\\n';
+
+            const formattedIssues = issuesToCopy.map(droppedIssue => {{
+                const originalIssue = droppedIssue.original_issue || droppedIssue.results?.[0] || {{}};
+
+                const level = getLevelFromIssue(droppedIssue);
+                const levelName = getLevelDisplayName(level);
+                const filterType = droppedIssue.filter_type || 'Unknown';
+                const reason = (droppedIssue.reason || 'No reason provided').replace(/<br\s*\/?>/gi, '\\n');
+
+                const filePath = originalIssue.file_path || originalIssue.filePath || 'Unknown';
+                const functionName = originalIssue.function_name || originalIssue.functionName || 'Unknown';
+                const category = originalIssue.category || 'Unknown';
+                const severity = originalIssue.severity || 'Unknown';
+                const lineNumber = originalIssue.lines || originalIssue.line_number || originalIssue.lineNumber || 'N/A';
+                const issueText = (originalIssue.issue || 'No description available').replace(/<br\s*\/?>/gi, '\\n');
+                const suggestion = (originalIssue.suggestion || 'No suggestion provided').replace(/<br\s*\/?>/gi, '\\n');
+
+                return `Title:\\n${{issueText}}
+
+Dropped At: ${{levelName}}
+Filter Type: ${{filterType}}
+Severity: ${{severity}}
+Category: ${{category}}
+File: ${{filePath}}
+Function: ${{functionName}}
+Lines: ${{lineNumber}}
+
+Reason for Dropping:\\n${{reason}}
+
+Original Suggestion:\\n${{suggestion}}`;
+            }}).join(separator);
+
+            navigator.clipboard.writeText(formattedIssues).then(() => {{
+                const button = event.target;
+                const originalText = button.textContent;
+                button.textContent = 'Copied!';
+                button.classList.add('copied');
+
+                setTimeout(() => {{
+                    button.textContent = originalText;
+                    button.classList.remove('copied');
+                }}, 2000);
+            }}).catch(err => {{
+                console.error('Failed to copy: ', err);
+                // Fallback for older browsers
+                const textArea = document.createElement('textarea');
+                textArea.value = formattedIssues;
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+
+                const button = event.target;
+                const originalText = button.textContent;
+                button.textContent = 'Copied!';
+                button.classList.add('copied');
+
+                setTimeout(() => {{
+                    button.textContent = originalText;
+                    button.classList.remove('copied');
+                }}, 2000);
+            }});
         }}
 
         // Initialize

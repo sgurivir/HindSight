@@ -124,7 +124,7 @@ def session_and_sink(tmp_path):
     """
     ctx = AnalysisContext.from_config(
         repo_path=str(tmp_path / "repo"),
-        config={"model": "claude-sonnet-4-5", "code_analyzer_workers": 2},
+        config={"model": "claude-sonnet-4-5", "max_analysis_workers": 2},
         output_base_dir=str(tmp_path / "out"),
         api_key="dummy",
     )
@@ -555,7 +555,7 @@ async def test_call_tree_groups_issues_by_defect_function(tmp_path):
         repo_path=str(tmp_path / "repo"),
         config={
             "model": "claude-sonnet-4-5",
-            "code_analyzer_workers": 2,
+            "max_analysis_workers": 2,
             "call_tree_analysis_enabled": True,
         },
         output_base_dir=str(tmp_path / "out"),

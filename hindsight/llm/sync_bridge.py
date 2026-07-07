@@ -26,6 +26,12 @@ from .client import AsyncLLMClient
 from .iterate import IterativeRunner, ToolExecutor
 from .stages import StageSpec
 
+# Per-batch fan-out cap for `run_many`. The bridge has no rate limiter of its
+# own (unlike the async pipeline's `bounded_gather`), and each filter batch
+# already runs inside one of the pipeline's `max_workers` function analyses,
+# so keep the inner concurrency modest to avoid multiplying up into 429s.
+DEFAULT_STAGE_CONCURRENCY = 5
+
 
 class SyncStageRunner:
     """Run one or more stage calls from sync code.
@@ -33,11 +39,18 @@ class SyncStageRunner:
     Spins up a fresh `AsyncLLMClient` + event loop per `run` / `run_many`
     invocation, then closes them cleanly. For batch verdicts (the common
     filter case) call `run_many` once so the httpx pool is amortized over
-    every issue in the batch.
+    every issue in the batch — and the prompts run concurrently under a
+    bounded semaphore.
     """
 
-    def __init__(self, client_config: LLMClientConfig):
+    def __init__(
+        self,
+        client_config: LLMClientConfig,
+        *,
+        max_concurrency: int = DEFAULT_STAGE_CONCURRENCY,
+    ):
         self._config = client_config
+        self._max_concurrency = max(1, int(max_concurrency))
 
     def run(
         self,
@@ -61,32 +74,50 @@ class SyncStageRunner:
         tools: Optional[ToolExecutor] = None,
         max_iterations: Optional[int] = None,
     ) -> List[Optional[Any]]:
-        """Run the stage once per prompt, sequentially. Returns parsed values.
+        """Run the stage once per prompt, concurrently. Returns parsed values.
 
-        Each slot is `None` if that call returned no usable result; that's a
-        soft failure — callers should treat it as "keep the issue / no
-        verdict" (the legacy code does this).
+        Prompts run under a bounded semaphore (`max_concurrency`) against one
+        shared client; results are returned in input order so callers can zip
+        them back to their inputs. Each slot is `None` if that call returned no
+        usable result; that's a soft failure — callers should treat it as
+        "keep the issue / no verdict" (the legacy code does this).
+
+        Concurrency is safe: `IterativeRunner.run` builds a fresh
+        `ConversationState` per call, no conversation logger is attached, and
+        any `tools` executor already handles concurrent `execute()` (tool calls
+        within a single iteration are dispatched concurrently).
         """
+        if not user_prompts:
+            return []
 
         async def _runner() -> List[Optional[Any]]:
+            sem = asyncio.Semaphore(self._max_concurrency)
             async with AsyncLLMClient(self._config) as client:
                 runner = IterativeRunner(client)
-                out: List[Optional[Any]] = []
-                for prompt in user_prompts:
-                    outcome = await runner.run(
-                        stage,
-                        user_prompt=prompt,
-                        tools=tools,
-                        max_iterations=max_iterations,
-                    )
+
+                async def _run_one(prompt: str) -> Optional[Any]:
+                    async with sem:
+                        outcome = await runner.run(
+                            stage,
+                            user_prompt=prompt,
+                            tools=tools,
+                            max_iterations=max_iterations,
+                        )
                     if outcome.error or outcome.text is None:
-                        out.append(None)
-                        continue
+                        return None
                     try:
-                        out.append(json.loads(outcome.text))
+                        return json.loads(outcome.text)
                     except json.JSONDecodeError:
-                        out.append(None)
-                return out
+                        return None
+
+                # gather() preserves input order, which callers rely on to zip
+                # verdicts back to their issues. return_exceptions keeps one bad
+                # prompt from cancelling the whole batch.
+                results = await asyncio.gather(
+                    *(_run_one(p) for p in user_prompts),
+                    return_exceptions=True,
+                )
+                return [None if isinstance(r, Exception) else r for r in results]
 
         return asyncio.run(_runner())
 
