@@ -17,10 +17,10 @@ python3 -m dev.generate_repo_config --repo ~/src/my-project --output <path>
 Analyze a repository for code issues using LLM-based analysis:
 
 ```bash
-# Example with coretime repository
+# Example with some_repo repository
 python3 -m hindsight.analyzers.code_analyzer \
-    --config ./hindsight/example_configs/repo_analysis/coretime.json \
-    --repo ~/src/coretime/
+    --config ./hindsight/example_configs/repo_analysis/some_repo.json \
+    --repo ~/src/some_repo/
 
 # Example with safari repository
 python3 -m hindsight.analyzers.code_analyzer \
@@ -34,11 +34,11 @@ Generate AST call graphs for a repository:
 
 ```bash
 python3 -m hindsight.core.lang_util.ast_util \
-    --repo ~/src/corelocation \
-    --out-dir ~/Desktop/cl_ast_artifacts/ \
+    --repo ~/src/some_repo \
+    --out-dir ~/Desktop/some_repo_ast_artifacts/ \
     --exclude .git Tools Tests Test ProtobufDefs Protobuf External Plugins proto \
              ci_scripts TestPlans test-files hws-log Oscar LogFormatters xcconfig \
-             Resources en.lproj CardioHealthTests CoreLocation.xcodeproj vagrant \
+             Resources en.lproj CardioHealthTests SomeRepo.xcodeproj vagrant \
              regressiontests .workflow
 ```
 
@@ -61,8 +61,8 @@ Analyze data flow patterns in a repository:
 
 ```bash
 python3 -m hindsight.analyzers.data_flow_analyzer \
-    --config ./hindsight/example_configs/repo_analysis/loc.json \
-    --repo ~/src/corelocation/
+    --config ./hindsight/example_configs/repo_analysis/some_repo.json \
+    --repo ~/src/some_repo/
 ```
 
 ### Move False Positives

@@ -431,7 +431,7 @@ class TestCreateTruncatedFunctionName:
 
     def test_truncate_long_function_name(self):
         """Test truncating long function name."""
-        long_name = "LocationInternal_CLLocationInternalClient_CoreMotion_asynchronousRemoteObject"
+        long_name = "SomeModule_SomeInternalClient_SomeComponent_asynchronousRemoteObject"
         
         result = _create_truncated_function_name(long_name)
         

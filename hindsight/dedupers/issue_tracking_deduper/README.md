@@ -38,8 +38,8 @@ This hybrid approach provides:
 │         │                   │                   │                   │       │
 │         ▼                   ▼                   ▼                   ▼       │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌───────────┐ │
-│  │ Radar API    │    │ ChromaDB +   │    │ File Path +  │    │ Annotated │ │
-│  │ (radarclient)│    │ File/Func    │    │ Function +   │    │ Report    │ │
+│  │ Bug Tracking │    │ ChromaDB +   │    │ File Path +  │    │ Annotated │ │
+│  │ API          │    │ File/Func    │    │ Function +   │    │ Report    │ │
 │  │              │    │ Extraction   │    │ Cosine Sim   │    │           │ │
 │  └──────────────┘    └──────────────┘    └──────────────┘    └───────────┘ │
 │                                                                             │
@@ -50,7 +50,7 @@ This hybrid approach provides:
 
 ### 1. Issue Downloading (`issue_helper.py`, `issue_downloader.py`)
 
-Downloads issue descriptions from Bug management system using the `radarclient` library.
+Downloads issue descriptions from Bug management system using a bug tracking API client.
 
 **How it works:**
 - Authenticates with Bug management API using credentials
@@ -153,9 +153,6 @@ Generates annotated HTML reports showing potential duplicates.
 ```bash
 # Install dependencies
 pip install -r requirements.txt
-
-# Install radarclient (Apple internal)
-pip install -i https://pypi.apple.com/simple radarclient
 ```
 
 ## Usage
@@ -377,18 +374,13 @@ issue_tracking_deduper/
 
 ## Dependencies
 
-- `radarclient` - Bug management API client (internal)
+- Bug management API client (internal)
 - `chromadb` - Vector database
 - `sentence-transformers` - Embedding model
 - `beautifulsoup4` - HTML parsing
 - `tqdm` - Progress bars
 
 ## Troubleshooting
-
-### "radarclient not installed"
-```bash
-pip install -i https://pypi.apple.com/simple radarclient
-```
 
 ### "Vector database not found"
 Run the ingest command first:

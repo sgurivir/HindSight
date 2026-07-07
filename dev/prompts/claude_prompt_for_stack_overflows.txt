@@ -1,7 +1,7 @@
 Go through each function in Daemon/ directory and identify potential cases where stack overflows can happen. 
 
 
-Also check if there are any potential heap/stack overflows/underflows which can happen in locationd, but triggered by an app using public iOS SDK
+Also check if there are any potential heap/stack overflows/underflows which can happen in some_daemon, but triggered by an app using public iOS SDK
 
 Dont report the candidates where data is sourced internally. 
 
